@@ -1,0 +1,39 @@
+# Local development infrastructure.
+#
+# Postgres 17 and Redis. Neither is exposed beyond localhost, and the
+# credentials here are development-only — production config comes from the
+# environment, never from a committed file.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: suliko
+      POSTGRES_PASSWORD: suliko
+      POSTGRES_DB: suliko
+      # Deterministic collation, so ORDER BY on Georgian text is stable
+      # across machines and matches production.
+      POSTGRES_INITDB_ARGS: "--locale-provider=icu --icu-locale=und --encoding=UTF8"
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - suliko_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U suliko -d suliko"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  suliko_pgdata:

@@ -1,0 +1,94 @@
+[project]
+name = "suliko-api"
+version = "0.1.0"
+description = "Suliko CRM backend — multi-tenant translation bureau management."
+requires-python = ">=3.12"
+
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    # Password hashing. argon2-cffi directly rather than passlib, which is
+    # unmaintained and whose bcrypt backend warns on modern bcrypt releases.
+    "argon2-cffi>=23.1",
+    # bcrypt kept ONLY to verify legacy hashes migrated from the PHP app,
+    # which are re-hashed to Argon2id on first successful login.
+    "bcrypt>=4.2",
+    "pyotp>=2.9",
+    "cryptography>=43.0",
+    "redis>=5.2",
+    "structlog>=24.4",
+    "python-multipart>=0.0.18",
+    "httpx>=0.28",
+    "email-validator>=2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "types-redis>=4.6",
+    "asgi-lifespan>=2.1",
+    "aiosqlite>=0.20",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/suliko"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # isort
+    "N",         # pep8-naming
+    "UP",        # pyupgrade
+    "B",         # bugbear
+    "A",         # builtins shadowing
+    "C4",        # comprehensions
+    "DTZ",       # naive datetimes — every timestamp in this app is tz-aware
+    "T20",       # no print()
+    "SIM",       # simplify
+    "RUF",
+    "S",         # bandit security checks
+]
+ignore = [
+    "S101",  # assert — used throughout the tests
+    "B008",  # function call in default arg — this is how FastAPI Depends() works
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106"]        # hardcoded test passwords are fine
+"alembic/versions/*" = ["E501"]     # generated migrations run long
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = []
+warn_unreachable = true
+disallow_untyped_decorators = false  # FastAPI decorators are untyped
+exclude = ["alembic/versions/"]
+
+[[tool.mypy.overrides]]
+module = ["pyotp.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["error"]
