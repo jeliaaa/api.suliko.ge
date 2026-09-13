@@ -1,0 +1,11 @@
+# Normalise line endings so Windows and Linux checkouts produce identical
+# diffs and identical build output.
+* text=auto eol=lf
+
+# Binary — never touch these.
+*.ttf binary
+*.woff binary
+*.woff2 binary
+*.png binary
+*.jpg binary
+*.ico binary
