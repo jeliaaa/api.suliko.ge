@@ -23,7 +23,7 @@ only be made here, never through the API: there is no sign-up path and no
 "first user becomes admin" rule.
 
 ```bash
-pytest -q                             # 108 tests
+pytest -q                             # 117 tests
 ruff check . && ruff format --check .
 mypy src
 ```
@@ -96,7 +96,7 @@ audit entry. If you reach for it in a feature handler, the design is wrong.
 
 ## Verified
 
-108 tests, `ruff` clean, `ruff format --check` clean, `mypy --strict` clean on 34 files.
+117 tests, `ruff` clean, `ruff format --check` clean, `mypy --strict` clean on 35 files.
 The app boots: `/health` returns 200, an unauthenticated `/api/v1/clients` returns 401.
 
 Not verified: anything needing a live database — the migration, RLS, and the auth endpoints
