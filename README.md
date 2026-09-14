@@ -6,13 +6,21 @@ Specs are one level up in [`../docs/`](../docs/); the build plan is
 [`../docs/BUILD-WITH-FASTAPI.md`](../docs/BUILD-WITH-FASTAPI.md). This README is how to run it.
 
 ```bash
-docker compose up -d                  # Postgres 17 + Redis
+docker compose up -d                  # Postgres 17 + Redis (or use a native install)
 uv venv --python 3.13
 uv pip install -e ".[dev]"
 cp .env.example .env                  # then set ENCRYPTION_MASTER_KEY
-alembic upgrade head
+
+python -m suliko.cli bootstrap        # creates DB, migrates, seeds, makes a superuser
+python -m suliko.cli check            # verifies config + connectivity
+
 uvicorn suliko.main:app --reload      # http://localhost:8000/docs
 ```
+
+The CLI also has discrete commands — `create-database`, `migrate`,
+`create-tenant`, `seed-reference`, `create-superuser`, `check`. A superuser can
+only be made here, never through the API: there is no sign-up path and no
+"first user becomes admin" rule.
 
 ```bash
 pytest -q                             # 108 tests
