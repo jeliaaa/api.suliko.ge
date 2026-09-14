@@ -33,7 +33,7 @@ from suliko.core.errors import (
 )
 from suliko.db.session import get_sessionmaker, session_scope
 from suliko.db.tenancy import reset_current_tenant_id, set_current_tenant_id
-from suliko.security.permissions import Permission, requires_mfa, requires_step_up
+from suliko.security.permissions import Permission, requires_step_up
 from suliko.security.sessions import AuthenticatedSession, resolve_session
 
 
@@ -101,13 +101,28 @@ async def get_db(
 async def get_authenticated_session(
     session: Annotated[AuthenticatedSession, Depends(get_current_session)],
 ) -> AuthenticatedSession:
-    """A session that has cleared the second factor, where one is required.
+    """A session that has cleared its second factor.
 
     A half-authenticated session (password accepted, 2FA pending) can reach
     only the challenge endpoint, which depends on ``get_current_session``
     directly rather than on this.
+
+    The test is ``mfa_satisfied_at is None`` alone, with no role check. Login
+    stamps that field only when the user has NO enrolled factor AND their role
+    does not require one — so a null value already means "this user owes a
+    second factor", for either reason.
+
+    Checking the role here as well would be actively wrong: a staff user who
+    voluntarily enrolled TOTP would be let through on their password alone,
+    silently ignoring the factor they chose to add.
     """
-    if requires_mfa(session.role) and session.mfa_satisfied_at is None:
+    if not get_settings().mfa_enforced:
+        # Checked here as well as at login so that sessions issued BEFORE the
+        # switch was flipped are not left permanently stuck on a challenge
+        # that no longer exists.
+        return session
+
+    if session.mfa_satisfied_at is None:
         raise MfaRequiredError("Two-factor authentication is required to continue.")
     return session
 

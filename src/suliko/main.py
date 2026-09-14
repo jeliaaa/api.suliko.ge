@@ -56,6 +56,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # deliberately query across tenants.
     install_tenant_filter()
 
+    if not settings.mfa_enforced:
+        # Warning rather than refusal: this is a deliberate, configured
+        # choice. But it must be impossible to miss in the logs, and it must
+        # show up on every single boot until it is turned back on.
+        structlog.get_logger().warning(
+            "mfa_disabled",
+            detail=(
+                "MFA_ENFORCED is false. Every account, including superusers, "
+                "signs in with a password alone. Set MFA_ENFORCED=true once "
+                "the enrolment screen exists."
+            ),
+        )
+
     structlog.get_logger().info("startup", version=__version__, environment=settings.environment)
     yield
     await dispose_engine()

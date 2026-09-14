@@ -77,6 +77,20 @@ class Settings(BaseSettings):
     #       base64.urlsafe_b64encode(os.urandom(32)).decode())"
     encryption_master_key: SecretStr = SecretStr("")
 
+    # ── Two-factor authentication ───────────────────────────────────────────
+    #: Master switch for the second factor.
+    #:
+    #: When false, login completes on the password alone: no challenge is
+    #: issued, no enrolment is demanded, and an already-enrolled factor is
+    #: ignored. Enrolled secrets are NOT deleted, so flipping this back to
+    #: true restores the previous behaviour with no re-enrolment.
+    #:
+    #: Intended as a temporary measure while the enrolment UI is being built.
+    #: Startup logs a warning on every boot while it is off, deliberately —
+    #: this is not a setting that should quietly become permanent, in a system
+    #: holding client identity documents and bank details.
+    mfa_enforced: bool = True
+
     # ── BFF gateway ─────────────────────────────────────────────────────────
     #: Shared secret the Vercel frontend presents in X-Suliko-Gateway.
     #:

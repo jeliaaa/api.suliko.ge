@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from suliko.api.deps import get_client_ip, get_current_session
+from suliko.config import get_settings
 from suliko.core.crypto import decrypt_for_tenant
 from suliko.core.errors import AuthenticationError, RateLimitedError, ValidationError
 from suliko.core.ratelimit import RateLimiter, get_rate_limiter
@@ -172,17 +173,26 @@ async def login(
                 .first()
             )
 
+            enforced = get_settings().mfa_enforced
             has_mfa = mfa is not None
-            must_have_mfa = requires_mfa(user.role)
+            must_have_mfa = enforced and requires_mfa(user.role)
+
+            # A challenge is owed when a factor exists and MFA is switched on.
+            # Note this covers VOLUNTARY enrolment: a staff user who added
+            # TOTP is challenged even though their role does not demand it.
+            challenge_owed = enforced and has_mfa
+
+            # The role demands a factor but none is enrolled. Fail closed —
+            # do not hand out a satisfied session to a privileged account
+            # that is missing its second factor.
+            enrolment_required = must_have_mfa and not has_mfa
 
             issued = await create_session(
                 db,
                 user,
                 ip=ip,
                 user_agent=user_agent,
-                # Only a user with no second factor at all, and none required,
-                # is fully authenticated by password alone.
-                mfa_satisfied=not has_mfa and not must_have_mfa,
+                mfa_satisfied=not (challenge_owed or enrolment_required),
             )
 
             user.last_login_at = datetime.now(UTC)
@@ -193,14 +203,13 @@ async def login(
 
         from suliko.security.permissions import permissions_for_role
 
-        # A privileged role with no enrolled factor must enrol before it can
-        # do anything — it is not let through, it is redirected to enrolment.
-        enrolment_required = must_have_mfa and not has_mfa
-
         response.status_code = status.HTTP_200_OK
         return LoginResponse(
             session_token=issued.token,
-            mfa_required=has_mfa,
+            # "Go to the challenge screen now" — NOT "a factor exists". With
+            # MFA switched off this is false even for a user who has TOTP
+            # enrolled, so the frontend sends them straight to the dashboard.
+            mfa_required=challenge_owed,
             mfa_enrolment_required=enrolment_required,
             user_id=user.id,
             tenant_id=user.tenant_id,
@@ -331,7 +340,13 @@ async def current_session(
         role=session.role.value,
         tenant_id=session.tenant_id,
         permissions=sorted(p.value for p in session.permissions),
-        mfa_satisfied=session.mfa_satisfied_at is not None,
+        # Must agree with the gate in deps.get_authenticated_session. When MFA
+        # is switched off the gate lets every request through, so reporting
+        # "not satisfied" here would strand the frontend on a challenge screen
+        # for a requirement the server is no longer enforcing — which is
+        # exactly what happens to sessions created BEFORE the switch, whose
+        # mfa_satisfied_at is null.
+        mfa_satisfied=(session.mfa_satisfied_at is not None or not get_settings().mfa_enforced),
         is_impersonated=session.is_impersonated,
     )
 

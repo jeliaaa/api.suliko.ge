@@ -25,6 +25,9 @@ dependencies = [
     "python-multipart>=0.0.18",
     "httpx>=0.28",
     "email-validator>=2.2",
+    # Renders the TOTP enrolment URI as a scannable QR in the terminal, so a
+    # superuser can be enrolled over SSH or RDP with no GUI.
+    "qrcode>=8.0",
 ]
 
 [project.optional-dependencies]
