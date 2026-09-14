@@ -77,7 +77,20 @@ class Settings(BaseSettings):
     #       base64.urlsafe_b64encode(os.urandom(32)).decode())"
     encryption_master_key: SecretStr = SecretStr("")
 
-    # ── CORS / BFF ──────────────────────────────────────────────────────────
+    # ── BFF gateway ─────────────────────────────────────────────────────────
+    #: Shared secret the Vercel frontend presents in X-Suliko-Gateway.
+    #:
+    #: Required when the API is internet-facing (the Vercel topology), because
+    #: Vercel has no stable egress IPs to allow-list. Optional and inert when
+    #: the API is loopback-only. Defence in depth — every endpoint still
+    #: enforces sessions, permissions and tenancy behind it.
+    bff_shared_secret: SecretStr = SecretStr("")
+
+    #: Set when this API is reachable from the internet rather than only from
+    #: localhost. Turns the missing-gateway-secret check below into an error.
+    public_api: bool = False
+
+    # ── CORS ────────────────────────────────────────────────────────────────
     # The browser never calls this API directly; the Next.js BFF does,
     # server-side. CORS therefore stays narrow.
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
@@ -117,6 +130,12 @@ class Settings(BaseSettings):
                 "per-process limiter, which does not hold across processes. "
                 "Either set REDIS_URL, or set RATE_LIMIT_SINGLE_INSTANCE=true "
                 "to confirm this deployment runs exactly one worker."
+            )
+        if self.public_api and not self.bff_shared_secret.get_secret_value():
+            problems.append(
+                "PUBLIC_API is on but BFF_SHARED_SECRET is not set. An "
+                "internet-facing API should not accept requests from callers "
+                "other than the frontend."
             )
         # Loopback is not an insecure transport — it never leaves the machine.
         # A single-box deployment where IIS reverse-proxies to 127.0.0.1

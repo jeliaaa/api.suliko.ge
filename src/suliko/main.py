@@ -14,6 +14,7 @@ from suliko import __version__
 from suliko.api.v1.router import api_router
 from suliko.config import get_settings
 from suliko.core.errors import install_error_handlers
+from suliko.core.gateway import GatewayMiddleware
 from suliko.db.session import dispose_engine
 from suliko.db.tenancy import install_tenant_filter
 
@@ -76,13 +77,19 @@ def create_app() -> FastAPI:
         openapi_url="/openapi.json",
     )
 
+    # Order matters: middleware added later runs EARLIER. The gateway is added
+    # after CORS so it runs first and rejects unknown callers before anything
+    # else touches the request — but it exempts OPTIONS so CORS preflight,
+    # which browsers send without custom headers, still succeeds.
+    app.add_middleware(GatewayMiddleware)
+
     # Narrow by design: only the BFF calls this API, server-side.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
-        allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
+        allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Suliko-Gateway"],
         max_age=600,
     )
 

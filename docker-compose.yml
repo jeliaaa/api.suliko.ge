@@ -1,39 +1,84 @@
-# Local development infrastructure.
+# PostgreSQL + Redis for Suliko.
 #
-# Postgres 17 and Redis. Neither is exposed beyond localhost, and the
-# credentials here are development-only — production config comes from the
-# environment, never from a committed file.
+# ## Designed to coexist with other things already on the host
+#
+# This file is written for a server that is ALREADY running other Docker
+# workloads. Every object it creates is explicitly named and prefixed, so no
+# command you run here can reach anything else:
+#
+#   - `name: suliko` pins the compose project. Every `docker compose` command
+#     run from this directory targets only this project's containers, and
+#     `docker compose down` can never stop a neighbour's container.
+#   - Container, network and volume names are all prefixed `suliko-`/`suliko_`.
+#   - Host ports are variables with NON-DEFAULT fallbacks (5433 / 6380), so a
+#     PostgreSQL or Redis already listening on the standard port is untouched.
+#     Override in .env if even those are taken.
+#   - Ports publish to 127.0.0.1 only. Neither service is reachable from the
+#     network, from another host, or from the server's other public IPs.
+#
+# NEVER run `docker system prune`, `docker volume prune`, `docker network
+# prune`, or `docker compose down -v` on this host. The first three are
+# host-wide and will delete other people's data; the last destroys this
+# project's database volume.
+
+name: suliko
 
 services:
   postgres:
     image: postgres:17-alpine
+    container_name: suliko-postgres
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: suliko
-      POSTGRES_PASSWORD: suliko
-      POSTGRES_DB: suliko
-      # Deterministic collation, so ORDER BY on Georgian text is stable
-      # across machines and matches production.
+      POSTGRES_USER: ${POSTGRES_USER:-suliko}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-suliko}
+      # Deterministic collation, so ORDER BY on Georgian text sorts the same
+      # on every machine rather than following the host's locale.
       POSTGRES_INITDB_ARGS: "--locale-provider=icu --icu-locale=und --encoding=UTF8"
     ports:
-      - "127.0.0.1:5432:5432"
+      # host:container — loopback only, non-default host port by default.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
     volumes:
       - suliko_pgdata:/var/lib/postgresql/data
+    networks:
+      - suliko
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U suliko -d suliko"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-suliko} -d ${POSTGRES_DB:-suliko}"]
       interval: 5s
       timeout: 3s
       retries: 10
+      start_period: 10s
 
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    container_name: suliko-redis
+    restart: unless-stopped
+    # A password even on loopback: on a shared Docker host, other containers
+    # can reach published ports, and an unauthenticated Redis is a well-known
+    # path to remote code execution. Persistence is off — these are ephemeral
+    # rate-limit counters, and losing them on restart is harmless.
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --requirepass
+      - ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:${REDIS_HOST_PORT:-6380}:6379"
+    networks:
+      - suliko
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "--no-auth-warning", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
 
+networks:
+  suliko:
+    name: suliko_net
+
 volumes:
   suliko_pgdata:
+    name: suliko_pgdata

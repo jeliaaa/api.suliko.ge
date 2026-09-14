@@ -37,6 +37,9 @@ dev = [
     "types-redis>=4.6",
     "asgi-lifespan>=2.1",
     "aiosqlite>=0.20",
+    # starlette.testclient imports httpx2; without it the import fails under
+    # our filterwarnings=error setting.
+    "httpx2>=0.28",
 ]
 
 [build-system]
@@ -96,4 +99,11 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-filterwarnings = ["error"]
+# Warnings are errors, so our own deprecations get fixed rather than ignored.
+# The exception below is inside a third-party package — we cannot fix it, and a
+# blanket "ignore" would hide ours too.
+filterwarnings = [
+    "error",
+    # starlette.testclient imports a deprecated anyio alias at module level.
+    "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning",
+]
