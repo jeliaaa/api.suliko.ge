@@ -267,3 +267,56 @@ def test_redaction_strips_secret_fields() -> None:
     assert cleaned["password"] == "[redacted]"
     assert cleaned["api_key"] == "[redacted]"
     assert cleaned["nested"] == {"access_token": "[redacted]", "keep": "visible"}  # type: ignore[comparison-overlap]
+
+
+# ── Production configuration guards ─────────────────────────────────────────
+
+
+def _prod_settings(**overrides: object):  # type: ignore[no-untyped-def]
+    from suliko.config import Settings
+
+    base: dict[str, object] = {
+        "environment": "production",
+        "debug": False,
+        "db_echo": False,
+        "encryption_master_key": "a" * 44,
+        "redis_url": "redis://localhost:6379/0",
+        "cors_origins": ["https://app.suliko.ge"],
+    }
+    base.update(overrides)
+    return Settings(**base)  # type: ignore[arg-type]
+
+
+def test_production_accepts_a_correct_configuration() -> None:
+    _prod_settings().validate_for_production()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"encryption_master_key": ""}, "ENCRYPTION_MASTER_KEY"),
+        ({"debug": True}, "DEBUG"),
+        ({"db_echo": True}, "DB_ECHO"),
+        ({"redis_url": None}, "REDIS_URL"),
+        ({"cors_origins": ["http://crm.example.com"]}, "https"),
+    ],
+)
+def test_production_refuses_insecure_configuration(
+    overrides: dict[str, object], expected: str
+) -> None:
+    with pytest.raises(RuntimeError, match=expected):
+        _prod_settings(**overrides).validate_for_production()
+
+
+def test_single_instance_flag_permits_running_without_redis() -> None:
+    """Redis has no supported native Windows build, and a one-worker box on
+    IIS is a real deployment target. The flag is an explicit acknowledgement,
+    not a way to silence the check."""
+    _prod_settings(redis_url=None, rate_limit_single_instance=True).validate_for_production()
+
+
+@pytest.mark.parametrize("origin", ["http://localhost:3000", "http://127.0.0.1:3000"])
+def test_loopback_cors_origins_are_allowed_in_production(origin: str) -> None:
+    """Loopback never leaves the machine, so it is not an insecure transport.
+    IIS reverse-proxying to 127.0.0.1 is the normal single-box topology."""
+    _prod_settings(cors_origins=[origin]).validate_for_production()

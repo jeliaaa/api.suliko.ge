@@ -28,7 +28,7 @@ class RateLimiter:
     change the economics of guessing a password.
     """
 
-    def __init__(self, redis_client: "aioredis.Redis[str] | None" = None) -> None:
+    def __init__(self, redis_client: aioredis.Redis[str] | None = None) -> None:
         self._redis: aioredis.Redis[str] | None = redis_client
         self._local: dict[str, list[float]] = defaultdict(list)
 

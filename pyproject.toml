@@ -74,7 +74,11 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S105", "S106"]        # hardcoded test passwords are fine
-"alembic/versions/*" = ["E501"]     # generated migrations run long
+# Migrations legitimately interpolate identifiers into DDL: PostgreSQL does not
+# accept bind parameters for table or role names. The interpolated values come
+# from SQLAlchemy metadata and module literals, never from user input — see the
+# note in 0001_initial_schema_and_rls.py.
+"alembic/versions/*" = ["E501", "S608"]
 
 [tool.mypy]
 python_version = "3.12"

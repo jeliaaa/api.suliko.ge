@@ -52,6 +52,13 @@ depends_on: str | Sequence[str] | None = None
 #: FORCE alone means one missed FORCE is a silent cross-tenant leak.
 APP_ROLE = "suliko_app"
 
+# Role and table names are interpolated into DDL below. That is unavoidable —
+# PostgreSQL does not accept bind parameters for identifiers — so both sources
+# are constrained instead: APP_ROLE is a literal in this file, and the table
+# names come from SQLAlchemy metadata, never from user input. Ruff's S608 is
+# suppressed per-statement rather than file-wide so a future f-string carrying
+# real user data still trips it.
+
 
 def _tenant_scoped_tables() -> list[str]:
     """Tables carrying a ``tenant_id``, in dependency order."""
@@ -144,10 +151,7 @@ def upgrade() -> None:
     # can simply be added when list volume justifies it.
     op.execute(sa.text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
     op.execute(
-        sa.text(
-            "CREATE INDEX ix_clients_name_trgm ON clients "
-            "USING gin (name gin_trgm_ops)"
-        )
+        sa.text("CREATE INDEX ix_clients_name_trgm ON clients USING gin (name gin_trgm_ops)")
     )
 
 

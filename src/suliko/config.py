@@ -48,9 +48,20 @@ class Settings(BaseSettings):
 
     # ── Rate limiting ───────────────────────────────────────────────────────
     # Redis is the right store for this — ephemeral, high-churn counters.
-    # Without it the app falls back to an in-process limiter, which is correct
-    # only for a single instance. Fine for dev; set it in production.
+    # Without it the app falls back to an in-process limiter.
     redis_url: str | None = None
+
+    #: Explicit acknowledgement that this deployment runs ONE worker process,
+    #: which makes the in-process rate limiter correct and Redis unnecessary.
+    #:
+    #: This exists because Redis has no supported native Windows build, and a
+    #: single-box Windows/IIS deployment is a real target for this product. The
+    #: limiter is only wrong when counters must be shared across processes.
+    #:
+    #: Setting this with more than one worker silently multiplies every rate
+    #: limit by the worker count — five login attempts becomes five *per
+    #: worker*. If you scale out, install Redis (or Memurai) and unset this.
+    rate_limit_single_instance: bool = False
 
     login_max_attempts_per_account: int = 5
     login_max_attempts_per_ip: int = 20
@@ -100,13 +111,24 @@ class Settings(BaseSettings):
             problems.append("DEBUG must be off in production")
         if self.db_echo:
             problems.append("DB_ECHO must be off in production (it logs query parameters)")
-        if not self.redis_url:
+        if not self.redis_url and not self.rate_limit_single_instance:
             problems.append(
-                "REDIS_URL is not set — rate limiting would fall back to a "
-                "per-process limiter, which does not hold across instances"
+                "REDIS_URL is not set. Rate limiting would fall back to a "
+                "per-process limiter, which does not hold across processes. "
+                "Either set REDIS_URL, or set RATE_LIMIT_SINGLE_INSTANCE=true "
+                "to confirm this deployment runs exactly one worker."
             )
-        if any(o.startswith("http://") for o in self.cors_origins):
-            problems.append("CORS origins must all be https in production")
+        # Loopback is not an insecure transport — it never leaves the machine.
+        # A single-box deployment where IIS reverse-proxies to 127.0.0.1
+        # legitimately has an http loopback origin.
+        insecure = [
+            o
+            for o in self.cors_origins
+            if o.startswith("http://")
+            and not o.startswith(("http://localhost", "http://127.0.0.1"))
+        ]
+        if insecure:
+            problems.append(f"CORS origins must be https in production: {insecure}")
 
         if problems:
             raise RuntimeError("Refusing to start in production:\n  - " + "\n  - ".join(problems))
