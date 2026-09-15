@@ -103,7 +103,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(
             ["portal_translator_id"],
             ["portal_translators.id"],
-            name="fk_portal_translator_links_portal_translator_id_portal_translators",
+            name="fk_portal_link_translator",
             ondelete="CASCADE",
         ),
         sa.ForeignKeyConstraint(
@@ -138,7 +138,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(
             ["portal_translator_id"],
             ["portal_translators.id"],
-            name="fk_personal_orders_portal_translator_id_portal_translators",
+            name="fk_personal_order_translator",
             ondelete="RESTRICT",
         ),
         sa.PrimaryKeyConstraint("id", name="pk_personal_orders"),
@@ -158,7 +158,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(
             ["personal_order_id"],
             ["personal_orders.id"],
-            name="fk_personal_order_language_pairs_personal_order_id_personal_orders",
+            name="fk_order_pair_order",
             ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("id", name="pk_personal_order_language_pairs"),
@@ -189,7 +189,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(
             ["personal_order_id"],
             ["personal_orders.id"],
-            name="fk_personal_order_files_personal_order_id_personal_orders",
+            name="fk_order_file_order",
             ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("id", name="pk_personal_order_files"),
@@ -263,7 +263,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(
             ["order_document_id"],
             ["order_documents.id"],
-            name="fk_order_document_drive_folders_order_document_id_order_documents",
+            name="fk_doc_drive_folder_document",
             ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("id", name="pk_order_document_drive_folders"),
