@@ -7,6 +7,14 @@ which silently produces a migration that drops nothing and creates nothing.
 
 from suliko.db.base import Base
 from suliko.models.audit import ActorType, AuditLog
+from suliko.models.cms import PageStatus, ServicePage, SiteString
+from suliko.models.collaboration import (
+    Notification,
+    NotificationKind,
+    OrderComment,
+    OrderCommentMention,
+    OrderCommentRead,
+)
 from suliko.models.directory import (
     Client,
     ClientType,
@@ -75,12 +83,20 @@ __all__ = [
     "Notary",
     "NotaryPayment",
     "NotaryPaymentAllocation",
+    "Notification",
+    "NotificationKind",
     "Order",
+    "OrderComment",
+    "OrderCommentMention",
+    "OrderCommentRead",
     "OrderDocument",
     "OrderStatusEvent",
+    "PageStatus",
     "PasswordResetToken",
     "PaymentMethod",
     "Role",
+    "ServicePage",
+    "SiteString",
     "Tenant",
     "TenantSettings",
     "TenantStatus",

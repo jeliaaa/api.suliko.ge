@@ -5,6 +5,7 @@ from __future__ import annotations
 import enum
 from datetime import date, datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     Boolean,
@@ -18,9 +19,13 @@ from sqlalchemy import (
     String,
     Text,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from suliko.db.base import Base, IdMixin, TenantScoped, TimestampMixin, enum_values
+
+if TYPE_CHECKING:
+    from suliko.models.directory import Client, Notary, Translator
+    from suliko.models.reference import DocumentType
 
 
 class Urgency(enum.StrEnum):
@@ -111,6 +116,15 @@ class Order(Base, IdMixin, TenantScoped, TimestampMixin):
         ForeignKey("users.id", ondelete="SET NULL"), default=None
     )
 
+    # lazy="raise" makes a forgotten joinedload fail loudly rather than
+    # silently issuing one query per row.
+    client: Mapped[Client] = relationship(lazy="raise", viewonly=True)
+    documents: Mapped[list[OrderDocument]] = relationship(
+        back_populates="order",
+        lazy="raise",
+        cascade="all, delete-orphan",
+    )
+
 
 class OrderDocument(Base, IdMixin, TenantScoped, TimestampMixin):
     """One document within an order — the unit that is priced and assigned.
@@ -168,6 +182,11 @@ class OrderDocument(Base, IdMixin, TenantScoped, TimestampMixin):
     notary_id: Mapped[int | None] = mapped_column(
         ForeignKey("notaries.id", ondelete="SET NULL"), default=None
     )
+
+    order: Mapped[Order] = relationship(back_populates="documents", lazy="raise")
+    document_type: Mapped[DocumentType] = relationship(lazy="raise", viewonly=True)
+    translator: Mapped[Translator | None] = relationship(lazy="raise", viewonly=True)
+    notary: Mapped[Notary | None] = relationship(lazy="raise", viewonly=True)
 
     @property
     def profit(self) -> Decimal:
