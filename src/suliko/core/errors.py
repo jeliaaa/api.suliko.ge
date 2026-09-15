@@ -13,6 +13,7 @@ Two rules that matter more than the plumbing:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import structlog
@@ -121,6 +122,41 @@ def _problem(
     )
 
 
+#: PostgreSQL SQLSTATEs that mean "the schema does not have what the code
+#: expects", mapped to how to describe the missing thing.
+#:
+#: Deliberately narrow. These four cannot be provoked by a request — no input
+#: this API accepts reaches a table name — so reporting them says nothing about
+#: any user's data, only about our own schema. That is the same reasoning that
+#: lets the validation handler return Pydantic's errors verbatim.
+_SCHEMA_SQLSTATES = {
+    "42P01": "table",
+    "42703": "column",
+    "42883": "function",
+    "3F000": "schema",
+}
+
+#: `relation "notifications" does not exist` -> notifications
+_QUOTED = re.compile(r'"([A-Za-z0-9_.]+)"')
+
+
+def _missing_schema_object(exc: SQLAlchemyError) -> str | None:
+    """Describe the missing table or column, or None if that is not the fault.
+
+    Returns something like ``table "notifications"`` — the identifier only,
+    never the driver's full message, which quotes the failing SQL.
+    """
+    orig = getattr(exc, "orig", None)
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+
+    kind = _SCHEMA_SQLSTATES.get(str(sqlstate))
+    if kind is None:
+        return None
+
+    match = _QUOTED.search(str(orig))
+    return f'{kind} "{match.group(1)}"' if match else f"a {kind} it expects"
+
+
 def install_error_handlers(app: FastAPI) -> None:
     settings = get_settings()
 
@@ -168,7 +204,29 @@ def install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(SQLAlchemyError)
     async def _db(request: Request, exc: SQLAlchemyError) -> JSONResponse:
-        # Database messages quote SQL and sometimes column values. Never echo.
+        # A table or column the code expects and the database does not have is
+        # a DEPLOYMENT state, not a data error: the service was updated and
+        # `alembic upgrade head` was not run. Flattening it to "an internal
+        # error occurred" sends whoever is on support hunting for a bug that
+        # does not exist, so it gets its own answer.
+        missing = _missing_schema_object(exc)
+        if missing is not None:
+            log.error(
+                "schema_out_of_date",
+                path=request.url.path,
+                missing=missing,
+            )
+            return _problem(
+                request,
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "schema_out_of_date",
+                f"The database is missing {missing}, which this build of the API "
+                f"requires. Run `alembic upgrade head` on the API server and "
+                f"restart the service.",
+            )
+
+        # Everything else: database messages quote SQL and sometimes column
+        # values. Never echo.
         log.exception("database_error", path=request.url.path)
         return _problem(
             request,

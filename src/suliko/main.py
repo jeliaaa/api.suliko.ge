@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from suliko import __version__
 from suliko.api.v1.router import api_router
@@ -17,6 +20,32 @@ from suliko.core.errors import install_error_handlers
 from suliko.core.gateway import GatewayMiddleware
 from suliko.db.session import dispose_engine
 from suliko.db.tenancy import install_tenant_filter
+
+
+def migration_head() -> str:
+    """The revision this build of the code expects the database to be at.
+
+    Read from the migration files rather than hardcoded, so it cannot go stale
+    the next time someone adds a revision: the head is the one revision that
+    nothing else names as its ``down_revision``.
+    """
+    versions = Path(__file__).resolve().parents[2] / "alembic" / "versions"
+
+    revisions: set[str] = set()
+    parents: set[str] = set()
+    for path in versions.glob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        for pattern, bucket in (
+            (r'^revision:?\s*(?::\s*str\s*)?=\s*"([^"]+)"', revisions),
+            (r'^down_revision:?\s*(?::[^=]+)?=\s*"([^"]+)"', parents),
+        ):
+            match = re.search(pattern, text, re.MULTILINE)
+            if match:
+                bucket.add(match.group(1))
+
+    heads = revisions - parents
+    # A merge point or an empty directory: say nothing rather than guess.
+    return next(iter(heads)) if len(heads) == 1 else ""
 
 
 def configure_logging(debug: bool) -> None:
@@ -112,6 +141,66 @@ def create_app() -> FastAPI:
     @app.get("/health", tags=["meta"], include_in_schema=False)
     async def health() -> dict[str, str]:
         return {"status": "ok", "version": __version__}
+
+    @app.get("/health/ready", tags=["meta"], include_in_schema=False)
+    async def ready() -> JSONResponse:
+        """Is this API actually able to serve requests?
+
+        `/health` answers "is the process up", which stays green while the
+        database is unreachable or a migration behind — and a schema one
+        migration behind is the single most common way this deployment breaks,
+        because the frontend ships on push and the API is a manual pull.
+
+        This answers the question that matters instead: can we reach the
+        database, and is its schema the one this build expects. One request,
+        and the answer names the fix.
+        """
+        from sqlalchemy import text
+
+        from suliko.db.session import get_sessionmaker
+
+        expected = migration_head()
+
+        try:
+            async with get_sessionmaker()() as db:
+                applied = await db.scalar(text("SELECT version_num FROM alembic_version"))
+        # Deliberately broad: whatever went wrong, the answer is the same
+        # shape and the type name is the useful part of it.
+        except Exception as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "unavailable",
+                    "version": __version__,
+                    "database": "unreachable",
+                    "detail": type(exc).__name__,
+                },
+            )
+
+        if applied != expected:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "migration_pending",
+                    "version": __version__,
+                    "database": "reachable",
+                    "schema_applied": applied,
+                    "schema_expected": expected,
+                    "detail": (
+                        "The database schema is not the one this build expects. "
+                        "Run `alembic upgrade head` and restart the service."
+                    ),
+                },
+            )
+
+        return JSONResponse(
+            content={
+                "status": "ok",
+                "version": __version__,
+                "database": "reachable",
+                "schema_applied": applied,
+            }
+        )
 
     return app
 

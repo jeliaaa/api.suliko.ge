@@ -255,6 +255,60 @@ async def create_language(
     return LanguageOut.model_validate(row, from_attributes=True)
 
 
+@router.patch("/languages/{language_id}", response_model=LanguageOut)
+async def update_language(
+    language_id: int,
+    payload: LanguageIn,
+    db: Db,
+    session: CurrentSession,
+    _: Annotated[object, Depends(require(Permission.SETTINGS_MANAGE))],
+) -> LanguageOut:
+    """Rename a language, or take it out of use.
+
+    There is deliberately no DELETE. `language_pair_prices`, `order_documents`
+    and every historical order store the *code*, so removing the row would
+    leave orders referring to a language nobody can name any more. Clearing
+    `is_active` takes it out of the dropdowns while history keeps reading
+    correctly, which is what "remove a language" actually means here.
+    """
+    row = await db.get(Language, language_id)
+    if row is None:
+        raise NotFoundError("Language not found.")
+
+    code = payload.code.lower()
+
+    # The code is what pricing and documents join on, so a change to it is a
+    # rename of the thing itself, not a relabelling — and a collision would
+    # silently merge two languages.
+    if code != row.code:
+        clash = (
+            (await db.execute(select(Language).where(Language.code == code))).scalars().first()
+        )
+        if clash:
+            raise ConflictError(f"Language {code!r} already exists.")
+
+    before = {k: getattr(row, k) for k in payload.model_dump()}
+
+    row.code = code
+    row.name_en = payload.name_en
+    row.name_ka = payload.name_ka
+    row.is_active = payload.is_active
+    await db.flush()
+
+    from suliko.core.audit import record
+
+    await record(
+        db,
+        session,
+        action="language.updated",
+        entity_type="language",
+        entity_id=row.id,
+        before=before,
+        after=payload.model_dump(mode="json"),
+    )
+    return LanguageOut.model_validate(row, from_attributes=True)
+
+
 # ── Language-pair pricing ───────────────────────────────────────────────────
 
 
