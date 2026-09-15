@@ -13,6 +13,9 @@ recognises the condition, and `/health/ready` reports it before a user does.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 from sqlalchemy.exc import OperationalError, ProgrammingError
 
@@ -83,7 +86,44 @@ def test_an_exception_with_no_sqlstate_is_not_schema_drift() -> None:
 # ── The readiness check knows what it expects ───────────────────────────────
 
 
-def test_migration_head_is_the_newest_revision() -> None:
-    """The head is derived, not hardcoded, so adding a revision cannot leave
-    the readiness check asserting a stale one."""
-    assert migration_head() == "0002"
+def test_migration_head_is_the_one_nothing_supersedes() -> None:
+    """The readiness check must name the newest revision without being told.
+
+    Computed here a second way — from the filenames — so that adding a
+    revision cannot leave `/health/ready` comparing against a stale head and
+    reporting a correctly-migrated database as pending.
+    """
+    versions = Path(__file__).resolve().parents[1] / "alembic" / "versions"
+
+    revisions: set[str] = set()
+    parents: set[str] = set()
+    for path in versions.glob("[0-9]*.py"):
+        text = path.read_text(encoding="utf-8")
+        revisions.update(re.findall(r'^revision:\s*str\s*=\s*"([^"]+)"', text, re.M))
+        parents.update(re.findall(r'^down_revision:[^=]*=\s*"([^"]+)"', text, re.M))
+
+    heads = revisions - parents
+    assert len(heads) == 1, f"migration history has {len(heads)} heads: {heads}"
+    assert migration_head() == heads.pop()
+
+
+def test_every_revision_is_reachable_from_the_first() -> None:
+    """No orphans: a revision whose parent does not exist is never applied,
+    and Alembic reports it as a separate head rather than an error."""
+    versions = Path(__file__).resolve().parents[1] / "alembic" / "versions"
+
+    parents: dict[str, str | None] = {}
+    for path in versions.glob("[0-9]*.py"):
+        text = path.read_text(encoding="utf-8")
+        revision = re.search(r'^revision:\s*str\s*=\s*"([^"]+)"', text, re.M)
+        down = re.search(r'^down_revision:[^=]*=\s*"([^"]+)"', text, re.M)
+        assert revision
+        parents[revision.group(1)] = down.group(1) if down else None
+
+    roots = [r for r, p in parents.items() if p is None]
+    assert len(roots) == 1, f"expected exactly one root revision, found {roots}"
+
+    for revision, parent in parents.items():
+        assert parent is None or parent in parents, (
+            f"revision {revision} names a parent that does not exist: {parent}"
+        )

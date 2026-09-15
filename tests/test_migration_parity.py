@@ -67,6 +67,22 @@ def _load_revision(filename: str) -> tuple[Any, RecordedOps]:
     return module, recorder
 
 
+def _import_revision(filename: str) -> Any:
+    """Import a revision module without running anything.
+
+    ``_load_revision`` executes ``upgrade()``, which 0001 cannot survive
+    against the recorder: it calls ``Base.metadata.create_all(op.get_bind())``,
+    and the recorder is not a connection. These tests only need the module's
+    declarations.
+    """
+    path = REVISION / filename
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 @pytest.fixture(scope="module")
 def revision_0002() -> tuple[Any, RecordedOps]:
     return _load_revision("0002_collaboration_and_cms.py")
@@ -166,3 +182,49 @@ def test_downgrade_drops_everything_upgrade_created(
     module.downgrade()
 
     assert set(recorder.dropped) == set(module.NEW_TABLES)
+
+
+# ── The two revisions must not both create the same table ───────────────────
+
+
+def test_0001_does_not_build_tables_that_0002_owns() -> None:
+    """The bug this pins: 0001 builds from ``Base.metadata``, which is the
+    CURRENT models package, not the models as they stood when 0001 was
+    written. Left unscoped, it creates the six collaboration and CMS tables
+    and 0002 then dies trying to create them again — so a fresh database can
+    never reach head.
+    """
+    first = _import_revision("0001_initial_schema_and_rls.py")
+    second = _import_revision("0002_collaboration_and_cms.py")
+
+    third = _import_revision("0003_integration_credentials.py")
+    later = set(second.NEW_TABLES) | set(third.NEW_TABLES)
+
+    assert later == first.LATER_REVISION_TABLES, (
+        "0001 must exclude every table a later revision creates. Out of sync: "
+        f"{later ^ first.LATER_REVISION_TABLES}"
+    )
+
+    built_by_0001 = {table.name for table in first._revision_tables()}
+    assert not (built_by_0001 & later)
+
+
+def test_0001_still_builds_the_core_tables() -> None:
+    """The exclusion must not go too far the other way."""
+    first = _import_revision("0001_initial_schema_and_rls.py")
+    built = {table.name for table in first._revision_tables()}
+
+    for core in ("orders", "order_documents", "clients", "users", "tenants", "expenses"):
+        assert core in built, f"0001 no longer creates {core}"
+
+
+def test_0001_applies_rls_to_every_table_it_builds() -> None:
+    """A tenant-scoped table with a grant but no policy is readable across
+    tenants. The two lists are derived from the same source so they cannot
+    drift, and this asserts that they have not."""
+    first = _import_revision("0001_initial_schema_and_rls.py")
+
+    scoped = set(first._tenant_scoped_tables())
+    built = {t.name for t in first._revision_tables() if "tenant_id" in t.columns}
+
+    assert scoped == built - {"audit_log"}

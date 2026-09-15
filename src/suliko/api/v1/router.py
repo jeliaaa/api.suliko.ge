@@ -7,6 +7,7 @@ from suliko.api.v1 import (
     calculator,
     clients,
     finances,
+    integrations,
     notaries,
     notifications,
     orders,
@@ -29,6 +30,7 @@ api_router.include_router(calculator.router)
 api_router.include_router(reports.router)
 api_router.include_router(users.router)
 api_router.include_router(settings.router)
+api_router.include_router(integrations.router)
 api_router.include_router(finances.router)
 api_router.include_router(notifications.router)
 api_router.include_router(notifications.comments_router)

@@ -33,6 +33,7 @@ from suliko.models.finance import (
     TranslatorPayment,
     TranslatorPaymentAllocation,
 )
+from suliko.models.integration import IntegrationCredential, IntegrationProvider
 from suliko.models.order import (
     CopyType,
     HandoverMethod,
@@ -75,6 +76,8 @@ __all__ = [
     "DocumentType",
     "Expense",
     "HandoverMethod",
+    "IntegrationCredential",
+    "IntegrationProvider",
     "Language",
     "LanguagePairPrice",
     "LoginAttempt",

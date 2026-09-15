@@ -60,11 +60,50 @@ APP_ROLE = "suliko_app"
 # real user data still trips it.
 
 
+#: Tables that belong to LATER revisions and must not be built here.
+#:
+#: ``create_all`` builds whatever is in ``Base.metadata`` *at the moment the
+#: migration runs*, which is the current models package — not the models as
+#: they stood when this revision was written. Without this exclusion, 0001
+#: creates the collaboration and CMS tables and 0002 then fails trying to
+#: create them again, so ``alembic upgrade head`` never completes on a fresh
+#: database.
+#:
+#: Kept in sync with 0002's ``NEW_TABLES`` by ``tests/test_migration_parity.py``.
+#: Every future revision that adds a table must add it here too — or, better,
+#: stop this revision from being the only one built from metadata.
+LATER_REVISION_TABLES = frozenset(
+    {
+        "order_comments",
+        "order_comment_mentions",
+        "order_comment_reads",
+        "notifications",
+        "service_pages",
+        "site_strings",
+        # 0003
+        "integration_credentials",
+    }
+)
+
+
+def _revision_tables() -> list[sa.Table]:
+    """The tables this revision owns, in dependency order."""
+    return [
+        table
+        for table in Base.metadata.sorted_tables
+        if table.name not in LATER_REVISION_TABLES
+    ]
+
+
 def _tenant_scoped_tables() -> list[str]:
-    """Tables carrying a ``tenant_id``, in dependency order."""
+    """Tables carrying a ``tenant_id``, in dependency order.
+
+    Scoped to this revision's own tables: applying RLS to a table 0002 has not
+    created yet would fail, and 0002 applies its own.
+    """
     return [
         table.name
-        for table in Base.metadata.sorted_tables
+        for table in _revision_tables()
         if "tenant_id" in table.columns and table.name != "audit_log"
     ]
 
@@ -73,7 +112,8 @@ def upgrade() -> None:
     bind = op.get_bind()
 
     # ── Tables ──────────────────────────────────────────────────────────────
-    Base.metadata.create_all(bind)
+    # Only this revision's own tables — see LATER_REVISION_TABLES.
+    Base.metadata.create_all(bind, tables=_revision_tables())
 
     # ── Application role ────────────────────────────────────────────────────
     # Created without a password: it is granted to the connecting user rather
@@ -164,5 +204,5 @@ def downgrade() -> None:
         op.execute(sa.text(f"DROP POLICY IF EXISTS tenant_isolation ON {table}"))
         op.execute(sa.text(f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY"))
 
-    Base.metadata.drop_all(op.get_bind())
+    Base.metadata.drop_all(op.get_bind(), tables=_revision_tables())
     # The role is left in place: it may own objects outside this database.

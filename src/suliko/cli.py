@@ -27,13 +27,14 @@ import sys
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import asyncpg
 from sqlalchemy import select, text
 
 from suliko.config import get_settings
 from suliko.core.crypto import encrypt_for_tenant
-from suliko.db.session import dispose_engine, get_sessionmaker
+from suliko.db.session import dispose_engine, get_engine, get_sessionmaker
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
 from suliko.models.directory import Client, ClientType  # noqa: F401 — registry
 from suliko.models.reference import DocumentType, Language, LanguagePairPrice, TenantSettings
@@ -517,6 +518,72 @@ async def bootstrap() -> None:
 # ── Entry point ─────────────────────────────────────────────────────────────
 
 
+async def schema_diff() -> int:
+    """Report what the database is missing compared with the models.
+
+    The question this answers is the one that actually gets asked when a
+    screen returns 500: *which* table or column is absent. Revision 0001
+    builds from ``Base.metadata``, so a database created before a model gained
+    a column has that column missing with no migration to add it — and the
+    only symptom is a 500 on whichever endpoint touches it.
+
+    Exit code 0 when the database matches, 1 when anything is missing.
+    """
+    from sqlalchemy import inspect
+
+    from suliko.models import Base
+
+    engine = get_engine()
+    missing_tables: list[str] = []
+    missing_columns: list[tuple[str, str]] = []
+
+    try:
+        conn_ctx = engine.connect()
+    except Exception as exc:
+        say(f"Could not reach the database: {type(exc).__name__}")
+        say("Check DATABASE_URL in .env and that PostgreSQL is running.")
+        return 1
+
+    async with conn_ctx as conn:
+        def table_names(sync: Any) -> set[str]:
+            return set(inspect(sync).get_table_names())
+
+        tables = await conn.run_sync(table_names)
+
+        for table in Base.metadata.sorted_tables:
+            if table.name not in tables:
+                missing_tables.append(table.name)
+                continue
+
+            def columns_of(sync: Any, name: str = table.name) -> set[str]:
+                return {c["name"] for c in inspect(sync).get_columns(name)}
+
+            actual = await conn.run_sync(columns_of)
+            for column in table.columns:
+                if column.name not in actual:
+                    missing_columns.append((table.name, column.name))
+
+    if not missing_tables and not missing_columns:
+        say(f"Schema matches the models ({len(Base.metadata.tables)} tables).")
+        return 0
+
+    if missing_tables:
+        say(f"Missing {len(missing_tables)} table(s):")
+        for name in missing_tables:
+            say(f"  - {name}")
+
+    if missing_columns:
+        say(f"Missing {len(missing_columns)} column(s):")
+        for table_name, column_name in missing_columns:
+            say(f"  - {table_name}.{column_name}")
+
+    say("")
+    say("Run `alembic upgrade head`. If that reports it is already at head,")
+    say("the database predates these models and needs a new revision:")
+    say("    alembic revision --autogenerate -m \"catch up to models\"")
+    return 1
+
+
 def main() -> None:
     # The ORM events that stamp tenant_id onto new rows live behind this call.
     # main.py installs them in the app factory, but the CLI writes tenant-scoped
@@ -532,6 +599,7 @@ def main() -> None:
     sub.add_parser("create-database", help="create the database if missing")
     sub.add_parser("migrate", help="alembic upgrade head")
     sub.add_parser("check", help="verify configuration and connectivity")
+    sub.add_parser("schema-diff", help="report tables and columns the database is missing")
 
     p = sub.add_parser("create-tenant", help="register a partner bureau")
     p.add_argument("--slug", required=True)
@@ -565,6 +633,8 @@ def main() -> None:
                     migrate()
                 case "check":
                     return await check()
+                case "schema-diff":
+                    return await schema_diff()
                 case "create-tenant":
                     await create_tenant(args.slug, args.name, args.locale)
                 case "create-superuser":

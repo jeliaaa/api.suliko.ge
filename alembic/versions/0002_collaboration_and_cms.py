@@ -18,6 +18,7 @@ the only revision allowed to build from metadata.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
 import sqlalchemy as sa
 from alembic import op
@@ -41,6 +42,25 @@ NEW_TABLES = (
 )
 
 
+def _existing_tables() -> set[str]:
+    """Tables the database already has.
+
+    Needed because a database migrated before 0001 was corrected will already
+    contain these six: that revision's ``create_all`` built everything in
+    ``Base.metadata``, including tables this revision owns. Re-creating one is
+    a hard failure, which would leave such a server permanently unable to
+    reach head.
+
+    Returns an empty set when there is no real connection — the
+    migration-parity test runs ``upgrade()`` against a recording stub and must
+    still observe every ``create_table`` call.
+    """
+    try:
+        return set(sa.inspect(op.get_bind()).get_table_names())
+    except Exception:
+        return set()
+
+
 def _timestamps() -> list[sa.Column[sa.DateTime]]:
     return [
         sa.Column(
@@ -59,8 +79,20 @@ def _timestamps() -> list[sa.Column[sa.DateTime]]:
 
 
 def upgrade() -> None:
+    # Skip anything a pre-correction 0001 already built; still apply the
+    # grants and RLS below, which that revision did not give these tables.
+    existing = _existing_tables()
+
+    def create_table(name: str, *args: Any, **kwargs: Any) -> None:
+        if name not in existing:
+            op.create_table(name, *args, **kwargs)
+
+    def create_index(name: str, table: str, columns: list[str], **kwargs: Any) -> None:
+        if table not in existing:
+            op.create_index(name, table, columns, **kwargs)
+
     # ── order_comments ──────────────────────────────────────────────────────
-    op.create_table(
+    create_table(
         "order_comments",
         sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
         sa.Column("tenant_id", sa.BigInteger(), nullable=False),
@@ -91,18 +123,18 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id", name="pk_order_comments"),
     )
-    op.create_index("ix_order_comments_tenant_id", "order_comments", ["tenant_id"])
-    op.create_index(
+    create_index("ix_order_comments_tenant_id", "order_comments", ["tenant_id"])
+    create_index(
         "ix_order_comments_tenant_order",
         "order_comments",
         ["tenant_id", "order_id", "created_at"],
     )
-    op.create_index(
+    create_index(
         "ix_order_comments_tenant_author", "order_comments", ["tenant_id", "author_user_id"]
     )
 
     # ── order_comment_mentions ──────────────────────────────────────────────
-    op.create_table(
+    create_table(
         "order_comment_mentions",
         sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
         sa.Column("tenant_id", sa.BigInteger(), nullable=False),
@@ -137,12 +169,12 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id", name="pk_order_comment_mentions"),
         sa.UniqueConstraint("comment_id", "user_id", name="uq_mention_once_per_comment"),
     )
-    op.create_index("ix_order_comment_mentions_tenant_id", "order_comment_mentions", ["tenant_id"])
-    op.create_index("ix_mentions_tenant_user", "order_comment_mentions", ["tenant_id", "user_id"])
+    create_index("ix_order_comment_mentions_tenant_id", "order_comment_mentions", ["tenant_id"])
+    create_index("ix_mentions_tenant_user", "order_comment_mentions", ["tenant_id", "user_id"])
 
     # ── order_comment_reads ─────────────────────────────────────────────────
     # No created_at/updated_at: the watermark IS the timestamp.
-    op.create_table(
+    create_table(
         "order_comment_reads",
         sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
         sa.Column("tenant_id", sa.BigInteger(), nullable=False),
@@ -175,11 +207,11 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id", name="pk_order_comment_reads"),
         sa.UniqueConstraint("user_id", "order_id", name="uq_read_once_per_order"),
     )
-    op.create_index("ix_order_comment_reads_tenant_id", "order_comment_reads", ["tenant_id"])
-    op.create_index("ix_comment_reads_tenant_user", "order_comment_reads", ["tenant_id", "user_id"])
+    create_index("ix_order_comment_reads_tenant_id", "order_comment_reads", ["tenant_id"])
+    create_index("ix_comment_reads_tenant_user", "order_comment_reads", ["tenant_id", "user_id"])
 
     # ── notifications ───────────────────────────────────────────────────────
-    op.create_table(
+    create_table(
         "notifications",
         sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
         sa.Column("tenant_id", sa.BigInteger(), nullable=False),
@@ -231,16 +263,16 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id", name="pk_notifications"),
     )
-    op.create_index("ix_notifications_tenant_id", "notifications", ["tenant_id"])
-    op.create_index(
+    create_index("ix_notifications_tenant_id", "notifications", ["tenant_id"])
+    create_index(
         "ix_notifications_tenant_user", "notifications", ["tenant_id", "user_id", "created_at"]
     )
-    op.create_index(
+    create_index(
         "ix_notifications_tenant_unread", "notifications", ["tenant_id", "user_id", "read_at"]
     )
 
     # ── service_pages ───────────────────────────────────────────────────────
-    op.create_table(
+    create_table(
         "service_pages",
         sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
         sa.Column("tenant_id", sa.BigInteger(), nullable=False),
@@ -274,11 +306,11 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id", name="pk_service_pages"),
         sa.UniqueConstraint("tenant_id", "slug", "locale", name="uq_service_page_slug_locale"),
     )
-    op.create_index("ix_service_pages_tenant_id", "service_pages", ["tenant_id"])
-    op.create_index("ix_service_pages_tenant_status", "service_pages", ["tenant_id", "status"])
+    create_index("ix_service_pages_tenant_id", "service_pages", ["tenant_id"])
+    create_index("ix_service_pages_tenant_status", "service_pages", ["tenant_id", "status"])
 
     # ── site_strings ────────────────────────────────────────────────────────
-    op.create_table(
+    create_table(
         "site_strings",
         sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
         sa.Column("tenant_id", sa.BigInteger(), nullable=False),
@@ -306,8 +338,8 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id", name="pk_site_strings"),
         sa.UniqueConstraint("tenant_id", "key", "locale", name="uq_site_string_key_locale"),
     )
-    op.create_index("ix_site_strings_tenant_id", "site_strings", ["tenant_id"])
-    op.create_index("ix_site_strings_tenant_group", "site_strings", ["tenant_id", "group_name"])
+    create_index("ix_site_strings_tenant_id", "site_strings", ["tenant_id"])
+    create_index("ix_site_strings_tenant_group", "site_strings", ["tenant_id", "group_name"])
 
     # ── Grants and row-level security ───────────────────────────────────────
     # The 0001 grant was `ON ALL TABLES`, which is a snapshot — it does not
