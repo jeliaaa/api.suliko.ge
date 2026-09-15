@@ -1,91 +1,36 @@
 """Migration 0002 must build exactly what the models declare.
 
-Revision 0001 builds from ``Base.metadata``, so it cannot drift. Every later
-revision is hand-written, which means it can — and the failure is quiet: the
-app starts, the queries compile, and a column is simply missing until someone
+Revision 0001 builds from ``Base.metadata``. Every later revision is
+hand-written, which means it can drift — and the failure is quiet: the app
+starts, the queries compile, and a column is simply missing until someone
 touches the one endpoint that uses it.
 
 These tests execute the revision's ``upgrade()`` against a recording stub and
-compare the result with the metadata. Nothing here needs a database.
+compare the result with the metadata. Nothing here needs a database. Revision
+0004 has its own module, ``test_migration_0004.py``; the recording stub lives in
+``migration_recorder.py`` so both can use it.
 """
 
 from __future__ import annotations
 
-import importlib.util
-from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import pytest
-import sqlalchemy as sa
 
+from migration_recorder import RecordedOps, import_revision, load_revision
 from suliko.models import Base
 
-REVISION = Path(__file__).resolve().parents[1] / "alembic" / "versions"
-
-
-@dataclass
-class RecordedOps:
-    """Stands in for ``alembic.op`` and remembers what it was asked to do."""
-
-    tables: dict[str, sa.Table] = field(default_factory=dict)
-    indexes: list[tuple[str, str, list[str]]] = field(default_factory=list)
-    statements: list[str] = field(default_factory=list)
-    dropped: list[str] = field(default_factory=list)
-
-    def create_table(self, name: str, *columns: Any, **kwargs: Any) -> sa.Table:
-        # A private MetaData: the real one already holds these tables, and
-        # re-declaring into it would collide.
-        table = sa.Table(name, sa.MetaData(), *columns, **kwargs)
-        self.tables[name] = table
-        return table
-
-    def create_index(self, name: str, table: str, columns: list[str], **_kwargs: Any) -> None:
-        self.indexes.append((name, table, list(columns)))
-
-    def drop_table(self, name: str) -> None:
-        self.dropped.append(name)
-
-    def drop_index(self, name: str, **_kwargs: Any) -> None:
-        self.dropped.append(name)
-
-    def execute(self, statement: Any) -> None:
-        self.statements.append(str(statement))
-
-
-def _load_revision(filename: str) -> tuple[Any, RecordedOps]:
-    """Import a revision with ``op`` replaced by the recorder, and run upgrade."""
-    path = REVISION / filename
-    spec = importlib.util.spec_from_file_location(path.stem, path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    recorder = RecordedOps()
-    module.op = recorder  # type: ignore[attr-defined]
-    module.upgrade()
-    return module, recorder
-
-
-def _import_revision(filename: str) -> Any:
-    """Import a revision module without running anything.
-
-    ``_load_revision`` executes ``upgrade()``, which 0001 cannot survive
-    against the recorder: it calls ``Base.metadata.create_all(op.get_bind())``,
-    and the recorder is not a connection. These tests only need the module's
-    declarations.
-    """
-    path = REVISION / filename
-    spec = importlib.util.spec_from_file_location(path.stem, path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+#: Every revision after 0001, in order. Each creates its own ``NEW_TABLES``.
+LATER_REVISIONS = (
+    "0002_collaboration_and_cms.py",
+    "0003_integration_credentials.py",
+    "0004_translator_portal_and_drive.py",
+)
 
 
 @pytest.fixture(scope="module")
 def revision_0002() -> tuple[Any, RecordedOps]:
-    return _load_revision("0002_collaboration_and_cms.py")
+    return load_revision("0002_collaboration_and_cms.py")
 
 
 def test_creates_exactly_the_new_tables(revision_0002: tuple[Any, RecordedOps]) -> None:
@@ -194,11 +139,8 @@ def test_0001_does_not_build_tables_that_0002_owns() -> None:
     and 0002 then dies trying to create them again — so a fresh database can
     never reach head.
     """
-    first = _import_revision("0001_initial_schema_and_rls.py")
-    second = _import_revision("0002_collaboration_and_cms.py")
-
-    third = _import_revision("0003_integration_credentials.py")
-    later = set(second.NEW_TABLES) | set(third.NEW_TABLES)
+    first = import_revision("0001_initial_schema_and_rls.py")
+    later = set().union(*(import_revision(name).NEW_TABLES for name in LATER_REVISIONS))
 
     assert later == first.LATER_REVISION_TABLES, (
         "0001 must exclude every table a later revision creates. Out of sync: "
@@ -209,9 +151,28 @@ def test_0001_does_not_build_tables_that_0002_owns() -> None:
     assert not (built_by_0001 & later)
 
 
+def test_every_model_table_is_created_by_exactly_one_revision() -> None:
+    """The same failure between later revisions: a table two of them create
+    fails the second on a fresh database, and a table none of them creates
+    exists only in tests."""
+    seen = {
+        table.name for table in import_revision("0001_initial_schema_and_rls.py")._revision_tables()
+    }
+    for name in LATER_REVISIONS:
+        tables = set(import_revision(name).NEW_TABLES)
+        overlap = seen & tables
+        assert not overlap, f"{name} creates tables an earlier revision already creates: {overlap}"
+        seen |= tables
+
+    assert seen == set(Base.metadata.tables), (
+        f"models without a migration: {sorted(set(Base.metadata.tables) - seen)} | "
+        f"migrated but not modelled: {sorted(seen - set(Base.metadata.tables))}"
+    )
+
+
 def test_0001_still_builds_the_core_tables() -> None:
     """The exclusion must not go too far the other way."""
-    first = _import_revision("0001_initial_schema_and_rls.py")
+    first = import_revision("0001_initial_schema_and_rls.py")
     built = {table.name for table in first._revision_tables()}
 
     for core in ("orders", "order_documents", "clients", "users", "tenants", "expenses"):
@@ -222,7 +183,7 @@ def test_0001_applies_rls_to_every_table_it_builds() -> None:
     """A tenant-scoped table with a grant but no policy is readable across
     tenants. The two lists are derived from the same source so they cannot
     drift, and this asserts that they have not."""
-    first = _import_revision("0001_initial_schema_and_rls.py")
+    first = import_revision("0001_initial_schema_and_rls.py")
 
     scoped = set(first._tenant_scoped_tables())
     built = {t.name for t in first._revision_tables() if "tenant_id" in t.columns}

@@ -10,7 +10,10 @@ from suliko.api.v1 import (
     integrations,
     notaries,
     notifications,
+    order_files,
     orders,
+    portal,
+    portal_admin,
     reference,
     reports,
     service_pages,
@@ -26,6 +29,7 @@ api_router.include_router(clients.router)
 api_router.include_router(translators.router)
 api_router.include_router(notaries.router)
 api_router.include_router(orders.router)
+api_router.include_router(order_files.router)
 api_router.include_router(calculator.router)
 api_router.include_router(reports.router)
 api_router.include_router(users.router)
@@ -37,13 +41,17 @@ api_router.include_router(notifications.comments_router)
 api_router.include_router(service_pages.router)
 api_router.include_router(service_pages.strings_router)
 
+# The suliko.ge translator portal and its admin. These do NOT use the staff
+# session chain in api/deps.py; see api/portal_deps.py.
+api_router.include_router(portal.router)
+api_router.include_router(portal_admin.router)
+
 # Every screen in the CRM now has a router. What is deliberately still absent:
 #
 #   - platform/    tenant provisioning, impersonation and the audit-log reader.
 #                  Superuser-only, and it needs the cross-tenant bypass in
 #                  db/tenancy.py, so it gets its own review rather than being
 #                  folded in with the tenant-scoped routers here.
-#   - files/       document uploads and the Google Drive mapping. Blocked on a
-#                  storage decision (docs/EXTERNAL-SERVICES.md §6).
-#   - integrations SMS, Bank of Georgia, api24. Each needs the envelope
-#                  encryption in core/crypto.py for its stored credentials.
+#
+# Order files are decided: a bureau's Google Shared Drive (order_files.py),
+# and the database for translators' personal orders (portal.py).

@@ -22,6 +22,7 @@ from suliko.models.directory import (
     Translator,
     TranslatorLanguagePair,
 )
+from suliko.models.drive import DriveSettings, OrderDocumentDriveFolder, OrderDriveFolder
 from suliko.models.finance import (
     ClientPayment,
     ClientPaymentAllocation,
@@ -41,6 +42,14 @@ from suliko.models.order import (
     OrderDocument,
     OrderStatusEvent,
     Urgency,
+)
+from suliko.models.portal import (
+    FileKind,
+    PersonalOrder,
+    PersonalOrderFile,
+    PersonalOrderLanguagePair,
+    PortalTranslator,
+    PortalTranslatorLink,
 )
 from suliko.models.reference import (
     Company,
@@ -74,7 +83,9 @@ __all__ = [
     "CompanyBankAccount",
     "CopyType",
     "DocumentType",
+    "DriveSettings",
     "Expense",
+    "FileKind",
     "HandoverMethod",
     "IntegrationCredential",
     "IntegrationProvider",
@@ -93,10 +104,17 @@ __all__ = [
     "OrderCommentMention",
     "OrderCommentRead",
     "OrderDocument",
+    "OrderDocumentDriveFolder",
+    "OrderDriveFolder",
     "OrderStatusEvent",
     "PageStatus",
     "PasswordResetToken",
     "PaymentMethod",
+    "PersonalOrder",
+    "PersonalOrderFile",
+    "PersonalOrderLanguagePair",
+    "PortalTranslator",
+    "PortalTranslatorLink",
     "Role",
     "ServicePage",
     "SiteString",

@@ -104,9 +104,35 @@ class Settings(BaseSettings):
     #: localhost. Turns the missing-gateway-secret check below into an error.
     public_api: bool = False
 
+    # ── Translator portal (suliko.ge) ───────────────────────────────────────
+    #: HMAC key shared with the suliko.ge Next.js server. It signs the identity
+    #: assertion that server sends with every portal call, and the file tickets
+    #: that let a browser move one file directly. See security/portal_tokens.py.
+    #: Empty disables the portal: every portal call is refused with 401.
+    #:
+    #: Separate from BFF_SHARED_SECRET on purpose. That one proves "the caller
+    #: is our frontend"; this one vouches for WHICH suliko.ge user is acting,
+    #: and is never itself sent over the wire.
+    portal_shared_secret: SecretStr = SecretStr("")
+    portal_assertion_max_age_seconds: int = 60
+    portal_ticket_max_age_seconds: int = 300
+
+    #: Personal-order files live in the database, so they are capped harder
+    #: than files that go to an organisation's Shared Drive.
+    personal_file_max_bytes: int = 25 * 1024 * 1024
+    drive_file_max_bytes: int = 50 * 1024 * 1024
+
+    # ── Google Drive ────────────────────────────────────────────────────────
+    #: Path to Suliko's service-account JSON key. Each organisation adds the
+    #: service account's email to one of its Shared Drives, and the suliko.ge
+    #: admin records that drive against the tenant. Unset disables Drive: order
+    #: data still works, file lists report that storage is not configured.
+    google_service_account_file: str | None = None
+
     # ── CORS ────────────────────────────────────────────────────────────────
-    # The browser never calls this API directly; the Next.js BFF does,
-    # server-side. CORS therefore stays narrow.
+    # The Next.js BFF calls this API server-side. The one exception is portal
+    # file transfer, where a browser holding a signed ticket uploads or
+    # downloads directly — so production lists the suliko.ge origins here too.
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
 
     # ── App ─────────────────────────────────────────────────────────────────
@@ -151,6 +177,11 @@ class Settings(BaseSettings):
                 "internet-facing API should not accept requests from callers "
                 "other than the frontend."
             )
+        portal_secret = self.portal_shared_secret.get_secret_value()
+        if portal_secret and len(portal_secret) < 32:
+            # It signs statements about who a user is. A short key is a
+            # brute-forceable key, and brute-forcing it is impersonation.
+            problems.append("PORTAL_SHARED_SECRET must be at least 32 characters")
         # Loopback is not an insecure transport — it never leaves the machine.
         # A single-box deployment where IIS reverse-proxies to 127.0.0.1
         # legitimately has an http loopback origin.
