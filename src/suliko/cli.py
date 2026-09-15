@@ -34,7 +34,7 @@ from sqlalchemy import select, text
 from suliko.config import get_settings
 from suliko.core.crypto import encrypt_for_tenant
 from suliko.db.session import dispose_engine, get_sessionmaker
-from suliko.db.tenancy import bypass_tenant_scope, tenant_scope
+from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
 from suliko.models.directory import Client, ClientType  # noqa: F401 — registry
 from suliko.models.reference import DocumentType, Language, LanguagePairPrice, TenantSettings
 from suliko.models.tenant import Tenant, TenantStatus
@@ -510,6 +510,13 @@ async def bootstrap() -> None:
 
 
 def main() -> None:
+    # The ORM events that stamp tenant_id onto new rows live behind this call.
+    # main.py installs them in the app factory, but the CLI writes tenant-scoped
+    # rows too (seed-reference, create-superuser) and gets its sessions straight
+    # from the sessionmaker, so without this every insert arrives with
+    # tenant_id NULL and trips the NOT NULL constraint.
+    install_tenant_filter()
+
     parser = argparse.ArgumentParser(prog="suliko", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
