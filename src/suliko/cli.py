@@ -426,6 +426,14 @@ async def check() -> int:
         fail("ENCRYPTION_MASTER_KEY is not set")
         problems += 1
 
+    # Shown explicitly because `extra="ignore"` on Settings means an unknown
+    # or misspelled variable in .env is dropped in silence. Without this line,
+    # "I set MFA_ENFORCED=false and nothing happened" has no cheap answer.
+    if settings.mfa_enforced:
+        ok("MFA is ENFORCED")
+    else:
+        warn("MFA is DISABLED — every account signs in with a password alone")
+
     if settings.redis_url:
         ok("Redis configured for rate limiting")
     elif settings.rate_limit_single_instance:

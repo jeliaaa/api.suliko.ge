@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import enum
 from datetime import date, datetime
+from decimal import Decimal
 
 from sqlalchemy import Boolean, Date, DateTime, Enum, Index, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
@@ -76,7 +77,7 @@ class Translator(Base, IdMixin, TenantScoped, TimestampMixin):
 
     # Default per-page rate paid to this translator. Per-pair overrides live in
     # TranslatorLanguagePair.
-    default_rate: Mapped[float | None] = mapped_column(Numeric(10, 2), default=None)
+    default_rate: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
 
     # Translator-portal credentials. Presence of a username is what the UI
     # renders as the "Active" / "None" account badge.
@@ -113,7 +114,7 @@ class TranslatorLanguagePair(Base, IdMixin, TenantScoped, TimestampMixin):
     translator_id: Mapped[int] = mapped_column(nullable=False)
     source_language: Mapped[str] = mapped_column(String(5), nullable=False)
     target_language: Mapped[str] = mapped_column(String(5), nullable=False)
-    rate_per_page: Mapped[float | None] = mapped_column(Numeric(10, 2), default=None)
+    rate_per_page: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
 
 
 class Notary(Base, IdMixin, TenantScoped, TimestampMixin):

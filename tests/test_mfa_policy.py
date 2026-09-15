@@ -155,6 +155,8 @@ async def _gate(*, enforced: bool, mfa_satisfied_at: object) -> bool:
             email="u@example.com",
             role=Role.SUPERUSER,
             tenant_id=1,
+            tenant_slug="acme",
+            tenant_name="Acme Translations",
             permissions=permissions_for_role(Role.SUPERUSER),
             mfa_satisfied_at=(datetime.now(UTC) if mfa_satisfied_at else None),
             impersonated_by_user_id=None,

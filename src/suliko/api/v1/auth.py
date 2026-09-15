@@ -322,6 +322,8 @@ class SessionInfo(BaseModel):
     email: str
     role: str
     tenant_id: int
+    tenant_slug: str
+    tenant_name: str
     permissions: list[str]
     mfa_satisfied: bool
     is_impersonated: bool
@@ -339,6 +341,8 @@ async def current_session(
         email=session.email,
         role=session.role.value,
         tenant_id=session.tenant_id,
+        tenant_slug=session.tenant_slug,
+        tenant_name=session.tenant_name,
         permissions=sorted(p.value for p in session.permissions),
         # Must agree with the gate in deps.get_authenticated_session. When MFA
         # is switched off the gate lets every request through, so reporting

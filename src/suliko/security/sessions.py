@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from suliko.config import get_settings
 from suliko.db.tenancy import bypass_tenant_scope
+from suliko.models.tenant import Tenant
 from suliko.models.user import Role, User, UserSession
 from suliko.security.passwords import generate_token, hash_token
 from suliko.security.permissions import Permission, permissions_for_role
@@ -42,6 +43,11 @@ class AuthenticatedSession:
     email: str
     role: Role
     tenant_id: int
+    #: The bureau's slug and display name. Resolved here rather than fetched
+    #: per-page because the app shell shows the organisation on every screen,
+    #: and the session lookup is already joining this row.
+    tenant_slug: str
+    tenant_name: str
     permissions: frozenset[Permission]
     mfa_satisfied_at: datetime | None
     impersonated_by_user_id: int | None
@@ -118,8 +124,9 @@ async def resolve_session(db: AsyncSession, token: str) -> AuthenticatedSession 
     with bypass_tenant_scope():
         row = (
             await db.execute(
-                select(UserSession, User)
+                select(UserSession, User, Tenant)
                 .join(User, User.id == UserSession.user_id)
+                .join(Tenant, Tenant.id == User.tenant_id)
                 .where(UserSession.token_hash == token_digest)
             )
         ).first()
@@ -127,7 +134,7 @@ async def resolve_session(db: AsyncSession, token: str) -> AuthenticatedSession 
         if row is None:
             return None
 
-        user_session, user = row
+        user_session, user, tenant = row
 
         if not user_session.is_valid_at(now):
             return None
@@ -157,6 +164,8 @@ async def resolve_session(db: AsyncSession, token: str) -> AuthenticatedSession 
             email=user.email,
             role=user.role,
             tenant_id=user.tenant_id,
+            tenant_slug=tenant.slug,
+            tenant_name=tenant.display_name,
             permissions=permissions_for_role(user.role),
             mfa_satisfied_at=user_session.mfa_satisfied_at,
             impersonated_by_user_id=user_session.impersonated_by_user_id,
