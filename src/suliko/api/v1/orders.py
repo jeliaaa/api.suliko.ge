@@ -35,7 +35,7 @@ from suliko.domain.orders import base_order_query
 from suliko.domain.pricing import DocumentPricingInput, PricingConfig, price_document
 from suliko.domain.statuses import INITIAL_STATUS, get_label, is_known
 from suliko.models.collaboration import NotificationKind
-from suliko.models.directory import Client, ClientType
+from suliko.models.directory import Client, ClientType, Translator
 from suliko.models.order import (
     CopyType,
     HandoverMethod,
@@ -96,6 +96,19 @@ class OrderUpdate(BaseModel):
     handover_method: HandoverMethod | None = None
     delivery_address: str | None = Field(default=None, max_length=500)
     notes: str | None = None
+
+
+class OrderDocumentUpdate(BaseModel):
+    """Reassign a document after the order was created.
+
+    Only the fields present are applied, so ``{"translator_id": null}``
+    unassigns while ``{}`` changes nothing.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    translator_id: int | None = None
+    translator_cost: Decimal | None = Field(default=None, ge=0)
 
 
 class StatusChange(BaseModel):
@@ -581,6 +594,52 @@ async def update_order(
         entity_id=order.id,
         before=before,
         after=changes,
+    )
+    return await _load_detail(order_id, db)
+
+
+@router.patch("/{order_id}/documents/{document_id}", response_model=OrderDetail)
+async def update_order_document(
+    order_id: int,
+    document_id: int,
+    payload: OrderDocumentUpdate,
+    db: Db,
+    session: CurrentSession,
+    _: Annotated[object, Depends(require(Permission.ORDERS_WRITE))],
+) -> OrderDetail:
+    """Assign, reassign or unassign a document's translator.
+
+    This is what puts a document in a translator's suliko.ge Orders tab: the
+    portal shows documents whose ``translator_id`` is a directory row linked to
+    that translator's account.
+    """
+    document = await db.get(OrderDocument, document_id)
+    if document is None or document.order_id != order_id:
+        raise NotFoundError("Document not found.")
+
+    changes = payload.model_dump(exclude_unset=True)
+    if "translator_cost" in changes and payload.translator_cost is None:
+        raise ValidationError("translator_cost cannot be null.")
+    if changes.get("translator_id") is not None:
+        translator = await db.get(Translator, payload.translator_id)
+        if translator is None:
+            raise ValidationError("That translator does not exist.")
+
+    before = {key: getattr(document, key) for key in changes}
+    for key, value in changes.items():
+        setattr(document, key, value)
+    await db.flush()
+
+    from suliko.core.audit import record
+
+    await record(
+        db,
+        session,
+        action="order.document_updated",
+        entity_type="order",
+        entity_id=order_id,
+        before={"document_id": document_id, **before},
+        after={"document_id": document_id, **changes},
     )
     return await _load_detail(order_id, db)
 

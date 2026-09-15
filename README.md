@@ -23,7 +23,7 @@ only be made here, never through the API: there is no sign-up path and no
 "first user becomes admin" rule.
 
 ```bash
-pytest -q                             # 117 tests
+pytest -q                             # 330 tests
 ruff check . && ruff format --check .
 mypy src
 ```
@@ -36,6 +36,34 @@ rest follow it. See the build doc for what is and is not done.
 
 **The initial migration has never run against a live Postgres** — Docker was unavailable when
 it was written. Verify it, then write `tests/test_rls.py` before trusting row-level security.
+
+## Translator portal (suliko.ge)
+
+Translators sign in to **suliko.ge**, not to this API. suliko.ge's Next.js server checks their
+login with its own .NET backend, then calls `/api/v1/portal/*` with a signed assertion saying
+which suliko.ge user is acting (`security/portal_tokens.py`, key `PORTAL_SHARED_SECRET`, the same
+value as suliko-front's `SULIKO_PORTAL_SECRET`).
+
+- **Admin** (`/api/v1/portal-admin/*`, suliko.ge admins only): mark a suliko.ge account as a
+  translator, link it to any number of bureaus — each link points at that bureau's own
+  `translators` row, existing or new — and record each bureau's Google Shared Drive.
+- **Assigned orders**: a document shows up in the translator's Orders tab when staff set its
+  `translator_id` to a linked row (`PATCH /api/v1/orders/{id}/documents/{doc_id}`). Translators
+  see order id, client name, due date and **only their own documents** — no prices.
+- **Files**: `Suliko Orders/#123 · Client/Document 456 · en → ka/{Source,Translation}` in the
+  bureau's Shared Drive. Staff drop sources straight into Drive; translators upload translations.
+  Browsers transfer files directly with short-lived tickets, because Vercel caps function bodies
+  at 4.5 MB.
+- **Personal orders**: a translator's own orders, visible to no bureau; files in the database.
+
+Drive setup: create a Google service account, download its JSON key, point
+`GOOGLE_SERVICE_ACCOUNT_FILE` at it, and have each bureau add the account's email to a Shared
+Drive as **Content manager**. A service account has no storage quota of its own, so a folder in
+someone's My Drive will not work.
+
+`portal_translators`, `portal_translator_links` and `personal_*` are deliberately platform-level
+(no RLS): the portal must find a translator's bureaus before any tenant is bound. Everything read
+*inside* a bureau still goes through `tenant_scope`. See `models/portal.py`.
 
 ## Stack
 

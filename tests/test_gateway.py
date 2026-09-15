@@ -111,6 +111,32 @@ def test_gateway_is_inert_when_no_secret_is_configured(
     assert response.status_code == 401
 
 
+# ── Portal file tickets ─────────────────────────────────────────────────────
+
+
+def test_portal_ticket_request_passes_the_gateway(client_with_gateway: TestClient) -> None:
+    """A browser downloading a file cannot hold the gateway secret; its ticket
+    is checked by the endpoint instead — so a bogus one gets 401, not 404."""
+    response = client_with_gateway.get(
+        "/api/v1/portal/personal-orders/1/files/1", params={"ticket": "not-a-real-ticket"}
+    )
+    assert response.status_code == 401
+
+
+def test_portal_request_without_a_ticket_is_still_gated(client_with_gateway: TestClient) -> None:
+    assert client_with_gateway.get("/api/v1/portal/me").status_code == 404
+
+
+def test_a_ticket_parameter_does_not_open_other_routes(client_with_gateway: TestClient) -> None:
+    response = client_with_gateway.get("/api/v1/clients", params={"ticket": "anything"})
+    assert response.status_code == 404
+
+
+def test_short_portal_secret_is_refused_in_production() -> None:
+    with pytest.raises(RuntimeError, match="PORTAL_SHARED_SECRET"):
+        _prod(portal_shared_secret="too-short").validate_for_production()
+
+
 # ── Production validation ───────────────────────────────────────────────────
 
 

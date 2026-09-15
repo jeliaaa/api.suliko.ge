@@ -46,6 +46,23 @@ HEADER_NAME = "X-Suliko-Gateway"
 #: CORS preflight is exempt because browsers do not send custom headers on it.
 EXEMPT_PATHS = frozenset({"/health"})
 
+#: Portal file transfer is done by a browser holding a signed ticket (see
+#: security/portal_tokens.py), and a browser cannot hold the gateway secret.
+#: The endpoint verifies the ticket, which is bound to one user, method and
+#: path and expires within minutes — a stronger credential than the shared
+#: secret it stands in for here. Presenting a bogus ticket only reaches that
+#: check and a 401.
+PORTAL_TICKET_PARAM = "ticket"
+
+
+def _is_portal_ticket_request(request: Request) -> bool:
+    prefix = f"{get_settings().api_v1_prefix}/portal/"
+    return (
+        request.method in ("GET", "POST")
+        and request.url.path.startswith(prefix)
+        and PORTAL_TICKET_PARAM in request.query_params
+    )
+
 
 class GatewayMiddleware(BaseHTTPMiddleware):
     async def dispatch(
@@ -58,6 +75,9 @@ class GatewayMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         if request.url.path in EXEMPT_PATHS or request.method == "OPTIONS":
+            return await call_next(request)
+
+        if _is_portal_ticket_request(request):
             return await call_next(request)
 
         presented = request.headers.get(HEADER_NAME, "")

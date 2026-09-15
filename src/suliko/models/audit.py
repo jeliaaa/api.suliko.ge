@@ -25,6 +25,11 @@ class ActorType(enum.StrEnum):
     SUPERUSER = "superuser"
     API_PARTNER = "api_partner"
     SYSTEM = "system"
+    #: suliko.ge accounts, identified by the portal assertion rather than a
+    #: CRM session. Their ids are not CRM user ids, so ``actor_id`` stays null
+    #: and the suliko.ge id is recorded in ``after.actor_external_user_id``.
+    PORTAL_ADMIN = "portal_admin"
+    PORTAL_TRANSLATOR = "portal_translator"
 
 
 class AuditLog(Base, IdMixin, TimestampMixin):

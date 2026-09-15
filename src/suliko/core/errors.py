@@ -18,6 +18,7 @@ from typing import Any
 
 import structlog
 from fastapi import FastAPI, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
@@ -88,6 +89,22 @@ class MfaRequiredError(AppError):
 
     status_code = status.HTTP_401_UNAUTHORIZED
     error_code = "mfa_required"
+
+
+class PayloadTooLargeError(AppError):
+    status_code = status.HTTP_413_CONTENT_TOO_LARGE
+    error_code = "payload_too_large"
+
+
+class UpstreamUnavailableError(AppError):
+    """A service we depend on (Google Drive) failed or refused.
+
+    The detail is ours; the upstream's own message is logged, not returned, as
+    it can name internal ids.
+    """
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    error_code = "upstream_unavailable"
 
 
 class RateLimitedError(AppError):
@@ -190,12 +207,15 @@ def install_error_handlers(app: FastAPI) -> None:
     async def _validation(request: Request, exc: RequestValidationError) -> JSONResponse:
         # Pydantic's errors describe our own schema, not user secrets, so they
         # are safe to return — they make integration far easier to debug.
+        # jsonable_encoder because a custom validator's error carries the
+        # raised exception object in `ctx`, which json.dumps cannot encode —
+        # without it, any `raise ValueError` in a validator became a 500.
         return _problem(
             request,
             status.HTTP_422_UNPROCESSABLE_CONTENT,
             "validation_failed",
             "Request validation failed.",
-            {"errors": exc.errors()},
+            {"errors": jsonable_encoder(exc.errors())},
         )
 
     @app.exception_handler(StarletteHTTPException)

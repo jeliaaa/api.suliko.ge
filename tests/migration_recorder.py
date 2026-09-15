@@ -1,0 +1,63 @@
+"""Run a migration revision against a recorder instead of a database.
+
+Shared by the migration parity tests. Not a test module itself (no ``test_``
+prefix), so pytest does not collect it.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import sqlalchemy as sa
+
+REVISIONS = Path(__file__).resolve().parents[1] / "alembic" / "versions"
+
+
+@dataclass
+class RecordedOps:
+    """Stands in for ``alembic.op`` and remembers what it was asked to do."""
+
+    tables: dict[str, sa.Table] = field(default_factory=dict)
+    indexes: list[tuple[str, str, list[str]]] = field(default_factory=list)
+    statements: list[str] = field(default_factory=list)
+    dropped: list[str] = field(default_factory=list)
+
+    def create_table(self, name: str, *columns: Any, **kwargs: Any) -> sa.Table:
+        # A private MetaData: the real one already holds these tables, and
+        # re-declaring into it would collide.
+        table = sa.Table(name, sa.MetaData(), *columns, **kwargs)
+        self.tables[name] = table
+        return table
+
+    def create_index(self, name: str, table: str, columns: list[str], **_kwargs: Any) -> None:
+        self.indexes.append((name, table, list(columns)))
+
+    def drop_table(self, name: str) -> None:
+        self.dropped.append(name)
+
+    def drop_index(self, name: str, **_kwargs: Any) -> None:
+        self.dropped.append(name)
+
+    def execute(self, statement: Any) -> None:
+        self.statements.append(str(statement))
+
+
+def import_revision(filename: str) -> Any:
+    path = REVISIONS / filename
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_revision(filename: str) -> tuple[Any, RecordedOps]:
+    """Import a revision with ``op`` replaced by the recorder, and run upgrade."""
+    module = import_revision(filename)
+    recorder = RecordedOps()
+    module.op = recorder
+    module.upgrade()
+    return module, recorder

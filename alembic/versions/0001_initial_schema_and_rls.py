@@ -82,6 +82,15 @@ LATER_REVISION_TABLES = frozenset(
         "site_strings",
         # 0003
         "integration_credentials",
+        # 0004
+        "portal_translators",
+        "portal_translator_links",
+        "personal_orders",
+        "personal_order_language_pairs",
+        "personal_order_files",
+        "drive_settings",
+        "order_drive_folders",
+        "order_document_drive_folders",
     }
 )
 
