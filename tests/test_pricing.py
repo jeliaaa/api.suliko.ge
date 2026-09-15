@@ -309,3 +309,36 @@ def test_tier_rates_decrease(tiers: tuple[tuple[int | None, Decimal], ...]) -> N
     """Bulk work gets cheaper per page — an increase would be a transcription error."""
     rates = [rate for _, rate in tiers]
     assert rates == sorted(rates, reverse=True)
+
+
+# ── Money columns must never be floats ──────────────────────────────────────
+
+
+def test_every_numeric_column_is_annotated_decimal() -> None:
+    """A `Numeric` column annotated `float` is a lie and a latent bug.
+
+    SQLAlchemy returns `Decimal` for `Numeric`, so the annotation would be
+    wrong at runtime — and worse, it invites arithmetic in float, which is
+    exactly the drift this whole module exists to prevent. This caught
+    nine such columns when it was written.
+    """
+    from sqlalchemy import Numeric
+
+    import suliko.models  # noqa: F401 — populates the registry
+    from suliko.db.base import Base
+
+    offenders: list[str] = []
+    for mapper in Base.registry.mappers:
+        for prop in mapper.column_attrs:
+            column = prop.columns[0]
+            if not isinstance(column.type, Numeric):
+                continue
+            annotation = mapper.class_.__annotations__.get(prop.key)
+            # Annotations are strings under `from __future__ import annotations`.
+            if annotation is not None and "Decimal" not in str(annotation):
+                offenders.append(f"{mapper.class_.__name__}.{prop.key} -> {annotation}")
+
+    assert not offenders, (
+        "these Numeric columns are not annotated Decimal, so money would be "
+        f"handled as float: {offenders}"
+    )

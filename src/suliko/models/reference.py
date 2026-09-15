@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from sqlalchemy import Boolean, Index, Numeric, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -32,7 +34,9 @@ class DocumentType(Base, IdMixin, TenantScoped, TimestampMixin):
 
     name_en: Mapped[str] = mapped_column(String(255), nullable=False)
     name_ka: Mapped[str] = mapped_column(String(255), nullable=False)
-    price_multiplier: Mapped[float] = mapped_column(Numeric(6, 3), default=1.0, nullable=False)
+    price_multiplier: Mapped[Decimal] = mapped_column(
+        Numeric(6, 3), default=Decimal("1.0"), nullable=False
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
 
@@ -52,7 +56,7 @@ class LanguagePairPrice(Base, IdMixin, TenantScoped, TimestampMixin):
 
     source_language: Mapped[str] = mapped_column(String(5), nullable=False)
     target_language: Mapped[str] = mapped_column(String(5), nullable=False)
-    price_per_page: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    price_per_page: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     @property
@@ -113,16 +117,18 @@ class TenantSettings(Base, IdMixin, TenantScoped, TimestampMixin):
     # Pricing knobs the PHP keeps in config_shared.php. Per-tenant here so a
     # partner bureau can set its own express/urgent surcharges and courier fee
     # without a code change.
-    urgency_multiplier_standard: Mapped[float] = mapped_column(
-        Numeric(6, 3), default=1.0, nullable=False
+    urgency_multiplier_standard: Mapped[Decimal] = mapped_column(
+        Numeric(6, 3), default=Decimal("1.0"), nullable=False
     )
-    urgency_multiplier_express: Mapped[float] = mapped_column(
-        Numeric(6, 3), default=1.5, nullable=False
+    urgency_multiplier_express: Mapped[Decimal] = mapped_column(
+        Numeric(6, 3), default=Decimal("1.5"), nullable=False
     )
-    urgency_multiplier_urgent: Mapped[float] = mapped_column(
-        Numeric(6, 3), default=2.0, nullable=False
+    urgency_multiplier_urgent: Mapped[Decimal] = mapped_column(
+        Numeric(6, 3), default=Decimal("2.0"), nullable=False
     )
-    delivery_fee: Mapped[float] = mapped_column(Numeric(10, 2), default=10, nullable=False)
-    default_translator_share: Mapped[float] = mapped_column(
-        Numeric(4, 3), default=0.5, nullable=False
+    delivery_fee: Mapped[Decimal] = mapped_column(
+        Numeric(10, 2), default=Decimal("10"), nullable=False
+    )
+    default_translator_share: Mapped[Decimal] = mapped_column(
+        Numeric(4, 3), default=Decimal("0.5"), nullable=False
     )
