@@ -38,7 +38,12 @@ from suliko.core.errors import (
     UpstreamUnavailableError,
     ValidationError,
 )
-from suliko.domain.order_files import get_drive_settings, parse_shared_drive_id
+from suliko.domain.order_files import (
+    DriveLinkError,
+    get_drive_settings,
+    resolve_shared_drive,
+    save_drive_link,
+)
 from suliko.domain.portal import (
     MatchReason,
     directory_matches,
@@ -46,10 +51,8 @@ from suliko.domain.portal import (
     find_tenant_by_slug,
     search_directory,
 )
-from suliko.integrations.google_drive import DriveError, DriveNotConfiguredError
 from suliko.models.audit import ActorType
 from suliko.models.directory import Translator
-from suliko.models.drive import DriveSettings, OrderDocumentDriveFolder, OrderDriveFolder
 from suliko.models.portal import PortalTranslator, PortalTranslatorLink
 from suliko.models.tenant import Tenant, TenantStatus
 
@@ -315,49 +318,16 @@ async def set_organization_drive(
     """
     tenant = await _tenant(db, slug)
 
-    drive_id: str | None = None
-    drive_name: str | None = None
-    if payload.shared_drive is not None:
-        drive_id = parse_shared_drive_id(payload.shared_drive)
-        if drive_id is None:
-            raise ValidationError("That is not a Shared Drive id or link.")
-        try:
-            drive_name = await drive.get_shared_drive_name(drive_id)
-        except DriveNotConfiguredError as exc:
-            raise ValidationError(
-                "Google Drive is not configured on the API server (GOOGLE_SERVICE_ACCOUNT_FILE)."
-            ) from exc
-        except DriveError as exc:
-            if exc.status in (403, 404):
-                raise ValidationError(
-                    "Suliko cannot open that Shared Drive. Add "
-                    f"{drive.service_account_email} to it as a Content manager, then try again."
-                ) from exc
-            log.warning("drive_call_failed", status=exc.status, error=str(exc))
-            raise UpstreamUnavailableError("Google Drive is not available right now.") from exc
+    try:
+        drive_id, drive_name = await resolve_shared_drive(drive, payload.shared_drive)
+    except DriveLinkError as exc:
+        if exc.upstream:
+            log.warning("drive_call_failed", error=str(exc))
+            raise UpstreamUnavailableError(exc.message) from exc
+        raise ValidationError(exc.message) from exc
 
     async with tenants(tenant.id) as tenant_db:
-        settings = await get_drive_settings(tenant_db)
-        previous = settings.shared_drive_id if settings else None
-
-        if drive_id is None:
-            if settings is not None:
-                await tenant_db.delete(settings)
-        elif settings is None:
-            tenant_db.add(DriveSettings(shared_drive_id=drive_id, drive_name=drive_name))
-        else:
-            settings.shared_drive_id = drive_id
-            settings.drive_name = drive_name
-
-        if previous != drive_id:
-            # Folder ids point into the previous drive and mean nothing in a new
-            # one. Loaded and deleted through the ORM, so the tenant filter —
-            # which covers SELECTs, not bulk DELETEs — decides what goes.
-            for model in (OrderDocumentDriveFolder, OrderDriveFolder):
-                for stale in (await tenant_db.execute(select(model))).scalars():
-                    await tenant_db.delete(stale)
-
-        await tenant_db.flush()
+        previous = await save_drive_link(tenant_db, drive_id, drive_name)
 
     await _audit(
         db,

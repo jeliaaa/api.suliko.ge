@@ -35,6 +35,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from suliko.core.errors import NotFoundError
+from suliko.db.tenancy import TenantContextError, is_bypassed, try_get_current_tenant_id
 from suliko.integrations.google_drive import DriveClient, DriveError, DriveFile
 from suliko.models.drive import DriveSettings, OrderDocumentDriveFolder, OrderDriveFolder
 from suliko.models.order import Order, OrderDocument
@@ -129,6 +130,112 @@ def attachment_headers(file_name: str) -> dict[str, str]:
 
 async def get_drive_settings(db: AsyncSession) -> DriveSettings | None:
     return (await db.execute(select(DriveSettings))).scalars().first()
+
+
+# ── Linking a bureau to a Shared Drive ──────────────────────────────────────
+#
+# Shared by the two places allowed to do it: the suliko.ge admin panel and the
+# CRM's platform console. One implementation, so the check that matters cannot
+# drift between them.
+#
+# ## Why linking is an OPERATOR action, not a bureau one
+#
+# Every bureau adds the SAME Suliko service account to its drive. So the
+# service account can open every linked drive on the platform, and a drive id
+# is all it takes to point a tenant at one. If a bureau could link its own
+# drive, bureau A could paste bureau B's drive id and read B's documents
+# through the CRM. Until ownership of a drive can be proved, linking stays
+# with someone trusted to check it.
+
+
+class DriveLinkError(Exception):
+    """A drive could not be linked. `message` is written to be shown."""
+
+    def __init__(self, message: str, *, upstream: bool = False) -> None:
+        super().__init__(message)
+        self.message = message
+        #: True when Google, not the input, is at fault.
+        self.upstream = upstream
+
+
+async def resolve_shared_drive(
+    drive: DriveClient, raw: str | None
+) -> tuple[str | None, str | None]:
+    """Parse a pasted id or link and open the drive, before anything is saved.
+
+    Returns ``(None, None)`` for "disconnect". Opening it first means a typo, or
+    a drive nobody shared with Suliko, is caught now rather than at the first
+    upload.
+    """
+    from suliko.integrations.google_drive import DriveNotConfiguredError
+
+    if raw is None or not raw.strip():
+        return None, None
+
+    drive_id = parse_shared_drive_id(raw)
+    if drive_id is None:
+        raise DriveLinkError("That is not a Shared Drive id or link.")
+
+    try:
+        name = await drive.get_shared_drive_name(drive_id)
+    except DriveNotConfiguredError as exc:
+        raise DriveLinkError(
+            "Google Drive is not configured on the API server "
+            "(GOOGLE_SERVICE_ACCOUNT_FILE is not set)."
+        ) from exc
+    except DriveError as exc:
+        if exc.status in (403, 404):
+            raise DriveLinkError(
+                "Suliko cannot open that Shared Drive. Add "
+                f"{drive.service_account_email} to it as a Content manager, then try again."
+            ) from exc
+        raise DriveLinkError("Google Drive is not available right now.", upstream=True) from exc
+
+    return drive_id, name
+
+
+async def save_drive_link(
+    db: AsyncSession, drive_id: str | None, drive_name: str | None
+) -> str | None:
+    """Store the link for the tenant IN SCOPE, and return the previous drive id.
+
+    `db` must already be scoped to the target tenant — ambient context, RLS
+    GUC and all. The stale-folder cleanup below relies on the ORM filter to
+    pick that tenant's rows, so an unscoped session here would wipe every
+    bureau's folder ids at once.
+    """
+    # Refuse rather than trust the caller. Under `bypass_tenant_scope()` the
+    # cleanup below is unfiltered and deletes EVERY bureau's folder ids — and
+    # the platform router, the natural caller, holds that bypass for its reads.
+    # Failing loudly here turns a silent platform-wide wipe into a stack trace.
+    if is_bypassed() or try_get_current_tenant_id() is None:
+        raise TenantContextError(
+            "save_drive_link needs a single tenant in scope. Wrap the call in "
+            "tenant_scope(tenant_id), not bypass_tenant_scope()."
+        )
+
+    settings = await get_drive_settings(db)
+    previous = settings.shared_drive_id if settings else None
+
+    if drive_id is None:
+        if settings is not None:
+            await db.delete(settings)
+    elif settings is None:
+        db.add(DriveSettings(shared_drive_id=drive_id, drive_name=drive_name))
+    else:
+        settings.shared_drive_id = drive_id
+        settings.drive_name = drive_name
+
+    if previous != drive_id:
+        # Folder ids point into the previous drive and mean nothing in a new
+        # one. Loaded and deleted through the ORM, so the tenant filter —
+        # which covers SELECTs, not bulk DELETEs — decides what goes.
+        for model in (OrderDocumentDriveFolder, OrderDriveFolder):
+            for stale in (await db.execute(select(model))).scalars():
+                await db.delete(stale)
+
+    await db.flush()
+    return previous
 
 
 async def _find_or_create(

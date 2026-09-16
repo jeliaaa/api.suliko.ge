@@ -27,6 +27,15 @@ stamp, and an explicit `tenant_id` on the row. The tenant is resolved from the
 URL and 404s before anything is written, so a write cannot land in a bureau
 that does not exist — or, worse, in the operator's own by omission.
 
+## Before row-level security is switched on
+
+Every read here runs under `bypass_tenant_scope()`, which switches off the ORM
+filter — but NOT PostgreSQL's RLS policies, which key on the session's GUC.
+Today that is invisible because the app connects as a PostgreSQL superuser and
+RLS is not enforced at all. The day it is, this router needs its own
+connection role with `BYPASSRLS`, or every other tenant's rows will silently
+come back empty.
+
 ## What is NOT here
 
 **Impersonation.** `Permission.PLATFORM_IMPERSONATE` exists and is in
@@ -52,10 +61,18 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy import case, func, select
 
 from suliko.api.deps import Db, require
-from suliko.core.errors import ConflictError, NotFoundError, ValidationError
+from suliko.api.portal_deps import Drive
+from suliko.core.errors import (
+    ConflictError,
+    NotFoundError,
+    UpstreamUnavailableError,
+    ValidationError,
+)
 from suliko.db.session import bind_tenant_guc
 from suliko.db.tenancy import bypass_tenant_scope, tenant_scope
+from suliko.domain.order_files import DriveLinkError, resolve_shared_drive, save_drive_link
 from suliko.domain.plans import TenantPlan, effective_plan
+from suliko.models.drive import DriveSettings
 from suliko.models.order import Order, OrderDocument
 from suliko.models.reference import Language, LanguagePairPrice
 from suliko.models.tenant import Tenant, TenantStatus
@@ -137,6 +154,14 @@ class TenantFigures(BaseModel):
     last_order: date | None
 
 
+class DriveLink(BaseModel):
+    #: None when the bureau has not linked one.
+    shared_drive_id: str | None
+    #: The name Google reported when it was linked — shown so a mistyped id
+    #: reads as "that isn't their drive" rather than passing unnoticed.
+    drive_name: str | None
+
+
 class TenantDetail(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -145,6 +170,22 @@ class TenantDetail(BaseModel):
     languages: list[str]
     pricing: list[PairPrice]
     figures: TenantFigures
+    drive: DriveLink
+
+
+class DriveServerStatus(BaseModel):
+    #: False when GOOGLE_SERVICE_ACCOUNT_FILE is unset or unreadable. Nothing
+    #: about Drive works until it is true.
+    configured: bool
+    #: What each bureau adds to its Shared Drive as a Content manager.
+    service_account_email: str | None
+
+
+class DriveLinkIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    #: A Shared Drive id, or a pasted drive link. Null or blank disconnects.
+    shared_drive: str | None = Field(default=None, max_length=500)
 
 
 class PlatformUserCreate(BaseModel):
@@ -332,6 +373,10 @@ async def get_tenant(tenant_id: int, db: Db, _: Superuser) -> TenantDetail:
 
         figures = await _figures(db, tenant_id)
 
+        drive_row = (
+            await db.execute(select(DriveSettings).where(DriveSettings.tenant_id == tenant_id))
+        ).scalar_one_or_none()
+
     return TenantDetail(
         tenant=_summary(
             tenant,
@@ -351,6 +396,10 @@ async def get_tenant(tenant_id: int, db: Db, _: Superuser) -> TenantDetail:
             for p in pricing
         ],
         figures=figures,
+        drive=DriveLink(
+            shared_drive_id=drive_row.shared_drive_id if drive_row else None,
+            drive_name=drive_row.drive_name if drive_row else None,
+        ),
     )
 
 
@@ -449,6 +498,61 @@ async def set_tenant_status(
     return _summary(
         tenant, users=int(counts[0]), active_users=int(counts[1] or 0), orders=figures.orders
     )
+
+
+# ── Google Drive ────────────────────────────────────────────────────────────
+
+
+@router.get("/drive", response_model=DriveServerStatus)
+async def drive_status(_: Superuser, drive: Drive) -> DriveServerStatus:
+    """Whether this server can reach Drive at all, and as whom."""
+    email = drive.service_account_email
+    return DriveServerStatus(configured=email is not None, service_account_email=email)
+
+
+@router.put("/tenants/{tenant_id}/drive", response_model=DriveLink)
+async def link_tenant_drive(
+    tenant_id: int,
+    payload: DriveLinkIn,
+    db: Db,
+    session: Superuser,
+    drive: Drive,
+) -> DriveLink:
+    """Connect, change or disconnect a bureau's Shared Drive.
+
+    Operator-only, deliberately — see `domain/order_files.py`. One service
+    account is a member of every bureau's drive, so letting a bureau enter its
+    own drive id would let it enter anybody's.
+    """
+    tenant = await _tenant_or_404(db, tenant_id)
+
+    try:
+        drive_id, drive_name = await resolve_shared_drive(drive, payload.shared_drive)
+    except DriveLinkError as exc:
+        if exc.upstream:
+            raise UpstreamUnavailableError(exc.message) from exc
+        raise ValidationError(exc.message) from exc
+
+    # Scoped to the TARGET tenant: the stale-folder cleanup inside relies on
+    # the ORM filter to pick this bureau's rows, and an unscoped session would
+    # clear every bureau's folder ids at once.
+    await bind_tenant_guc(db, tenant_id)
+    with tenant_scope(tenant_id):
+        previous = await save_drive_link(db, drive_id, drive_name)
+
+    from suliko.core.audit import record
+
+    await record(
+        db,
+        session,
+        action="platform.tenant_drive_changed",
+        entity_type="tenant",
+        entity_id=tenant.id,
+        tenant_id=tenant.id,
+        before={"shared_drive_id": previous},
+        after={"shared_drive_id": drive_id, "drive_name": drive_name},
+    )
+    return DriveLink(shared_drive_id=drive_id, drive_name=drive_name)
 
 
 # ── Users, in somebody else's tenant ────────────────────────────────────────

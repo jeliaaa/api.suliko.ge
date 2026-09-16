@@ -270,6 +270,20 @@ class CheckResult(BaseModel):
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 
+#: Providers that exist in the registry but are NOT offered on the screen.
+#:
+#: Google Drive: this card asked each bureau for its own service-account key,
+#: and nothing ever read it. Drive actually runs on ONE Suliko service account
+#: (`GOOGLE_SERVICE_ACCOUNT_FILE`), with each bureau's Shared Drive linked by a
+#: platform operator — see `integrations/google_drive.py`. A form that saves a
+#: private key and then does nothing with it is worse than no form: people
+#: fill it in and wonder why their files never appear.
+#:
+#: Kept in `PROVIDERS` rather than deleted, because the enum value is baked
+#: into a CHECK constraint (revision 0003) and existing rows may hold it.
+HIDDEN_PROVIDERS: frozenset[IntegrationProvider] = frozenset({IntegrationProvider.GOOGLE_DRIVE})
+
+
 def _require_allowed(session: AuthenticatedSession, provider: IntegrationProvider) -> None:
     """Refuse a provider the caller's plan does not include.
 
