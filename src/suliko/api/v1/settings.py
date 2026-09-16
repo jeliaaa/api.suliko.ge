@@ -281,9 +281,7 @@ async def update_language(
     # rename of the thing itself, not a relabelling — and a collision would
     # silently merge two languages.
     if code != row.code:
-        clash = (
-            (await db.execute(select(Language).where(Language.code == code))).scalars().first()
-        )
+        clash = (await db.execute(select(Language).where(Language.code == code))).scalars().first()
         if clash:
             raise ConflictError(f"Language {code!r} already exists.")
 

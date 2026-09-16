@@ -102,6 +102,47 @@ class RateLimiter:
     async def clear_mfa_failures(self, key: str) -> None:
         await self._clear(key)
 
+    # ── Password reset ──────────────────────────────────────────────────────
+
+    async def check_password_reset(self, account_key: str, ip_key: str) -> int | None:
+        """Seconds to wait, or None.
+
+        Counts REQUESTS rather than failures, unlike the login limiter. A
+        reset request succeeds by definition — it always answers 204 — so
+        there is no failure to count, and what has to be bounded is how often
+        we can be made to send mail to an address someone else chose.
+        """
+        settings = get_settings()
+        window = settings.password_reset_window_seconds
+        if await self._current(account_key, window) >= settings.password_reset_max_per_account:
+            return window
+        if await self._current(ip_key, window) >= settings.password_reset_max_per_ip:
+            return window
+        return None
+
+    async def record_password_reset_request(self, account_key: str, ip_key: str) -> None:
+        window = get_settings().password_reset_window_seconds
+        await self._hit_count(account_key, window)
+        await self._hit_count(ip_key, window)
+
+    # ── Signing up ──────────────────────────────────────────────────────────
+
+    async def check_signup(self, ip_key: str) -> int | None:
+        """Seconds to wait, or None.
+
+        By IP alone: there is no account yet to key on, which is exactly what
+        makes this endpoint worth throttling — it creates a tenant, and the
+        caller chooses every field in it.
+        """
+        settings = get_settings()
+        window = settings.signup_window_seconds
+        if await self._current(ip_key, window) >= settings.signup_max_per_ip:
+            return window
+        return None
+
+    async def record_signup(self, ip_key: str) -> None:
+        await self._hit_count(ip_key, get_settings().signup_window_seconds)
+
     # ── Generic writes ──────────────────────────────────────────────────────
 
     async def check_write(self, key: str) -> int | None:

@@ -282,6 +282,11 @@ def _prod_settings(**overrides: object):  # type: ignore[no-untyped-def]
         "encryption_master_key": "a" * 44,
         "redis_url": "redis://localhost:6379/0",
         "cors_origins": ["https://app.suliko.ge"],
+        # Auth mail must be deliverable in production: password reset answers
+        # 204 either way, so an unconfigured mailer silently strands people.
+        "smtp_host": "smtp.example.com",
+        "smtp_from_email": "noreply@suliko.ge",
+        "app_url": "https://app.suliko.ge",
     }
     base.update(overrides)
     return Settings(**base)  # type: ignore[arg-type]
@@ -299,6 +304,13 @@ def test_production_accepts_a_correct_configuration() -> None:
         ({"db_echo": True}, "DB_ECHO"),
         ({"redis_url": None}, "REDIS_URL"),
         ({"cors_origins": ["http://crm.example.com"]}, "https"),
+        # Password reset answers 204 whether or not the account exists, so a
+        # production box with no mailer tells every locked-out user that their
+        # link is on its way and then drops it.
+        ({"smtp_host": None}, "SMTP_HOST"),
+        ({"smtp_from_email": None}, "SMTP_FROM_EMAIL"),
+        # Reset links are clicked from an email client, off our network.
+        ({"app_url": "http://app.suliko.ge"}, "APP_URL"),
     ],
 )
 def test_production_refuses_insecure_configuration(

@@ -14,6 +14,7 @@ from sqlalchemy import (
     Integer,
     String,
     UniqueConstraint,
+    false,
 )
 from sqlalchemy.dialects.postgresql import INET
 from sqlalchemy.orm import Mapped, mapped_column
@@ -50,6 +51,12 @@ class User(Base, IdMixin, TenantScoped, TimestampMixin):
     email: Mapped[str] = mapped_column(String(255), nullable=False)
     full_name: Mapped[str] = mapped_column(String(255), nullable=False)
 
+    #: Job title, free text — "Project manager", "Notary liaison". Shown on
+    #: the Users screen and in the invite email. Purely descriptive: what
+    #: someone may DO is the role and the overrides below, never this.
+    position: Mapped[str | None] = mapped_column(String(100), default=None)
+    phone: Mapped[str | None] = mapped_column(String(50), default=None)
+
     # Argon2id for everything written by this app. Legacy bcrypt hashes
     # imported from the PHP app verify too, and are re-hashed on first
     # successful login (suliko.security.passwords.verify_and_maybe_rehash).
@@ -64,6 +71,17 @@ class User(Base, IdMixin, TenantScoped, TimestampMixin):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
+    #: Set when the password was issued BY SOMEONE ELSE — an invite's one-time
+    #: password, or an administrator resetting an account. Until it is cleared
+    #: the session can reach nothing but the change-password screen.
+    #:
+    #: `server_default` as well as `default` so that a fresh database built
+    #: from metadata and an existing one migrated by revision 0006 end up with
+    #: the same DDL. Without it the two drift, and the drift is invisible.
+    must_change_password: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
+
     # Set when the user must re-authenticate everywhere: password change,
     # role change, offboarding. Sessions older than this are rejected, which
     # revokes them without a delete sweep.
@@ -73,6 +91,44 @@ class User(Base, IdMixin, TenantScoped, TimestampMixin):
 
     def __repr__(self) -> str:
         return f"<User {self.id} {self.username!r} t{self.tenant_id} {self.role.value}>"
+
+
+class UserPermissionOverride(Base, IdMixin, TenantScoped, TimestampMixin):
+    """One permission explicitly granted to, or withheld from, one user.
+
+    Stored as a DIFFERENCE against the role's bundle rather than as the whole
+    effective set. Two reasons, and the second is the important one:
+
+    1. A staff member with one extra permission is one row, not thirty.
+    2. Changing someone's ROLE still means something. If the set were stored
+       whole, promoting a manager to admin would change the label and nothing
+       else — the stored set would keep overriding the new bundle, silently.
+
+    ``granted`` is the direction: true adds a permission the role does not
+    give, false takes away one it does. Both are needed — the owner's form is
+    a list of checkboxes over the whole catalogue, and either box can differ
+    from the role's default.
+
+    The permission is a plain string, matching ``Permission`` values. Not an
+    enum column: the catalogue grows, and a row naming a permission this build
+    has dropped should be ignored on read, not break every query against the
+    table. ``effective_permissions`` does exactly that.
+    """
+
+    __tablename__ = "user_permission_overrides"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "user_id",
+            "permission",
+            name="uq_user_permission_overrides_tenant_id",
+        ),
+        Index("ix_user_permission_overrides_tenant_user", "tenant_id", "user_id"),
+    )
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    permission: Mapped[str] = mapped_column(String(64), nullable=False)
+    granted: Mapped[bool] = mapped_column(Boolean, nullable=False)
 
 
 class MfaMethod(Base, IdMixin, TenantScoped, TimestampMixin):

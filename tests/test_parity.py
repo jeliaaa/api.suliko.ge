@@ -154,3 +154,65 @@ def test_only_admin_and_above_can_transfer_funds() -> None:
         assert Permission.FINANCE_TRANSFER not in ROLE_PERMISSIONS[role]
     for role in (Role.ADMIN, Role.OWNER, Role.SUPERUSER):
         assert Permission.FINANCE_TRANSFER in ROLE_PERMISSIONS[role]
+
+
+# ── Plans ───────────────────────────────────────────────────────────────────
+
+PLANS_TS = FRONTEND / "src" / "shared" / "auth" / "plans.ts"
+
+requires_plans_ts = pytest.mark.skipif(
+    not PLANS_TS.exists(), reason="frontend checkout not present next to this repo"
+)
+
+
+def _ts_string_array(source: str, name: str) -> list[str]:
+    """Extract ``export const NAME = ["a", "b"] as const;``."""
+    body = source.split(f"export const {name} = ", 1)[1].split("]", 1)[0]
+    return re.findall(r'"([^"]+)"', body)
+
+
+@requires_plans_ts
+def test_the_plan_names_agree() -> None:
+    """A plan the frontend knows and the backend does not is enforced as the
+    default — silently, and as the WRONG plan."""
+    from suliko.domain.plans import TenantPlan
+
+    source = PLANS_TS.read_text(encoding="utf-8")
+    assert set(_ts_string_array(source, "PLANS")) == {p.value for p in TenantPlan}
+
+
+@requires_plans_ts
+def test_the_feature_names_agree() -> None:
+    from suliko.domain.plans import Feature
+
+    source = PLANS_TS.read_text(encoding="utf-8")
+    assert set(_ts_string_array(source, "FEATURES")) == {f.value for f in Feature}
+
+
+@requires_plans_ts
+def test_the_default_plan_agrees() -> None:
+    """If these disagree, a tenant mid-onboarding sees one plan's tabs and is
+    refused by the other's."""
+    from suliko.domain.plans import DEFAULT_PLAN
+
+    source = PLANS_TS.read_text(encoding="utf-8")
+    match = re.search(r'export const DEFAULT_PLAN: Plan = "([^"]+)"', source)
+    assert match, "plans.ts no longer declares DEFAULT_PLAN"
+    assert match.group(1) == DEFAULT_PLAN.value
+
+
+@requires_plans_ts
+def test_the_feature_bundles_agree() -> None:
+    """Notifications is the one screen gated by plan rather than permission,
+    so the two lists are the only thing keeping the tab and the endpoint in
+    step."""
+    from suliko.domain.plans import PLAN_FEATURES, TenantPlan
+
+    source = PLANS_TS.read_text(encoding="utf-8")
+    for plan in TenantPlan:
+        name = f"{plan.value.upper()}_FEATURES"
+        # Split on `=` before `]`: the declaration carries a `Feature[]` type
+        # annotation, whose own bracket comes first.
+        body = source.split(f"const {name}", 1)[1].split("=", 1)[1].split("]", 1)[0]
+        declared = set(re.findall(r'"([^"]+)"', body))
+        assert declared == {f.value for f in PLAN_FEATURES[plan]}, f"{plan.value}: features differ"

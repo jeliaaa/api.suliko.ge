@@ -174,9 +174,7 @@ class InvoiceOut(BaseModel):
 
 
 async def _company(db: Db, role: CompanyRole) -> Company | None:
-    return (
-        (await db.execute(select(Company).where(Company.role == role))).scalars().first()
-    )
+    return (await db.execute(select(Company).where(Company.role == role))).scalars().first()
 
 
 async def _accounts(db: Db, company_id: int) -> list[CompanyBankAccount]:

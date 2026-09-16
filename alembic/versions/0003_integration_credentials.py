@@ -78,9 +78,7 @@ def upgrade() -> None:
         sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
         sa.Column("tenant_id", sa.BigInteger(), nullable=False),
         sa.Column("provider", sa.String(length=40), nullable=False),
-        sa.Column(
-            "is_enabled", sa.Boolean(), nullable=False, server_default=sa.text("false")
-        ),
+        sa.Column("is_enabled", sa.Boolean(), nullable=False, server_default=sa.text("false")),
         # JSONB, not JSON: the non-secret config is queried and diffed, and
         # JSONB is the one that can be indexed if that is ever needed.
         sa.Column(
@@ -128,13 +126,9 @@ def upgrade() -> None:
         # One row per provider per tenant. Without this, a double-submitted
         # form gives a bureau two sets of Drive credentials and no way to know
         # which one the app will pick up.
-        sa.UniqueConstraint(
-            "tenant_id", "provider", name="uq_integration_tenant_provider"
-        ),
+        sa.UniqueConstraint("tenant_id", "provider", name="uq_integration_tenant_provider"),
     )
-    create_index(
-        "ix_integration_credentials_tenant_id", "integration_credentials", ["tenant_id"]
-    )
+    create_index("ix_integration_credentials_tenant_id", "integration_credentials", ["tenant_id"])
 
     for table in NEW_TABLES:
         op.execute(sa.text(f"GRANT SELECT, INSERT, UPDATE, DELETE ON {table} TO {APP_ROLE}"))

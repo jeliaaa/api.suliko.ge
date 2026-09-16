@@ -22,10 +22,11 @@ from fastapi import status as http_status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Select, func, select, update
 
-from suliko.api.deps import CurrentSession, Db, require
+from suliko.api.deps import CurrentSession, Db, require, require_feature
 from suliko.api.v1._shared import PageMeta
 from suliko.core.errors import NotFoundError, PermissionDeniedError
 from suliko.domain.notifications import notify
+from suliko.domain.plans import Feature
 from suliko.models.collaboration import (
     Notification,
     NotificationKind,
@@ -37,7 +38,14 @@ from suliko.models.order import Order
 from suliko.models.user import User
 from suliko.security.permissions import Permission
 
-router = APIRouter(prefix="/notifications", tags=["notifications"])
+# Gated on the PLAN, not on a permission: every role may read their own
+# notifications, but a freelancer has no colleagues to be notified by, so
+# the whole screen is withheld rather than shown permanently empty.
+router = APIRouter(
+    prefix="/notifications",
+    tags=["notifications"],
+    dependencies=[Depends(require_feature(Feature.NOTIFICATIONS))],
+)
 comments_router = APIRouter(prefix="/orders", tags=["comments"])
 
 

@@ -84,6 +84,19 @@ class StepUpRequiredError(AppError):
     error_code = "step_up_required"
 
 
+class PasswordChangeRequiredError(AppError):
+    """The password was issued by someone else and must be replaced.
+
+    403 rather than 401: the session is valid and the credentials were
+    correct. What is refused is the ACTION, until the one-time password an
+    invite or an admin reset handed out has been replaced with one only this
+    user knows.
+    """
+
+    status_code = 403
+    error_code = "password_change_required"
+
+
 class MfaRequiredError(AppError):
     """Login succeeded but the second factor has not been satisfied yet."""
 

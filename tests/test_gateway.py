@@ -150,6 +150,11 @@ def _prod(**overrides: object):  # type: ignore[no-untyped-def]
         "encryption_master_key": "a" * 44,
         "redis_url": "redis://localhost:6379/0",
         "cors_origins": ["https://app.suliko.ge"],
+        # Auth mail must be deliverable in production: password reset answers
+        # 204 either way, so an unconfigured mailer silently strands people.
+        "smtp_host": "smtp.example.com",
+        "smtp_from_email": "noreply@suliko.ge",
+        "app_url": "https://app.suliko.ge",
     }
     base.update(overrides)
     return Settings(**base)  # type: ignore[arg-type]

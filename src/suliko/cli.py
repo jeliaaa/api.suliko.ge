@@ -430,10 +430,16 @@ async def check() -> int:
     # Shown explicitly because `extra="ignore"` on Settings means an unknown
     # or misspelled variable in .env is dropped in silence. Without this line,
     # "I set MFA_ENFORCED=false and nothing happened" has no cheap answer.
-    if settings.mfa_enforced:
-        ok("MFA is ENFORCED")
-    else:
+    if not settings.mfa_enforced:
         warn("MFA is DISABLED — every account signs in with a password alone")
+    elif settings.mfa_require_enrolment:
+        ok("MFA is ENFORCED, and enrolment is required of privileged roles")
+    else:
+        ok("MFA is ENFORCED — anyone with a factor is challenged for it")
+        warn(
+            "MFA_REQUIRE_ENROLMENT is false — owners/admins with no factor "
+            "sign in on their password alone. Turn it on once enrolment ships."
+        )
 
     if settings.redis_url:
         ok("Redis configured for rate limiting")
@@ -545,6 +551,7 @@ async def schema_diff() -> int:
         return 1
 
     async with conn_ctx as conn:
+
         def table_names(sync: Any) -> set[str]:
             return set(inspect(sync).get_table_names())
 
@@ -580,7 +587,7 @@ async def schema_diff() -> int:
     say("")
     say("Run `alembic upgrade head`. If that reports it is already at head,")
     say("the database predates these models and needs a new revision:")
-    say("    alembic revision --autogenerate -m \"catch up to models\"")
+    say('    alembic revision --autogenerate -m "catch up to models"')
     return 1
 
 

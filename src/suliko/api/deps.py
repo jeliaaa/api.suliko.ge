@@ -21,6 +21,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Annotated
 
+import structlog
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,11 +29,13 @@ from suliko.config import get_settings
 from suliko.core.errors import (
     AuthenticationError,
     MfaRequiredError,
+    PasswordChangeRequiredError,
     PermissionDeniedError,
     StepUpRequiredError,
 )
 from suliko.db.session import get_sessionmaker, session_scope
 from suliko.db.tenancy import reset_current_tenant_id, set_current_tenant_id
+from suliko.domain.plans import Feature, allows_feature
 from suliko.security.permissions import Permission, requires_step_up
 from suliko.security.sessions import AuthenticatedSession, resolve_session
 
@@ -98,10 +101,8 @@ async def get_db(
         yield db
 
 
-async def get_authenticated_session(
-    session: Annotated[AuthenticatedSession, Depends(get_current_session)],
-) -> AuthenticatedSession:
-    """A session that has cleared its second factor.
+async def _require_mfa(session: AuthenticatedSession) -> AuthenticatedSession:
+    """The second-factor half of the gate.
 
     A half-authenticated session (password accepted, 2FA pending) can reach
     only the challenge endpoint, which depends on ``get_current_session``
@@ -127,8 +128,66 @@ async def get_authenticated_session(
     return session
 
 
+async def get_session_for_password_change(
+    session: Annotated[AuthenticatedSession, Depends(get_current_session)],
+) -> AuthenticatedSession:
+    """Cleared its second factor, but may still owe a password change.
+
+    Exists so `POST /auth/password/change` is reachable by the one person the
+    gate below is aimed at. Everything else depends on
+    `get_authenticated_session`, which refuses them — otherwise an invited
+    employee could work indefinitely on a password their manager chose and
+    still knows.
+    """
+    return await _require_mfa(session)
+
+
+async def get_authenticated_session(
+    session: Annotated[AuthenticatedSession, Depends(get_current_session)],
+) -> AuthenticatedSession:
+    """A session that has cleared its second factor AND owns its password.
+
+    The gate every business endpoint sits behind. Two refusals, and they are
+    deliberately separate dependencies so that each one's own escape hatch
+    stays reachable: the 2FA challenge depends on ``get_current_session``, and
+    the change-password endpoint on ``get_session_for_password_change``.
+    """
+    session = await _require_mfa(session)
+
+    if session.must_change_password:
+        # An invite's one-time password, or one an administrator set. Both are
+        # known to somebody else, so the account is not yet the user's alone.
+        raise PasswordChangeRequiredError("Set your own password before continuing.")
+    return session
+
+
 CurrentSession = Annotated[AuthenticatedSession, Depends(get_authenticated_session)]
 Db = Annotated[AsyncSession, Depends(get_db)]
+
+
+def require_feature(feature: Feature) -> Callable[..., Awaitable[AuthenticatedSession]]:
+    """Require the caller's PLAN to include a feature.
+
+    The companion to ``require`` for screens that no permission guards.
+    Dashboard, Calculator and Notifications are open to every role, so the
+    plan's permission mask cannot reach them and they need naming explicitly.
+
+    403 rather than 404: the caller is inside their own tenant and the feature
+    demonstrably exists — they are on the wrong plan, and telling them so is
+    the difference between an upgrade and a support ticket.
+    """
+
+    async def dependency(
+        session: Annotated[AuthenticatedSession, Depends(get_authenticated_session)],
+    ) -> AuthenticatedSession:
+        if not allows_feature(session.plan, feature):
+            raise PermissionDeniedError(
+                f"{feature.value.replace('_', ' ').capitalize()} is not included "
+                f"in the {session.plan.value} plan."
+            )
+        return session
+
+    return dependency
 
 
 def require(*permissions: Permission) -> Callable[..., Awaitable[AuthenticatedSession]]:
@@ -159,7 +218,7 @@ def require(*permissions: Permission) -> Callable[..., Awaitable[AuthenticatedSe
                     f"This action requires the {permission.value} permission."
                 )
 
-            if requires_step_up(permission):
+            if requires_step_up(permission) and session.can_step_up:
                 age = session.mfa_age_seconds(datetime.now(UTC))
                 max_age = settings.step_up_max_age_minutes * 60
                 if age is None or age > max_age:
@@ -167,6 +226,19 @@ def require(*permissions: Permission) -> Callable[..., Awaitable[AuthenticatedSe
                         "Re-enter your authentication code to continue.",
                         permission=permission.value,
                     )
+            elif requires_step_up(permission):
+                # No factor to re-present, so there is nothing to step up
+                # with. Demanding one anyway does not raise the bar: it
+                # refuses Settings, Users, the plan choice and outbound
+                # transfers permanently, five minutes after every login, with
+                # no action the user can take. Logged rather than silent —
+                # this is a control that is not running.
+                structlog.get_logger().info(
+                    "step_up_skipped_no_factor",
+                    user_id=session.user_id,
+                    tenant_id=session.tenant_id,
+                    permission=permission.value,
+                )
 
         return session
 

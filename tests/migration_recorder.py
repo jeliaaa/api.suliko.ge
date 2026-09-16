@@ -24,6 +24,25 @@ class RecordedOps:
     indexes: list[tuple[str, str, list[str]]] = field(default_factory=list)
     statements: list[str] = field(default_factory=list)
     dropped: list[str] = field(default_factory=list)
+    #: Columns added to tables an EARLIER revision owns, as (table, column).
+    added_columns: list[tuple[str, sa.Column[object]]] = field(default_factory=list)
+    dropped_columns: list[tuple[str, str]] = field(default_factory=list)
+
+    def get_bind(self) -> None:
+        """There is no database.
+
+        Revisions that inspect the schema before acting — the guarded
+        `add_column` in 0006 — branch on this. Returning None makes them take
+        the "nothing exists yet" path, which is what records the operation so
+        a test can see it.
+        """
+        return None
+
+    def add_column(self, table: str, column: sa.Column[object], **_kwargs: Any) -> None:
+        self.added_columns.append((table, column))
+
+    def drop_column(self, table: str, name: str, **_kwargs: Any) -> None:
+        self.dropped_columns.append((table, name))
 
     def create_table(self, name: str, *columns: Any, **kwargs: Any) -> sa.Table:
         # A private MetaData: the real one already holds these tables, and

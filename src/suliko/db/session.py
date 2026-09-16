@@ -83,6 +83,31 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
             raise
 
 
+async def bind_tenant_guc(session: AsyncSession, tenant_id: int) -> None:
+    """Apply the RLS GUC to a session that was opened before the tenant was known.
+
+    ``session_scope`` sets this at open time from the ambient context, which is
+    right for an authenticated request — ``get_current_session`` has already
+    resolved the tenant by then. The auth endpoints are the exception: they
+    open a session in order to *find* the user, and only then learn which
+    tenant they are acting for. Without this, every tenant-scoped row they
+    write (a session, a reset token) is inserted with no GUC set, and the
+    ``WITH CHECK`` on the ``tenant_isolation`` policy rejects it.
+
+    Transaction-local, exactly as in ``session_scope`` — it must not leak to
+    the next request that borrows this pooled connection.
+
+    A no-op on anything that is not PostgreSQL, so the SQLite-backed tests can
+    exercise the same code paths.
+    """
+    if session.bind is None or session.bind.dialect.name != "postgresql":
+        return
+    await session.execute(
+        text("SELECT set_config('suliko.tenant_id', :tid, true)"),
+        {"tid": str(tenant_id)},
+    )
+
+
 async def get_db() -> AsyncIterator[AsyncSession]:
     """FastAPI dependency.
 

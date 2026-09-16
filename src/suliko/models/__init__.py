@@ -67,6 +67,7 @@ from suliko.models.user import (
     PasswordResetToken,
     Role,
     User,
+    UserPermissionOverride,
     UserSession,
 )
 
@@ -127,5 +128,6 @@ __all__ = [
     "TranslatorPaymentAllocation",
     "Urgency",
     "User",
+    "UserPermissionOverride",
     "UserSession",
 ]

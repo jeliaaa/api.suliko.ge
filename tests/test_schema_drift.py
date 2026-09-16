@@ -44,7 +44,7 @@ def test_missing_table_is_named() -> None:
 
 
 def test_missing_column_is_named() -> None:
-    exc = programming_error("42703", 'column notifications.subject_label does not exist')
+    exc = programming_error("42703", "column notifications.subject_label does not exist")
     # No quotes in this driver message shape, so it degrades to the kind.
     assert _missing_schema_object(exc) == "a column it expects"
 
@@ -69,7 +69,7 @@ def test_a_constraint_violation_is_not_schema_drift() -> None:
     contents to the caller, which is the thing the generic handler exists to
     prevent.
     """
-    exc = programming_error("23505", 'Key (email)=(nino@example.ge) already exists')
+    exc = programming_error("23505", "Key (email)=(nino@example.ge) already exists")
     assert _missing_schema_object(exc) is None
 
 

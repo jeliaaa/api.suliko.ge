@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     # how fresh the session itself is.
     step_up_max_age_minutes: int = 5
 
+    #: How long a password-reset link stays usable. Long enough to survive a
+    #: slow mail relay and someone reading their inbox after lunch; short
+    #: enough that a link sitting in an archived mailbox is not a standing key.
+    password_reset_ttl_minutes: int = 60
+
     # ── Rate limiting ───────────────────────────────────────────────────────
     # Redis is the right store for this — ephemeral, high-churn counters.
     # Without it the app falls back to an in-process limiter.
@@ -70,6 +75,20 @@ class Settings(BaseSettings):
     mfa_window_seconds: int = 300
     write_max_per_minute: int = 120
 
+    #: Reset requests per account and per IP per window. Lower than the login
+    #: limits: a reset request sends mail to a third party, so an unthrottled
+    #: endpoint is both an enumeration oracle and a way to use us to spam
+    #: someone else's inbox.
+    password_reset_max_per_account: int = 3
+    password_reset_max_per_ip: int = 10
+    password_reset_window_seconds: int = 3600  # 1 hour
+
+    #: Sign-ups per IP per window. `POST /auth/signup` is the only
+    #: unauthenticated endpoint that creates a TENANT, so an unthrottled one
+    #: lets a single address fill the tenants table overnight.
+    signup_max_per_ip: int = 3
+    signup_window_seconds: int = 3600  # 1 hour
+
     # ── Crypto ──────────────────────────────────────────────────────────────
     # Master key wrapping per-tenant data keys (envelope encryption).
     # Generate with:
@@ -90,6 +109,22 @@ class Settings(BaseSettings):
     #: this is not a setting that should quietly become permanent, in a system
     #: holding client identity documents and bank details.
     mfa_enforced: bool = True
+
+    #: Whether a role in MFA_REQUIRED_ROLES may sign in with NO factor enrolled.
+    #:
+    #: False (the default) lets them in on the password alone. True fails the
+    #: login closed instead, which is the stronger policy and the eventual
+    #: intent — but it can only be honest once a user can enrol a factor for
+    #: themselves. There is no enrolment screen yet: enrolling means running
+    #: `suliko enrol-mfa` on the server, so failing closed does not prompt
+    #: anyone to add a factor, it simply locks out the owner and every admin
+    #: of every tenant with no way for them to act on it.
+    #:
+    #: This is deliberately SEPARATE from MFA_ENFORCED. With the default pair
+    #: (enforced, enrolment not required) a user who HAS a factor is still
+    #: challenged for it — so 2FA keeps working for everyone who has enrolled,
+    #: and only the dead end is removed. Turn this on the day enrolment ships.
+    mfa_require_enrolment: bool = False
 
     # ── BFF gateway ─────────────────────────────────────────────────────────
     #: Shared secret the Vercel frontend presents in X-Suliko-Gateway.
@@ -129,6 +164,35 @@ class Settings(BaseSettings):
     #: data still works, file lists report that storage is not configured.
     google_service_account_file: str | None = None
 
+    # ── Outbound email (platform) ───────────────────────────────────────────
+    # AUTH mail only: password resets, and later invites and welcome mail.
+    #
+    # Deliberately platform-level rather than the per-tenant SMTP integration.
+    # A password reset is requested BEFORE we know which tenant the address
+    # belongs to, and a bureau whose SMTP credentials have lapsed must never
+    # be the reason one of its people cannot get back into their account.
+    # Business mail — client confirmations, document delivery — keeps using
+    # the tenant's own SMTP, because it has to come from the bureau's address.
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_username: str | None = None
+    smtp_password: SecretStr = SecretStr("")
+    #: STARTTLS on a submission port (587). The usual choice.
+    smtp_starttls: bool = True
+    #: Implicit TLS from the first byte (465). Mutually exclusive with the above.
+    smtp_ssl: bool = False
+    smtp_from_email: str | None = None
+    smtp_from_name: str = "Suliko"
+    #: Sending happens in a worker thread; this bounds how long it can block one.
+    smtp_timeout_seconds: int = 20
+
+    #: Public base URL of the frontend. Password-reset links are built from it.
+    #:
+    #: NEVER derived from a request header. `Host` is attacker-controlled, and
+    #: a reset link pointing at an attacker's domain is account takeover — the
+    #: classic host-header poisoning bug, and the reason this is configuration.
+    app_url: str = "http://localhost:3000"
+
     # ── CORS ────────────────────────────────────────────────────────────────
     # The Next.js BFF calls this API server-side. The one exception is portal
     # file transfer, where a browser holding a signed ticket uploads or
@@ -137,6 +201,10 @@ class Settings(BaseSettings):
 
     # ── App ─────────────────────────────────────────────────────────────────
     app_name: str = "Suliko CRM API"
+
+    #: Interface language a self-signed-up bureau starts in. Georgian, because
+    #: that is who this is sold to; they can change it in Settings.
+    default_signup_locale: str = "ka"
     api_v1_prefix: str = "/api/v1"
 
     @field_validator("database_url")
@@ -149,6 +217,16 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
+
+    @property
+    def email_configured(self) -> bool:
+        """Whether auth mail can actually leave the building.
+
+        A host and a From address are the minimum. Username and password are
+        not required — an internal relay that authenticates by IP is a normal
+        deployment.
+        """
+        return bool(self.smtp_host and self.smtp_from_email)
 
     def validate_for_production(self) -> None:
         """Fail fast at startup rather than run insecurely.
@@ -193,6 +271,22 @@ class Settings(BaseSettings):
         ]
         if insecure:
             problems.append(f"CORS origins must be https in production: {insecure}")
+
+        if not self.email_configured:
+            # Not merely a missing feature. `POST /auth/password/forgot`
+            # answers 204 whether or not the account exists — it has to, or it
+            # enumerates users — so with no mailer it tells every locked-out
+            # person that their reset is on its way and then silently drops it.
+            problems.append(
+                "SMTP_HOST and SMTP_FROM_EMAIL are not both set. Password "
+                "reset mail cannot be delivered, and the endpoint cannot tell "
+                "the user that without also revealing which accounts exist."
+            )
+        if self.app_url.startswith("http://") and not self.app_url.startswith(
+            ("http://localhost", "http://127.0.0.1")
+        ):
+            # Reset links are carried in email and clicked from anywhere.
+            problems.append(f"APP_URL must be https in production: {self.app_url}")
 
         if problems:
             raise RuntimeError("Refusing to start in production:\n  - " + "\n  - ".join(problems))

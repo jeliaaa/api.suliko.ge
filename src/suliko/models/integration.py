@@ -116,9 +116,7 @@ class IntegrationCredential(Base, IdMixin, TenantScoped, TimestampMixin):
 
     #: Result of the last "Test connection", so the screen can show whether
     #: these credentials have ever actually worked.
-    last_check_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), default=None
-    )
+    last_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     last_check_ok: Mapped[bool | None] = mapped_column(Boolean, default=None)
     #: Why the last check failed. Written by us, never the raw provider body,
     #: which can echo the credential back.

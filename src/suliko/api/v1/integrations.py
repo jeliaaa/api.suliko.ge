@@ -40,9 +40,11 @@ from sqlalchemy import select
 
 from suliko.api.deps import CurrentSession, Db, require
 from suliko.core.crypto import DecryptionError, decrypt_for_tenant, encrypt_for_tenant
-from suliko.core.errors import NotFoundError, ValidationError
+from suliko.core.errors import NotFoundError, PermissionDeniedError, ValidationError
+from suliko.domain.plans import allows_provider, providers_for_plan
 from suliko.models.integration import IntegrationCredential, IntegrationProvider
 from suliko.security.permissions import Permission
+from suliko.security.sessions import AuthenticatedSession
 
 router = APIRouter(prefix="/integrations", tags=["integrations"])
 
@@ -268,6 +270,19 @@ class CheckResult(BaseModel):
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 
+def _require_allowed(session: AuthenticatedSession, provider: IntegrationProvider) -> None:
+    """Refuse a provider the caller's plan does not include.
+
+    The list endpoint hides them, which is UX. This is the enforcement: the
+    provider is named in the URL, so hiding it from a list stops nobody from
+    typing it.
+    """
+    if not allows_provider(session.plan, provider):
+        raise PermissionDeniedError(
+            f"{provider.value} is not included in the {session.plan.value} plan."
+        )
+
+
 def _spec(provider: IntegrationProvider) -> ProviderSpec:
     spec = PROVIDERS.get(provider)
     if spec is None:  # pragma: no cover — the path enum makes this unreachable
@@ -329,9 +344,11 @@ def _out(row: IntegrationCredential | None, spec: ProviderSpec, tenant_id: int) 
 
 async def _row(db: Db, provider: IntegrationProvider) -> IntegrationCredential | None:
     return (
-        (await db.execute(select(IntegrationCredential).where(
-            IntegrationCredential.provider == provider
-        )))
+        (
+            await db.execute(
+                select(IntegrationCredential).where(IntegrationCredential.provider == provider)
+            )
+        )
         .scalars()
         .first()
     )
@@ -353,7 +370,13 @@ async def list_integrations(
     """
     saved = (await db.execute(select(IntegrationCredential))).scalars()
     rows = {row.provider: row for row in saved}
-    return [_out(rows.get(p), spec, session.tenant_id) for p, spec in PROVIDERS.items()]
+    # Filtered by plan. A freelancer connects Google Drive and nothing else,
+    # and listing seven services they cannot save is a worse answer than
+    # listing the one they can.
+    allowed = providers_for_plan(session.plan)
+    return [
+        _out(rows.get(p), spec, session.tenant_id) for p, spec in PROVIDERS.items() if p in allowed
+    ]
 
 
 @router.get("/{provider}", response_model=IntegrationOut)
@@ -362,6 +385,7 @@ async def get_integration(
     db: Db,
     session: Annotated[CurrentSession, Depends(require(Permission.SETTINGS_MANAGE))],
 ) -> IntegrationOut:
+    _require_allowed(session, provider)
     return _out(await _row(db, provider), _spec(provider), session.tenant_id)
 
 
@@ -372,6 +396,7 @@ async def save_integration(
     db: Db,
     session: Annotated[CurrentSession, Depends(require(Permission.SETTINGS_MANAGE))],
 ) -> IntegrationOut:
+    _require_allowed(session, provider)
     spec = _spec(provider)
 
     known_config = {f.key for f in spec.config_fields}
@@ -451,6 +476,7 @@ async def check_integration(
     check lands with the flow that needs it: SMTP with the confirmation email,
     Drive with document upload, BOG with the payment link.
     """
+    _require_allowed(session, provider)
     spec = _spec(provider)
     row = await _row(db, provider)
 
@@ -461,14 +487,11 @@ async def check_integration(
     missing = [
         f.label
         for f in spec.fields
-        if f.required
-        and not str((secrets if f.secret else row.config).get(f.key, "")).strip()
+        if f.required and not str((secrets if f.secret else row.config).get(f.key, "")).strip()
     ]
 
     if missing:
-        result = CheckResult(
-            ok=False, detail=f"Missing required field(s): {', '.join(missing)}."
-        )
+        result = CheckResult(ok=False, detail=f"Missing required field(s): {', '.join(missing)}.")
     elif row.secrets is not None and not secrets:
         # The blob exists but would not decrypt — the master key changed.
         result = CheckResult(

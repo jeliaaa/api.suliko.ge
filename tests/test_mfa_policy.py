@@ -15,19 +15,25 @@ from __future__ import annotations
 import pytest
 
 from suliko.models.user import Role
-from suliko.security.permissions import requires_mfa
+from suliko.security.permissions import Permission, requires_mfa
 
 
-def decide(*, enforced: bool, has_mfa: bool, role: Role) -> dict[str, bool]:
+def decide(
+    *, enforced: bool, has_mfa: bool, role: Role, require_enrolment: bool = True
+) -> dict[str, bool]:
     """Mirror of the decision in `api/v1/auth.py::login`.
 
     Duplicated rather than imported because the real one is entangled with a
     database session and a request. `test_mirror_matches_source` below guards
     against the two drifting.
+
+    ``require_enrolment`` defaults to True here and False in `Settings`. The
+    default is deliberately the opposite way round: these tests are about
+    pinning the STRICT policy, and every case that relaxes it says so.
     """
     must_have_mfa = enforced and requires_mfa(role)
     challenge_owed = enforced and has_mfa
-    enrolment_required = must_have_mfa and not has_mfa
+    enrolment_required = require_enrolment and must_have_mfa and not has_mfa
 
     return {
         "mfa_satisfied": not (challenge_owed or enrolment_required),
@@ -88,7 +94,65 @@ def test_disabled_never_demands_enrolment() -> None:
         assert decide(enforced=False, has_mfa=False, role=role)["enrolment_required"] is False
 
 
+# ── Enrolment not required (the shipping default) ───────────────────────────
+#
+# MFA_ENFORCED stays on, so anyone holding a factor is still challenged for
+# it. What is relaxed is the demand that a privileged role HAVE one — because
+# there is no enrolment screen, so failing that closed locks out the owner and
+# every admin of every tenant with no action available to them.
+
+
+@pytest.mark.parametrize("role", [Role.SUPERUSER, Role.OWNER, Role.ADMIN])
+def test_a_privileged_account_without_a_factor_can_sign_in(role: Role) -> None:
+    """The lockout this flag exists to remove.
+
+    Every one of these roles is in MFA_REQUIRED_ROLES, and a freshly created
+    tenant's owner has no factor. Before this, they could not reach their own
+    product at all.
+    """
+    d = decide(enforced=True, has_mfa=False, role=role, require_enrolment=False)
+    assert d == {"mfa_satisfied": True, "mfa_required": False, "enrolment_required": False}
+
+
+@pytest.mark.parametrize("role", list(Role))
+def test_an_enrolled_factor_is_still_challenged(role: Role) -> None:
+    """The half that must NOT be relaxed.
+
+    Relaxing enrolment must not quietly stop honouring factors people already
+    have — that would silently downgrade every account the CLI has enrolled.
+    """
+    d = decide(enforced=True, has_mfa=True, role=role, require_enrolment=False)
+    assert d["mfa_required"] is True
+    assert d["mfa_satisfied"] is False
+
+
+def test_relaxing_enrolment_never_demands_enrolment() -> None:
+    """The frontend's fail-closed branch must be unreachable in this state."""
+    for role in Role:
+        d = decide(enforced=True, has_mfa=False, role=role, require_enrolment=False)
+        assert d["enrolment_required"] is False
+
+
+def test_the_strict_policy_is_one_flag_away() -> None:
+    """Turning MFA_REQUIRE_ENROLMENT on restores the original behaviour
+    exactly, so shipping the enrolment screen is a config change."""
+    d = decide(enforced=True, has_mfa=False, role=Role.OWNER, require_enrolment=True)
+    assert d == {"mfa_satisfied": False, "mfa_required": False, "enrolment_required": True}
+
+
 # ── Guards ──────────────────────────────────────────────────────────────────
+
+
+def test_enrolment_is_not_required_by_default() -> None:
+    """The counterpart to `test_default_is_enforced`.
+
+    A default that locks out the owner of every new tenant is not a safe
+    default, it is an outage. This one has to be flipped deliberately, the
+    same way MFA_ENFORCED does — and startup warns on every boot until it is.
+    """
+    from suliko.config import Settings
+
+    assert Settings(_env_file=None).mfa_require_enrolment is False
 
 
 def test_default_is_enforced() -> None:
@@ -120,7 +184,7 @@ def test_mirror_matches_source() -> None:
     for expression in (
         "must_have_mfa = enforced and requires_mfa(user.role)",
         "challenge_owed = enforced and has_mfa",
-        "enrolment_required = must_have_mfa and not has_mfa",
+        "enrolment_required = require_enrolment and must_have_mfa and not has_mfa",
         "mfa_satisfied=not (challenge_owed or enrolment_required)",
         "mfa_required=challenge_owed",
     ):
@@ -140,6 +204,7 @@ async def _gate(*, enforced: bool, mfa_satisfied_at: object) -> bool:
     from suliko.api.deps import get_authenticated_session
     from suliko.config import get_settings
     from suliko.core.errors import MfaRequiredError
+    from suliko.domain.plans import TenantPlan
     from suliko.security.permissions import permissions_for_role
     from suliko.security.sessions import AuthenticatedSession
 
@@ -157,6 +222,10 @@ async def _gate(*, enforced: bool, mfa_satisfied_at: object) -> bool:
             tenant_id=1,
             tenant_slug="acme",
             tenant_name="Acme Translations",
+            plan=TenantPlan.BUREAU,
+            onboarding_required=False,
+            must_change_password=False,
+            has_mfa=False,
             permissions=permissions_for_role(Role.SUPERUSER),
             mfa_satisfied_at=(datetime.now(UTC) if mfa_satisfied_at else None),
             impersonated_by_user_id=None,
@@ -207,3 +276,108 @@ def test_session_endpoint_agrees_with_the_gate() -> None:
         "mirror deps.get_authenticated_session, or stale sessions strand the "
         "frontend on the two-factor page."
     )
+
+
+# ── Step-up ─────────────────────────────────────────────────────────────────
+#
+# `STEP_UP_PERMISSIONS` demands a code verified within the last few minutes
+# before Settings, Users, the plan choice, API keys or an outbound transfer.
+# That is a real control for someone who HAS a factor. For someone who does
+# not, it is a permanent refusal five minutes after every login, satisfiable
+# by nothing — which is what these pin.
+
+
+async def _step_up(
+    *, permission: object, minutes_since_login: int, has_mfa: bool, enforced: bool = True
+) -> bool:
+    """True when the request is allowed through."""
+    from datetime import UTC, datetime, timedelta
+
+    from suliko.api.deps import require
+    from suliko.config import get_settings
+    from suliko.core.errors import StepUpRequiredError
+    from suliko.domain.plans import TenantPlan
+    from suliko.security.permissions import permissions_for_role
+    from suliko.security.sessions import AuthenticatedSession
+
+    settings = get_settings()
+    original = settings.mfa_enforced
+    object.__setattr__(settings, "mfa_enforced", enforced)
+    try:
+        session = AuthenticatedSession(
+            session_id=1,
+            user_id=1,
+            username="owner",
+            full_name="Owner",
+            email="owner@acme.test",
+            role=Role.OWNER,
+            tenant_id=1,
+            tenant_slug="acme",
+            tenant_name="Acme Translations",
+            plan=TenantPlan.BUREAU,
+            onboarding_required=False,
+            must_change_password=False,
+            has_mfa=has_mfa,
+            permissions=permissions_for_role(Role.OWNER),
+            # What login stamps: for a user with no factor, the moment they
+            # signed in; for one with a factor, the moment they answered.
+            mfa_satisfied_at=datetime.now(UTC) - timedelta(minutes=minutes_since_login),
+            impersonated_by_user_id=None,
+        )
+        try:
+            await require(permission)(session)  # type: ignore[arg-type]
+            return True
+        except StepUpRequiredError:
+            return False
+    finally:
+        object.__setattr__(settings, "mfa_enforced", original)
+
+
+@pytest.mark.parametrize(
+    "permission",
+    [
+        Permission.SETTINGS_MANAGE,
+        Permission.USERS_MANAGE,
+        Permission.TENANT_MANAGE,
+        Permission.APIKEYS_MANAGE,
+    ],
+)
+async def test_a_user_with_no_factor_is_not_asked_to_step_up(permission: Permission) -> None:
+    """The bug this fixes, and it was live with MFA switched off.
+
+    Five minutes after login, an owner with no enrolled factor was refused
+    Settings, the Users screen, the onboarding plan choice and API keys — and
+    the only way to clear it was a TOTP code they did not have. Every one of
+    those screens was simply unusable after the first few minutes.
+    """
+    assert await _step_up(permission=permission, minutes_since_login=60, has_mfa=False)
+
+
+@pytest.mark.parametrize("enforced", [True, False])
+async def test_the_switch_does_not_resurrect_the_dead_end(enforced: bool) -> None:
+    """It bit in BOTH positions of MFA_ENFORCED, because login stamps
+    `mfa_satisfied_at` either way."""
+    assert await _step_up(
+        permission=Permission.SETTINGS_MANAGE,
+        minutes_since_login=60,
+        has_mfa=False,
+        enforced=enforced,
+    )
+
+
+async def test_an_enrolled_user_is_still_asked_to_step_up() -> None:
+    """The half that must NOT be relaxed. Someone who can answer a challenge
+    is still asked — that is the whole point of the control."""
+    assert not await _step_up(
+        permission=Permission.SETTINGS_MANAGE, minutes_since_login=60, has_mfa=True
+    )
+
+
+async def test_a_fresh_code_satisfies_step_up() -> None:
+    assert await _step_up(
+        permission=Permission.SETTINGS_MANAGE, minutes_since_login=1, has_mfa=True
+    )
+
+
+async def test_a_permission_outside_the_step_up_set_is_never_delayed() -> None:
+    assert await _step_up(permission=Permission.ORDERS_WRITE, minutes_since_login=600, has_mfa=True)

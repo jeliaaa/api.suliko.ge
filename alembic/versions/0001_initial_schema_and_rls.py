@@ -91,6 +91,8 @@ LATER_REVISION_TABLES = frozenset(
         "drive_settings",
         "order_drive_folders",
         "order_document_drive_folders",
+        # 0006
+        "user_permission_overrides",
     }
 )
 
@@ -98,9 +100,7 @@ LATER_REVISION_TABLES = frozenset(
 def _revision_tables() -> list[sa.Table]:
     """The tables this revision owns, in dependency order."""
     return [
-        table
-        for table in Base.metadata.sorted_tables
-        if table.name not in LATER_REVISION_TABLES
+        table for table in Base.metadata.sorted_tables if table.name not in LATER_REVISION_TABLES
     ]
 
 

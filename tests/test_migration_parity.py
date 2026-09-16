@@ -25,6 +25,10 @@ LATER_REVISIONS = (
     "0002_collaboration_and_cms.py",
     "0003_integration_credentials.py",
     "0004_translator_portal_and_drive.py",
+    # Data only — no tables, hence an empty NEW_TABLES. Listed so the
+    # single-head and exclusion-list checks still see it.
+    "0005_tenant_plans.py",
+    "0006_user_invites_and_permission_overrides.py",
 )
 
 

@@ -104,6 +104,26 @@ def generate_token(prefix: str = "") -> str:
     return f"{prefix}{token}" if prefix else token
 
 
+#: Unambiguous when read aloud or copied from an email: no O/0, I/l/1, U/V.
+#: A one-time password gets typed by hand from a message, often on a phone,
+#: and a character someone has to guess at is a support call.
+_OTP_ALPHABET = "ABCDEFGHJKMNPQRSTWXYZabcdefghijkmnpqrstwxyz23456789"
+
+
+def generate_one_time_password(length: int = 16) -> str:
+    """A temporary password for an invited user.
+
+    Sixteen characters from a 51-character alphabet is ~90 bits, which is far
+    past anything guessable — and it has to be, because this value travels
+    through email and is valid until the user replaces it.
+
+    Formatted in groups of four. It exists to be transcribed once, and a
+    single 16-character run is where transcription errors come from.
+    """
+    raw = "".join(secrets.choice(_OTP_ALPHABET) for _ in range(length))
+    return "-".join(raw[i : i + 4] for i in range(0, length, 4))
+
+
 def hash_token(token: str) -> str:
     """SHA-256 of an opaque token, for storage.
 

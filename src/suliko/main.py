@@ -98,6 +98,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "the enrolment screen exists."
             ),
         )
+    elif not settings.mfa_require_enrolment:
+        # The weaker of the two states, and the easier one to forget about:
+        # 2FA looks switched on, and for anyone who has enrolled it is. What
+        # is off is the requirement to enrol at all.
+        structlog.get_logger().warning(
+            "mfa_enrolment_not_required",
+            detail=(
+                "MFA_REQUIRE_ENROLMENT is false. A factor is still demanded "
+                "from anyone who has one enrolled, but owners, admins and "
+                "superusers with no factor sign in on their password alone. "
+                "Set MFA_REQUIRE_ENROLMENT=true once the enrolment screen "
+                "exists — until then it locks those accounts out instead."
+            ),
+        )
 
     structlog.get_logger().info("startup", version=__version__, environment=settings.environment)
     yield

@@ -33,6 +33,7 @@ from suliko.config import get_settings
 from suliko.core.errors import NotFoundError, ValidationError
 from suliko.db.base import Base
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
+from suliko.domain.plans import TenantPlan
 from suliko.integrations.google_drive import (
     FOLDER_MIME_TYPE,
     DriveError,
@@ -1039,6 +1040,10 @@ def _staff_session(tenant_id: int) -> AuthenticatedSession:
         tenant_id=tenant_id,
         tenant_slug="acme",
         tenant_name="Acme Translations",
+        plan=TenantPlan.BUREAU,
+        onboarding_required=False,
+        must_change_password=False,
+        has_mfa=False,
         permissions=permissions_for_role(Role.STAFF),
         mfa_satisfied_at=None,
         impersonated_by_user_id=None,
