@@ -34,7 +34,7 @@ informally sent. It is not built yet, and the numbering below says so.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Annotated, Literal
 
@@ -245,13 +245,17 @@ async def list_companies(
     tab look broken on a fresh tenant.
     """
     out: list[CompanyOut] = []
-    for role in ("legal_entity", "brand"):
-        company = await _company(db, role)  # type: ignore[arg-type]
+    roles: tuple[CompanyRole, ...] = ("legal_entity", "brand")
+
+    for role in roles:
+        company = await _company(db, role)
         if company is None:
+            # A blank record, so the form renders with the role already
+            # chosen. id 0 means "not saved yet"; PUT creates it.
             out.append(
                 CompanyOut(
                     id=0,
-                    role=role,  # type: ignore[arg-type]
+                    role=role,
                     missing_for_invoice=list(INVOICE_REQUIRED),
                 )
             )
@@ -453,7 +457,8 @@ def _party(company: Company | None, locale: str) -> InvoiceParty:
     if company is None:
         return InvoiceParty(name="", address="", id_number="", email="", phone="", site="")
 
-    name = (company.name_en if locale == "en" else company.name_ka) or company.name_ka or company.name_en
+    preferred = company.name_en if locale == "en" else company.name_ka
+    name = preferred or company.name_ka or company.name_en
     address = (
         (company.address_en if locale == "en" else company.address_ka)
         or company.address_ka
@@ -553,7 +558,7 @@ async def order_invoice(
         # sequence. See the module docstring before treating it as legal.
         number=f"{order.id}",
         is_provisional=True,
-        issued_on=date.today(),
+        issued_on=datetime.now(UTC).date(),
         locale=locale,
         seller=_party(legal, locale),
         seller_brand=(

@@ -78,7 +78,7 @@ async def test_the_dashboard_builds_valid_postgresql() -> None:
 
 @pytest.mark.asyncio
 async def test_the_month_comparison_is_like_for_like() -> None:
-    """15 September must compare against 1–15 August, not the whole of August.
+    """15 September must compare against 1-15 August, not the whole of August.
 
     The clamp matters at month boundaries: 31 March-to-date against February
     would otherwise run past the end of the month.
