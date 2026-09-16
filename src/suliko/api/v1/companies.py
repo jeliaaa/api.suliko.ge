@@ -41,7 +41,8 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends
 from fastapi import status as http_status
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
+from sqlalchemy import Select, select
+from sqlalchemy.orm import joinedload
 
 from suliko.api.deps import CurrentSession, Db, require
 from suliko.api.v1._shared import mask_tail
@@ -447,6 +448,24 @@ async def invoice_readiness(
 invoice_router = APIRouter(prefix="/orders", tags=["companies"])
 
 
+def _invoice_documents_query(order_id: int) -> Select[tuple[OrderDocument]]:
+    """An order's document lines, with the type name each line prints.
+
+    The eager load is not an optimisation. `OrderDocument.document_type` is
+    declared lazy="raise", so without it the first invoice line raises instead
+    of quietly issuing one query — which is what lazy="raise" is for, but it
+    has to be paired with the eager load at every read site.
+
+    Separate from the handler so that pairing is testable without a database.
+    """
+    return (
+        select(OrderDocument)
+        .where(OrderDocument.order_id == order_id)
+        .options(joinedload(OrderDocument.document_type))
+        .order_by(OrderDocument.id)
+    )
+
+
 def _party(company: Company | None, locale: str) -> InvoiceParty:
     """A company as it appears on the invoice, in one locale.
 
@@ -493,8 +512,6 @@ async def order_invoice(
     filed, which is worse than no invoice at all.
     """
     stmt, _status_sq, _docs, _paid, _expenses = base_order_query()
-    from sqlalchemy.orm import joinedload
-
     stmt = stmt.join(Client, Client.id == Order.client_id).options(joinedload(Order.client))
     row = (await db.execute(stmt.where(Order.id == order_id))).unique().first()
     if row is None:
@@ -525,17 +542,7 @@ async def order_invoice(
             "Add one under Settings → Companies."
         )
 
-    docs = (
-        (
-            await db.execute(
-                select(OrderDocument)
-                .where(OrderDocument.order_id == order_id)
-                .order_by(OrderDocument.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
+    docs = (await db.execute(_invoice_documents_query(order_id))).unique().scalars().all()
 
     lines = [
         InvoiceLine(

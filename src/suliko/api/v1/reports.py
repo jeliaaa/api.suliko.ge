@@ -234,15 +234,23 @@ async def dashboard(
 
     # Status board.
     status2 = latest_status_subquery()
+    # Built once and used in both the SELECT and the GROUP BY. Calling
+    # coalesce() twice produces two separate bind parameters ($1 and $2), and
+    # PostgreSQL matches grouping expressions structurally — two Param nodes
+    # with different ids are not equal, so it falls back to requiring the bare
+    # column and rejects the query with "must appear in the GROUP BY clause".
+    # The SQL text looks identical either way; only the parameter ids differ,
+    # which is why this compiles cleanly and fails only against a database.
+    current_status = func.coalesce(status2.c.status, "new")
     status_rows = (
         await db.execute(
             select(
-                func.coalesce(status2.c.status, "new").label("status"),
+                current_status.label("status"),
                 func.count().label("count"),
             )
             .select_from(Order)
             .outerjoin(status2, status2.c.order_id == Order.id)
-            .group_by(func.coalesce(status2.c.status, "new"))
+            .group_by(current_status)
         )
     ).all()
 

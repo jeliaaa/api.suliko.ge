@@ -6,10 +6,13 @@ invoice that looks official but cannot be paid or filed. Both are pinned.
 
 from __future__ import annotations
 
+from sqlalchemy.dialects import postgresql
+
 from suliko.api.v1.companies import (
     INVOICE_REQUIRED,
     CompanyIn,
     InvoiceParty,
+    _invoice_documents_query,
     _missing,
     _party,
 )
@@ -113,3 +116,21 @@ def test_the_input_schema_covers_the_stored_columns() -> None:
         if c.name not in {"id", "tenant_id", "role", "created_at", "updated_at"}
     }
     assert stored == set(CompanyIn.model_fields)
+
+
+# ── The document lines ──────────────────────────────────────────────────────
+
+
+def test_invoice_lines_load_the_document_type_in_the_same_query() -> None:
+    """Every invoice line prints its document type's name.
+
+    `OrderDocument.document_type` is declared lazy="raise", so a missing eager
+    load is not a slow invoice — it is no invoice at all, raising on the first
+    line and turning `GET /orders/{id}/invoice` into a 500. The join is the
+    fix, and this is the test that the join is still there.
+    """
+    sql = str(_invoice_documents_query(7).compile(dialect=postgresql.dialect()))
+
+    assert "JOIN document_types" in sql
+    assert "document_types_1.name_ka" in sql
+    assert "document_types_1.name_en" in sql

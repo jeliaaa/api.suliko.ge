@@ -14,11 +14,13 @@ exist. That is a deployment property, and `suliko.cli schema-diff` answers it.
 from __future__ import annotations
 
 import datetime as dt
+import re
 from decimal import Decimal
 from typing import Any
 
 import pytest
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.dialects.postgresql import asyncpg
 
 from suliko.api.v1 import reports
 
@@ -42,12 +44,15 @@ class CompilingSession:
     one of them another's shape.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, dialect: Any = None) -> None:
         self.compiled: list[str] = []
+        # Default to the generic PostgreSQL dialect; the asyncpg one is passed
+        # in where the rendered bind parameters themselves are the subject.
+        self.dialect = dialect or postgresql.dialect()
 
     async def execute(self, stmt: Any) -> FakeResult:
         # The compile is the assertion: an unrenderable statement raises here.
-        self.compiled.append(str(stmt.compile(dialect=postgresql.dialect())))
+        self.compiled.append(str(stmt.compile(dialect=self.dialect)))
 
         names = [c.name for c in stmt.selected_columns]
 
@@ -129,3 +134,73 @@ def test_cancelled_orders_are_excluded_from_every_total() -> None:
         )
     )
     assert "NOT IN ('cancelled')" in sql
+
+
+# ── GROUP BY and its bind parameters ────────────────────────────────────────
+
+
+def _group_by_clauses(sql: str) -> list[str]:
+    """Every GROUP BY clause in a statement, nested subqueries included.
+
+    Scanned by parenthesis depth rather than split on a keyword, because a
+    subquery's GROUP BY ends at the `)` that closes the subquery and not at
+    any word.
+    """
+    clauses: list[str] = []
+    for match in re.finditer(r"\bGROUP BY\b", sql):
+        depth = 0
+        index = match.end()
+        end = len(sql)
+        while index < len(sql):
+            char = sql[index]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    end = index
+                    break
+                depth -= 1
+            elif depth == 0 and sql.startswith(("ORDER BY", "HAVING", "LIMIT", "UNION"), index):
+                end = index
+                break
+            index += 1
+        clauses.append(sql[match.end() : end])
+    return clauses
+
+
+@pytest.mark.asyncio
+async def test_a_grouped_expression_reuses_the_bind_parameter_it_selects() -> None:
+    """A grouped expression must be the SAME object as the selected one.
+
+    PostgreSQL matches GROUP BY expressions against the select list
+    structurally, and two bind parameters with different ids are not equal.
+    Building `coalesce(status, "new")` twice — once for the SELECT and once
+    for the GROUP BY — therefore renders identical-looking SQL carrying `$1`
+    in one place and `$2` in the other, and PostgreSQL rejects the statement
+    with "column ... must appear in the GROUP BY clause".
+
+    A compile-only test cannot see that: the SQL renders perfectly and only
+    fails once a server assigns parameter ids. So this asserts the property
+    directly — a parameter used in a GROUP BY must appear more than once in
+    the statement, because the matching SELECT has to carry the same one.
+    Rendered with the asyncpg dialect specifically: it is the driver in
+    production and the one that numbers parameters.
+    """
+    db = CompilingSession(dialect=asyncpg.dialect())
+    await reports.dashboard(db=db, _=None, today=dt.date(2026, 9, 15))  # type: ignore[arg-type]
+
+    checked = 0
+    for sql in db.compiled:
+        for clause in _group_by_clauses(sql):
+            for parameter in set(re.findall(r"\$\d+", clause)):
+                # The lookahead stops $1 being counted inside $12.
+                uses = len(re.findall(re.escape(parameter) + r"(?!\d)", sql))
+                checked += 1
+                assert uses > 1, (
+                    f"{parameter} appears only in the GROUP BY of this statement. "
+                    "The SELECT built the same expression a second time and got "
+                    "its own parameter, which PostgreSQL will not match it against. "
+                    f"Build the expression once and reuse it.\n\n{sql}"
+                )
+
+    assert checked, "the status board groups by an expression; if that changed, so should this"
