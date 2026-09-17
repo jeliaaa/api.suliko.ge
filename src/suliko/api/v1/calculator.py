@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
 from suliko.api.deps import CurrentSession, Db, require
+from suliko.domain.plans import TenantPlan, pricing_for_plan
 from suliko.domain.pricing import (
     DocumentPricingInput,
     PricingConfig,
@@ -84,20 +85,28 @@ class QuoteResponse(BaseModel):
     currency: str = "GEL"
 
 
-async def _pricing_config(db: Db) -> PricingConfig:
-    """Per-tenant multipliers, falling back to the documented defaults."""
+async def _pricing_config(db: Db, plan: TenantPlan) -> PricingConfig:
+    """Per-tenant multipliers, falling back to the documented defaults.
+
+    Then adjusted for the plan — see `domain/plans.pricing_for_plan`. Both
+    branches go through it, so a tenant with no settings row is not the one
+    case where a freelancer is charged a translator share.
+    """
     settings = (await db.execute(select(TenantSettings))).scalars().first()
     if settings is None:
-        return PricingConfig.defaults()
+        return pricing_for_plan(PricingConfig.defaults(), plan)
 
-    return PricingConfig(
-        urgency_multipliers={
-            Urgency.STANDARD: Decimal(str(settings.urgency_multiplier_standard)),
-            Urgency.EXPRESS: Decimal(str(settings.urgency_multiplier_express)),
-            Urgency.URGENT: Decimal(str(settings.urgency_multiplier_urgent)),
-        },
-        delivery_fee=Decimal(str(settings.delivery_fee)),
-        translator_share=Decimal(str(settings.default_translator_share)),
+    return pricing_for_plan(
+        PricingConfig(
+            urgency_multipliers={
+                Urgency.STANDARD: Decimal(str(settings.urgency_multiplier_standard)),
+                Urgency.EXPRESS: Decimal(str(settings.urgency_multiplier_express)),
+                Urgency.URGENT: Decimal(str(settings.urgency_multiplier_urgent)),
+            },
+            delivery_fee=Decimal(str(settings.delivery_fee)),
+            translator_share=Decimal(str(settings.default_translator_share)),
+        ),
+        plan,
     )
 
 
@@ -105,10 +114,10 @@ async def _pricing_config(db: Db) -> PricingConfig:
 async def quote(
     payload: QuoteRequest,
     db: Db,
-    _session: CurrentSession,
+    session: CurrentSession,
     __: Annotated[object, Depends(require(Permission.ORDERS_READ))],
 ) -> QuoteResponse:
-    config = await _pricing_config(db)
+    config = await _pricing_config(db, session.plan)
 
     # Load every rate and multiplier the request touches in two queries rather
     # than one per line — a 50-document quote should not be 100 round trips.

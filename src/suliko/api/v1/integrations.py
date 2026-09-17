@@ -39,8 +39,22 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
 from suliko.api.deps import CurrentSession, Db, require
+from suliko.api.portal_deps import Drive
 from suliko.core.crypto import DecryptionError, decrypt_for_tenant, encrypt_for_tenant
-from suliko.core.errors import NotFoundError, PermissionDeniedError, ValidationError
+from suliko.core.errors import (
+    NotFoundError,
+    PermissionDeniedError,
+    UpstreamUnavailableError,
+    ValidationError,
+)
+from suliko.domain.order_files import (
+    DriveLinkError,
+    drive_verification_name,
+    get_drive_settings,
+    resolve_shared_drive,
+    save_drive_link,
+    verify_drive_ownership,
+)
 from suliko.domain.plans import allows_provider, providers_for_plan
 from suliko.models.integration import IntegrationCredential, IntegrationProvider
 from suliko.security.permissions import Permission
@@ -272,12 +286,14 @@ class CheckResult(BaseModel):
 
 #: Providers that exist in the registry but are NOT offered on the screen.
 #:
-#: Google Drive: this card asked each bureau for its own service-account key,
-#: and nothing ever read it. Drive actually runs on ONE Suliko service account
-#: (`GOOGLE_SERVICE_ACCOUNT_FILE`), with each bureau's Shared Drive linked by a
-#: platform operator — see `integrations/google_drive.py`. A form that saves a
-#: private key and then does nothing with it is worse than no form: people
-#: fill it in and wonder why their files never appear.
+#: Google Drive: the generic card asked each bureau for its own
+#: service-account key, and nothing ever read it. Drive runs on ONE Suliko
+#: service account (`GOOGLE_SERVICE_ACCOUNT_FILE`); what a bureau actually sets
+#: is WHICH Shared Drive, and that has its own endpoints below
+#: (`/integrations/drive`) with an ownership check the generic form has no
+#: place for. A form that saves a private key and then does nothing with it is
+#: worse than no form: people fill it in and wonder why their files never
+#: appear.
 #:
 #: Kept in `PROVIDERS` rather than deleted, because the enum value is baked
 #: into a CHECK constraint (revision 0003) and existing rows may hold it.
@@ -391,6 +407,139 @@ async def list_integrations(
     return [
         _out(rows.get(p), spec, session.tenant_id) for p, spec in PROVIDERS.items() if p in allowed
     ]
+
+
+# ── Google Drive ────────────────────────────────────────────────────────────
+#
+# Registered BEFORE the `/{provider}` routes, which would otherwise try to read
+# "drive" as a provider name and 422.
+
+
+class DriveLinkOut(BaseModel):
+    shared_drive_id: str
+    #: The name Google reported when it was linked.
+    drive_name: str | None
+
+
+class DriveIntegrationOut(BaseModel):
+    #: False until GOOGLE_SERVICE_ACCOUNT_FILE is set on the API server.
+    #: Nothing below can work until it is true, and no setting here fixes it.
+    server_configured: bool
+    #: What the bureau adds to its Shared Drive as a Content manager.
+    service_account_email: str | None
+    #: The folder the bureau creates at the top of its drive to prove it is
+    #: theirs. Fixed per organisation.
+    verification_folder: str
+    linked: DriveLinkOut | None
+
+
+class DriveConnectIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    #: A Shared Drive id, or a link pasted from the browser's address bar.
+    shared_drive: str = Field(min_length=1, max_length=500)
+
+
+async def _drive_state(db: Db, drive: Drive, tenant_id: int) -> DriveIntegrationOut:
+    settings = await get_drive_settings(db)
+    email = drive.service_account_email
+    return DriveIntegrationOut(
+        server_configured=email is not None,
+        service_account_email=email,
+        verification_folder=drive_verification_name(tenant_id),
+        linked=(
+            DriveLinkOut(shared_drive_id=settings.shared_drive_id, drive_name=settings.drive_name)
+            if settings
+            else None
+        ),
+    )
+
+
+@router.get("/drive", response_model=DriveIntegrationOut)
+async def get_drive_integration(
+    db: Db,
+    drive: Drive,
+    session: Annotated[CurrentSession, Depends(require(Permission.SETTINGS_MANAGE))],
+) -> DriveIntegrationOut:
+    """Where this organisation's files go, and what it takes to connect."""
+    _require_allowed(session, IntegrationProvider.GOOGLE_DRIVE)
+    return await _drive_state(db, drive, session.tenant_id)
+
+
+@router.put("/drive", response_model=DriveIntegrationOut)
+async def connect_drive(
+    payload: DriveConnectIn,
+    db: Db,
+    drive: Drive,
+    session: Annotated[CurrentSession, Depends(require(Permission.SETTINGS_MANAGE))],
+) -> DriveIntegrationOut:
+    """Connect this organisation to a Shared Drive it can prove it owns.
+
+    Three things are checked before anything is saved: that the drive opens
+    at all (so Suliko's service account is a member), that no other
+    organisation already has it, and that it contains this organisation's
+    verification folder. The last is what makes this safe to offer to every
+    bureau rather than only to an operator — see `domain/order_files.py`.
+
+    The same flow for everyone, superusers included: a superuser connects the
+    drive of the organisation they are signed in to, like anyone else.
+    """
+    _require_allowed(session, IntegrationProvider.GOOGLE_DRIVE)
+
+    try:
+        drive_id, drive_name = await resolve_shared_drive(drive, payload.shared_drive)
+        if drive_id is None:  # pragma: no cover — min_length=1 rules out blank
+            raise DriveLinkError("Paste the Shared Drive link or id.")
+        await verify_drive_ownership(db, drive, drive_id=drive_id, tenant_id=session.tenant_id)
+    except DriveLinkError as exc:
+        if exc.upstream:
+            raise UpstreamUnavailableError(exc.message) from exc
+        raise ValidationError(exc.message) from exc
+
+    previous = await save_drive_link(db, drive_id, drive_name)
+
+    from suliko.core.audit import record
+
+    await record(
+        db,
+        session,
+        action="integration.drive_connected",
+        entity_type="tenant",
+        entity_id=session.tenant_id,
+        before={"shared_drive_id": previous},
+        after={"shared_drive_id": drive_id, "drive_name": drive_name},
+    )
+    return await _drive_state(db, drive, session.tenant_id)
+
+
+@router.delete("/drive", response_model=DriveIntegrationOut)
+async def disconnect_drive(
+    db: Db,
+    drive: Drive,
+    session: Annotated[CurrentSession, Depends(require(Permission.SETTINGS_MANAGE))],
+) -> DriveIntegrationOut:
+    """Stop using the connected drive.
+
+    Nothing is deleted in Google Drive. What goes is Suliko's record of where
+    each document's folders were, because those ids point into this drive and
+    mean nothing in the next one.
+    """
+    _require_allowed(session, IntegrationProvider.GOOGLE_DRIVE)
+
+    previous = await save_drive_link(db, None, None)
+
+    from suliko.core.audit import record
+
+    await record(
+        db,
+        session,
+        action="integration.drive_disconnected",
+        entity_type="tenant",
+        entity_id=session.tenant_id,
+        before={"shared_drive_id": previous},
+        after={"shared_drive_id": None},
+    )
+    return await _drive_state(db, drive, session.tenant_id)
 
 
 @router.get("/{provider}", response_model=IntegrationOut)

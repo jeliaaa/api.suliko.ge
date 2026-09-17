@@ -199,3 +199,61 @@ def test_a_stored_plan_round_trips(plan: TenantPlan) -> None:
     """`tenants.plan` is a plain String column, so the enum value is the
     storage format and renaming one is a migration."""
     assert parse(plan.value) is plan
+
+
+# ── Pricing ─────────────────────────────────────────────────────────────────
+
+
+def test_a_freelancer_pays_no_translator() -> None:
+    """They do the translation themselves. The bureau default of a 50% share
+    would book half of every job as a cost paid to nobody, and halve the
+    profit their Reports screen shows."""
+    from decimal import Decimal
+
+    from suliko.domain.plans import pricing_for_plan
+    from suliko.domain.pricing import PricingConfig
+
+    config = pricing_for_plan(PricingConfig.defaults(), TenantPlan.FREELANCER)
+    assert config.translator_share == Decimal("0")
+
+
+def test_a_bureau_keeps_its_configured_share() -> None:
+    from decimal import Decimal
+
+    from suliko.domain.plans import pricing_for_plan
+    from suliko.domain.pricing import PricingConfig, Urgency
+
+    configured = PricingConfig(
+        urgency_multipliers={Urgency.STANDARD: Decimal("1")},
+        translator_share=Decimal("0.35"),
+    )
+    assert pricing_for_plan(configured, TenantPlan.BUREAU) is configured
+
+
+def test_only_the_share_changes_for_a_freelancer() -> None:
+    """Urgency surcharges and the delivery fee are the freelancer's own
+    settings and must survive the adjustment."""
+    from decimal import Decimal
+
+    from suliko.domain.plans import pricing_for_plan
+    from suliko.domain.pricing import PricingConfig, Urgency
+
+    configured = PricingConfig(
+        urgency_multipliers={Urgency.URGENT: Decimal("3")},
+        delivery_fee=Decimal("25"),
+        translator_share=Decimal("0.5"),
+    )
+    adjusted = pricing_for_plan(configured, TenantPlan.FREELANCER)
+    assert adjusted.urgency_multipliers == configured.urgency_multipliers
+    assert adjusted.delivery_fee == Decimal("25")
+
+
+def test_the_quote_and_the_order_apply_the_same_rule() -> None:
+    """If only one of them did, a freelancer would be shown one profit while
+    building the order and have another stored."""
+    import inspect
+
+    from suliko.api.v1 import calculator, orders
+
+    assert "pricing_for_plan" in inspect.getsource(orders.create_order)
+    assert "pricing_for_plan" in inspect.getsource(calculator._pricing_config)

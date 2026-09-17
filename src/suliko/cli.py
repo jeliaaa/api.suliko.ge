@@ -25,7 +25,6 @@ import re
 import subprocess
 import sys
 from datetime import UTC, datetime
-from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -36,8 +35,9 @@ from suliko.config import get_settings
 from suliko.core.crypto import encrypt_for_tenant
 from suliko.db.session import dispose_engine, get_engine, get_sessionmaker
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
+from suliko.domain.reference_seed import seed_reference_data
 from suliko.models.directory import Client, ClientType  # noqa: F401 — registry
-from suliko.models.reference import DocumentType, Language, LanguagePairPrice, TenantSettings
+from suliko.models.reference import TenantSettings
 from suliko.models.tenant import Tenant, TenantStatus
 from suliko.models.user import MfaMethod, MfaRecoveryCode, Role, User
 from suliko.security import totp as totp_service
@@ -267,85 +267,9 @@ async def create_superuser(
 
 # ── Reference data ──────────────────────────────────────────────────────────
 
-#: Language set the bureau actually works in, taken from the PHP's
-#: API24_LANG_IDS map in config.php.
-LANGUAGES: tuple[tuple[str, str, str], ...] = (
-    ("ka", "Georgian", "ქართული"),
-    ("en", "English", "ინგლისური"),
-    ("ru", "Russian", "რუსული"),
-    ("de", "German", "გერმანული"),
-    ("fr", "French", "ფრანგული"),
-    ("it", "Italian", "იტალიური"),
-    ("es", "Spanish", "ესპანური"),
-    ("pt", "Portuguese", "პორტუგალიური"),
-    ("tr", "Turkish", "თურქული"),
-    ("az", "Azerbaijani", "აზერბაიჯანული"),
-    ("hy", "Armenian", "სომხური"),
-    ("uk", "Ukrainian", "უკრაინული"),
-    ("pl", "Polish", "პოლონური"),
-    ("ar", "Arabic", "არაბული"),
-    ("he", "Hebrew", "ებრაული"),
-    ("zh", "Chinese", "ჩინური"),
-    ("ja", "Japanese", "იაპონური"),
-    ("el", "Greek", "ბერძნული"),
-    ("lv", "Latvian", "ლატვიური"),
-    ("sl", "Slovenian", "სლოვენური"),
-    ("sk", "Slovak", "სლოვაკური"),
-    ("sr", "Serbian", "სერბული"),
-    ("ur", "Urdu", "ურდუ"),
-    ("fi", "Finnish", "ფინური"),
-    ("la", "Latin", "ლათინური"),
-)
-
-#: Starter document types. Multipliers all 1.0 — set your own in Settings.
-DOCUMENT_TYPES: tuple[tuple[str, str], ...] = (
-    ("Passport", "პასპორტი"),
-    ("ID card", "პირადობის მოწმობა"),
-    ("Birth certificate", "დაბადების მოწმობა"),
-    ("Marriage certificate", "ქორწინების მოწმობა"),
-    ("Diploma", "დიპლომი"),
-    ("Transcript", "ნიშნების ფურცელი"),
-    ("Certificate", "ცნობა"),
-    ("Power of attorney", "მინდობილობა"),
-    ("Contract", "ხელშეკრულება"),
-    ("Letter", "წერილი"),
-    ("Technical specifications", "ტექნიკური მახასიათებლები"),
-    ("Medical record", "სამედიცინო ჩანაწერი"),
-    ("Bank statement", "საბანკო ამონაწერი"),
-    ("Court document", "სასამართლო დოკუმენტი"),
-    ("Other", "სხვა"),
-)
-
-#: Rates read off the production Calculator screen's "Pricing Reference" panel.
-#: The panel was scrolled, so this is the visible subset — NOT a complete rate
-#: card. Verify every line against your own before quoting a client.
-STARTER_RATES: tuple[tuple[str, str, str], ...] = (
-    ("az", "da", "100.00"),
-    ("ka", "sv", "60.00"),
-    ("sv", "ka", "60.00"),
-    ("es", "ka", "50.00"),
-    ("pt", "ka", "50.00"),
-    ("ka", "uk", "45.00"),
-    ("pt", "ru", "45.00"),
-    ("ru", "pt", "45.00"),
-    ("uk", "ka", "45.00"),
-    ("en", "es", "40.00"),
-    ("en", "fr", "40.00"),
-    ("en", "it", "40.00"),
-    ("en", "pt", "40.00"),
-    ("es", "en", "40.00"),
-    ("es", "ru", "40.00"),
-    ("fr", "en", "40.00"),
-    ("fr", "ru", "40.00"),
-    ("it", "en", "40.00"),
-    ("it", "ru", "40.00"),
-    ("ka", "es", "40.00"),
-    ("ka", "pt", "40.00"),
-    ("pt", "en", "40.00"),
-)
-
 
 async def seed_reference(tenant_slug: str, with_rates: bool = False) -> None:
+    """Fill an organisation's catalogues. The data lives in domain/reference_seed."""
     async with get_sessionmaker()() as db:
         with bypass_tenant_scope():
             tenant = (
@@ -355,58 +279,21 @@ async def seed_reference(tenant_slug: str, with_rates: bool = False) -> None:
             raise SystemExit(f"No tenant with slug {tenant_slug!r}.")
 
         with tenant_scope(int(tenant.id)):
-            existing_codes = set((await db.execute(select(Language.code))).scalars())
-            added = 0
-            for code, name_en, name_ka in LANGUAGES:
-                if code not in existing_codes:
-                    db.add(Language(code=code, name_en=name_en, name_ka=name_ka))
-                    added += 1
-            ok(f"languages: {added} added, {len(existing_codes)} already present")
-
-            existing_types = set((await db.execute(select(DocumentType.name_en))).scalars())
-            added = 0
-            for name_en, name_ka in DOCUMENT_TYPES:
-                if name_en not in existing_types:
-                    db.add(
-                        DocumentType(
-                            name_en=name_en,
-                            name_ka=name_ka,
-                            price_multiplier=Decimal("1.0"),
-                        )
-                    )
-                    added += 1
-            ok(f"document types: {added} added, {len(existing_types)} already present")
-
-            if with_rates:
-                existing_pairs = {
-                    (src, tgt)
-                    for src, tgt in await db.execute(
-                        select(
-                            LanguagePairPrice.source_language,
-                            LanguagePairPrice.target_language,
-                        )
-                    )
-                }
-                added = 0
-                for src, tgt, price in STARTER_RATES:
-                    if (src, tgt) not in existing_pairs:
-                        db.add(
-                            LanguagePairPrice(
-                                source_language=src,
-                                target_language=tgt,
-                                price_per_page=Decimal(price),
-                                is_active=True,
-                            )
-                        )
-                        added += 1
-                ok(f"language pair rates: {added} added")
-                warn(
-                    "Those rates were read off a screenshot of the production "
-                    "Calculator and are an INCOMPLETE subset. Verify every line "
-                    "in Settings -> Pricing before quoting a client."
-                )
-
+            result = await seed_reference_data(db, with_rates=with_rates)
             await db.commit()
+
+        ok(f"languages: {result.languages_added} added, {result.languages_present} already present")
+        ok(
+            f"document types: {result.document_types_added} added, "
+            f"{result.document_types_present} already present"
+        )
+        if with_rates:
+            ok(f"language pair rates: {result.rates_added} added")
+            warn(
+                "Those rates were read off a screenshot of the production "
+                "Calculator and are an INCOMPLETE subset. Verify every line "
+                "in Settings -> Pricing before quoting a client."
+            )
 
 
 # ── Health check ────────────────────────────────────────────────────────────

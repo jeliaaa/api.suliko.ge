@@ -27,6 +27,8 @@ in any bureau's drive — would be downloadable by anyone holding a portal login
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import re
 from dataclasses import dataclass
 from urllib.parse import quote
@@ -134,18 +136,24 @@ async def get_drive_settings(db: AsyncSession) -> DriveSettings | None:
 
 # ── Linking a bureau to a Shared Drive ──────────────────────────────────────
 #
-# Shared by the two places allowed to do it: the suliko.ge admin panel and the
-# CRM's platform console. One implementation, so the check that matters cannot
-# drift between them.
+# Shared by the two places that do it: a bureau's own Settings → Integrations,
+# and the suliko.ge admin panel. One implementation, so the checks that matter
+# cannot drift between them.
 #
-# ## Why linking is an OPERATOR action, not a bureau one
+# ## Why a bureau has to PROVE it owns the drive
 #
-# Every bureau adds the SAME Suliko service account to its drive. So the
-# service account can open every linked drive on the platform, and a drive id
-# is all it takes to point a tenant at one. If a bureau could link its own
-# drive, bureau A could paste bureau B's drive id and read B's documents
-# through the CRM. Until ownership of a drive can be proved, linking stays
-# with someone trusted to check it.
+# Every bureau adds the SAME Suliko service account to its drive, so that
+# account can open every linked drive on the platform, and a drive id is all
+# it takes to point a tenant at one. Without a proof, bureau A could paste
+# bureau B's drive id and read B's documents through the CRM.
+#
+# The proof is the same shape as domain verification. Each tenant has a fixed
+# folder name nobody else can predict (`drive_verification_name`), and the
+# drive must contain a folder with that name at its top level. Creating one
+# needs write access to the drive — which is precisely what an attacker
+# pointing at someone else's drive does not have. Suliko itself never creates
+# folders at a drive's top level except `Suliko Orders`, so no request can be
+# used to plant the marker on a bureau's behalf.
 
 
 class DriveLinkError(Exception):
@@ -192,6 +200,70 @@ async def resolve_shared_drive(
         raise DriveLinkError("Google Drive is not available right now.", upstream=True) from exc
 
     return drive_id, name
+
+
+VERIFICATION_PREFIX = "suliko-verify-"
+
+
+def drive_verification_name(tenant_id: int) -> str:
+    """The folder a tenant must create in its drive before linking it.
+
+    Derived, not stored: an HMAC of the tenant id under the server's master
+    key. Stable across page loads, so the instructions a bureau reads do not
+    change under them — and unguessable from outside, so no bureau can work
+    out another's. A leaked value is harmless: it only ever verifies a drive
+    for the tenant it was derived from.
+    """
+    from suliko.config import get_settings
+
+    key = get_settings().encryption_master_key.get_secret_value().encode()
+    digest = hmac.new(key, f"suliko-drive-verify:{tenant_id}".encode(), hashlib.sha256)
+    return VERIFICATION_PREFIX + digest.hexdigest()[:16]
+
+
+async def verify_drive_ownership(
+    db: AsyncSession, drive: DriveClient, *, drive_id: str, tenant_id: int
+) -> None:
+    """Refuse a drive this tenant has not proved it controls.
+
+    Two checks, in the order that gives the clearer message:
+
+    1. No OTHER tenant has this drive linked. A drive holds one bureau's
+       files; sharing one would mix two bureaus' folders in it.
+    2. The drive contains this tenant's verification folder at its top level.
+
+    Check 1 reads across tenants and is therefore only as good as what the
+    session can see. It is defence in depth — check 2 is the one that holds on
+    its own, because it needs write access to the drive itself.
+    """
+    from suliko.db.tenancy import bypass_tenant_scope
+
+    with bypass_tenant_scope():
+        taken = (
+            await db.execute(
+                select(DriveSettings.tenant_id).where(
+                    DriveSettings.shared_drive_id == drive_id,
+                    DriveSettings.tenant_id != tenant_id,
+                )
+            )
+        ).first()
+    if taken is not None:
+        raise DriveLinkError(
+            "That Shared Drive is already connected to another organisation on Suliko."
+        )
+
+    marker = drive_verification_name(tenant_id)
+    try:
+        found = await drive.find_folder(drive_id=drive_id, parent_id=drive_id, name=marker)
+    except DriveError as exc:
+        raise DriveLinkError("Google Drive is not available right now.", upstream=True) from exc
+
+    if found is None:
+        raise DriveLinkError(
+            f'Create a folder named "{marker}" at the top level of that Shared Drive, '
+            "then try again. It proves the drive is yours; you can delete it once the "
+            "drive is connected."
+        )
 
 
 async def save_drive_link(

@@ -42,6 +42,7 @@ from suliko.core.ratelimit import RateLimiter, get_rate_limiter
 from suliko.db.session import bind_tenant_guc, get_sessionmaker, session_scope
 from suliko.db.tenancy import bypass_tenant_scope, tenant_scope
 from suliko.domain.plans import effective_permissions, effective_plan
+from suliko.domain.reference_seed import seed_reference_data
 from suliko.models.reference import TenantSettings
 from suliko.models.tenant import Tenant, TenantStatus
 from suliko.models.user import LoginAttempt, MfaMethod, MfaRecoveryCode, Role, User
@@ -497,6 +498,10 @@ async def signup(
 
         with tenant_scope(tenant_id):
             db.add(TenantSettings(tenant_id=tenant_id, default_language=tenant.locale))
+            # The same starter catalogues `suliko seed-reference` adds, minus
+            # prices — see domain/reference_seed.py for why. Without these the
+            # very first "New translation" has no document type to choose.
+            await seed_reference_data(db)
             user = User(
                 tenant_id=tenant_id,
                 username=username,

@@ -44,8 +44,11 @@ from __future__ import annotations
 
 import enum
 from collections.abc import Mapping
+from dataclasses import replace
+from decimal import Decimal
 from types import MappingProxyType
 
+from suliko.domain.pricing import PricingConfig
 from suliko.models.integration import IntegrationProvider
 from suliko.models.user import Role
 from suliko.security.permissions import Permission, permissions_for_role
@@ -231,6 +234,22 @@ def providers_for_plan(plan: TenantPlan) -> frozenset[IntegrationProvider]:
     return PLAN_PROVIDERS.get(plan, frozenset())
 
 
+def pricing_for_plan(config: PricingConfig, plan: TenantPlan) -> PricingConfig:
+    """Adjust a tenant's pricing knobs for what its plan actually is.
+
+    A freelancer does the translation themselves. The plan withholds
+    `translators.*`, so there is nobody to assign and nobody to pay — and the
+    bureau default of a 50% translator share would book half of every job as a
+    cost paid to no one, halving the profit their Reports screen shows.
+
+    Applied at quote time AND at order time, so the price a freelancer is shown
+    is the cost the order is stored with.
+    """
+    if plan is TenantPlan.FREELANCER:
+        return replace(config, translator_share=Decimal("0"))
+    return config
+
+
 __all__ = [
     "DEFAULT_PLAN",
     "NON_OVERRIDABLE",
@@ -247,5 +266,6 @@ __all__ = [
     "overridable_for_plan",
     "parse",
     "permissions_for_plan",
+    "pricing_for_plan",
     "providers_for_plan",
 ]

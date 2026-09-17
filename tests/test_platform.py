@@ -489,8 +489,17 @@ async def test_disconnecting_removes_only_that_bureaus_link(db: AsyncSession) ->
 class _FakeDrive:
     service_account_email = "suliko-drive@suliko.iam.gserviceaccount.com"
 
-    def __init__(self, *, status: int | None = None) -> None:
+    def __init__(
+        self, *, status: int | None = None, top_level_folders: dict[str, set[str]] | None = None
+    ) -> None:
         self.status = status
+        #: drive id -> folder names at that drive's top level.
+        self.top_level_folders = top_level_folders or {}
+        self.lookups: list[tuple[str, str, str]] = []
+
+    async def find_folder(self, *, drive_id: str, parent_id: str, name: str) -> object | None:
+        self.lookups.append((drive_id, parent_id, name))
+        return object() if name in self.top_level_folders.get(parent_id, set()) else None
 
     async def get_shared_drive_name(self, drive_id: str) -> str:
         from suliko.integrations.google_drive import DriveError
@@ -547,8 +556,132 @@ async def test_a_google_outage_is_reported_as_upstream() -> None:
     assert caught.value.upstream is True
 
 
-def test_platform_linking_is_scoped_to_the_target_tenant() -> None:
-    body = inspect.getsource(platform.link_tenant_drive)
-    assert "bind_tenant_guc(db, tenant_id)" in body
-    assert "tenant_scope(tenant_id)" in body
+def test_the_platform_console_only_reports_the_drive() -> None:
+    """Connecting a drive lives in Settings → Integrations, behind the
+    ownership check. The platform console shows the link and nothing more."""
+    source = inspect.getsource(platform)
+    assert "save_drive_link" not in source
+    assert "resolve_shared_drive" not in source
+    for route in platform.router.routes:
+        assert "drive" not in route.path, f"{route.path} writes drive settings"  # type: ignore[attr-defined]
+
+
+# ── Proving a drive belongs to the organisation connecting it ───────────────
+
+
+def test_every_tenant_gets_its_own_verification_folder() -> None:
+    from suliko.domain.order_files import VERIFICATION_PREFIX, drive_verification_name
+
+    names = {drive_verification_name(tenant_id) for tenant_id in range(1, 201)}
+    assert len(names) == 200
+    assert all(n.startswith(VERIFICATION_PREFIX) for n in names)
+
+
+def test_the_verification_folder_is_stable() -> None:
+    """The instructions a bureau reads must not change between page loads."""
+    from suliko.domain.order_files import drive_verification_name
+
+    assert drive_verification_name(ACME) == drive_verification_name(ACME)
+
+
+def test_the_verification_folder_is_not_guessable_from_the_tenant_id() -> None:
+    """Keyed on the server secret. A bare hash of the id could be computed by
+    any bureau for any other bureau, which would make the check decorative."""
+    import hashlib
+
+    from suliko.domain.order_files import VERIFICATION_PREFIX, drive_verification_name
+
+    plain = hashlib.sha256(f"suliko-drive-verify:{ACME}".encode()).hexdigest()[:16]
+    assert drive_verification_name(ACME) != VERIFICATION_PREFIX + plain
+
+
+async def test_a_drive_with_the_folder_is_accepted(db: AsyncSession) -> None:
+    from suliko.domain.order_files import drive_verification_name, verify_drive_ownership
+
+    drive = _FakeDrive(top_level_folders={"0AAcmeNewDrive1": {drive_verification_name(ACME)}})
+    await verify_drive_ownership(db, drive, drive_id="0AAcmeNewDrive1", tenant_id=ACME)  # type: ignore[arg-type]
+
+    # Looked for at the TOP of the drive: parent is the drive itself.
+    assert drive.lookups == [("0AAcmeNewDrive1", "0AAcmeNewDrive1", drive_verification_name(ACME))]
+
+
+async def test_a_drive_without_the_folder_is_refused_with_the_name_to_create(
+    db: AsyncSession,
+) -> None:
+    from suliko.domain.order_files import (
+        DriveLinkError,
+        drive_verification_name,
+        verify_drive_ownership,
+    )
+
+    with pytest.raises(DriveLinkError) as caught:
+        await verify_drive_ownership(
+            db,
+            _FakeDrive(),  # type: ignore[arg-type]
+            drive_id="0AAcmeNewDrive1",
+            tenant_id=ACME,
+        )
+    assert drive_verification_name(ACME) in caught.value.message
+    assert caught.value.upstream is False
+
+
+async def test_another_bureaus_folder_does_not_verify_this_one(db: AsyncSession) -> None:
+    """The attack itself: Globex points at a drive where only ACME's marker
+    exists. Globex cannot create its own marker there, and ACME's is useless
+    to it."""
+    from suliko.domain.order_files import (
+        DriveLinkError,
+        drive_verification_name,
+        verify_drive_ownership,
+    )
+
+    drive = _FakeDrive(top_level_folders={"0AAcmeNewDrive1": {drive_verification_name(ACME)}})
+    with pytest.raises(DriveLinkError, match="Create a folder"):
+        await verify_drive_ownership(db, drive, drive_id="0AAcmeNewDrive1", tenant_id=GLOBEX)  # type: ignore[arg-type]
+
+
+async def test_a_drive_another_bureau_has_connected_is_refused(db: AsyncSession) -> None:
+    """Even WITH a valid marker: someone who later gains write access to a
+    drive must not be able to pull it away from the bureau using it."""
+    from suliko.domain.order_files import (
+        DriveLinkError,
+        drive_verification_name,
+        verify_drive_ownership,
+    )
+
+    await _seed_folders(db)  # Globex has 0AGlobexDrive01 connected
+
+    drive = _FakeDrive(top_level_folders={"0AGlobexDrive01": {drive_verification_name(ACME)}})
+    with pytest.raises(DriveLinkError, match="another organisation"):
+        await verify_drive_ownership(db, drive, drive_id="0AGlobexDrive01", tenant_id=ACME)  # type: ignore[arg-type]
+
+    # Refused before Google was even asked.
+    assert drive.lookups == []
+
+
+async def test_reconnecting_your_own_drive_is_not_a_clash(db: AsyncSession) -> None:
+    from suliko.domain.order_files import drive_verification_name, verify_drive_ownership
+
+    await _seed_folders(db)  # ACME already has 0AAcmeDrive0001
+
+    drive = _FakeDrive(top_level_folders={"0AAcmeDrive0001": {drive_verification_name(ACME)}})
+    await verify_drive_ownership(db, drive, drive_id="0AAcmeDrive0001", tenant_id=ACME)  # type: ignore[arg-type]
+
+
+def test_the_settings_endpoint_verifies_before_it_saves() -> None:
+    """The order is the control: nothing is written until ownership holds."""
+    from suliko.api.v1 import integrations
+
+    body = inspect.getsource(integrations.connect_drive)
+    assert body.index("verify_drive_ownership") < body.index("save_drive_link")
+    assert "tenant_id=session.tenant_id" in body, "must verify for the CALLER's tenant"
     assert "await record(" in body
+
+
+def test_the_drive_routes_are_matched_before_the_generic_provider_routes() -> None:
+    """Otherwise `/integrations/drive` is read as a provider called "drive"
+    and 422s before the Drive handler is ever reached."""
+    from suliko.api.v1 import integrations
+
+    paths = [route.path for route in integrations.router.routes]  # type: ignore[attr-defined]
+    assert paths.index("/integrations/drive") < paths.index("/integrations/{provider}")

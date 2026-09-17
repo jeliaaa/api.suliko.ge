@@ -32,6 +32,7 @@ from suliko.api.v1._shared import PageMeta
 from suliko.core.errors import NotFoundError, ValidationError
 from suliko.domain.notifications import notify, notify_everyone
 from suliko.domain.orders import base_order_query
+from suliko.domain.plans import pricing_for_plan
 from suliko.domain.pricing import DocumentPricingInput, PricingConfig, price_document
 from suliko.domain.statuses import INITIAL_STATUS, get_label, is_known
 from suliko.models.collaboration import NotificationKind
@@ -450,6 +451,8 @@ async def create_order(
         if settings
         else PricingConfig.defaults()
     )
+    # Must match what the quote endpoint showed while the order was built.
+    config = pricing_for_plan(config, session.plan)
 
     # Load rates and multipliers once rather than per document.
     rates = {

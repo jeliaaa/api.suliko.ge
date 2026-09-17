@@ -61,16 +61,13 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy import case, func, select
 
 from suliko.api.deps import Db, require
-from suliko.api.portal_deps import Drive
 from suliko.core.errors import (
     ConflictError,
     NotFoundError,
-    UpstreamUnavailableError,
     ValidationError,
 )
 from suliko.db.session import bind_tenant_guc
 from suliko.db.tenancy import bypass_tenant_scope, tenant_scope
-from suliko.domain.order_files import DriveLinkError, resolve_shared_drive, save_drive_link
 from suliko.domain.plans import TenantPlan, effective_plan
 from suliko.models.drive import DriveSettings
 from suliko.models.order import Order, OrderDocument
@@ -155,6 +152,10 @@ class TenantFigures(BaseModel):
 
 
 class DriveLink(BaseModel):
+    """Read-only here. A bureau connects its drive in Settings → Integrations,
+    where the ownership check lives — the platform console only reports it,
+    which is what support needs when someone says their files are missing."""
+
     #: None when the bureau has not linked one.
     shared_drive_id: str | None
     #: The name Google reported when it was linked — shown so a mistyped id
@@ -171,21 +172,6 @@ class TenantDetail(BaseModel):
     pricing: list[PairPrice]
     figures: TenantFigures
     drive: DriveLink
-
-
-class DriveServerStatus(BaseModel):
-    #: False when GOOGLE_SERVICE_ACCOUNT_FILE is unset or unreadable. Nothing
-    #: about Drive works until it is true.
-    configured: bool
-    #: What each bureau adds to its Shared Drive as a Content manager.
-    service_account_email: str | None
-
-
-class DriveLinkIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    #: A Shared Drive id, or a pasted drive link. Null or blank disconnects.
-    shared_drive: str | None = Field(default=None, max_length=500)
 
 
 class PlatformUserCreate(BaseModel):
@@ -498,61 +484,6 @@ async def set_tenant_status(
     return _summary(
         tenant, users=int(counts[0]), active_users=int(counts[1] or 0), orders=figures.orders
     )
-
-
-# ── Google Drive ────────────────────────────────────────────────────────────
-
-
-@router.get("/drive", response_model=DriveServerStatus)
-async def drive_status(_: Superuser, drive: Drive) -> DriveServerStatus:
-    """Whether this server can reach Drive at all, and as whom."""
-    email = drive.service_account_email
-    return DriveServerStatus(configured=email is not None, service_account_email=email)
-
-
-@router.put("/tenants/{tenant_id}/drive", response_model=DriveLink)
-async def link_tenant_drive(
-    tenant_id: int,
-    payload: DriveLinkIn,
-    db: Db,
-    session: Superuser,
-    drive: Drive,
-) -> DriveLink:
-    """Connect, change or disconnect a bureau's Shared Drive.
-
-    Operator-only, deliberately — see `domain/order_files.py`. One service
-    account is a member of every bureau's drive, so letting a bureau enter its
-    own drive id would let it enter anybody's.
-    """
-    tenant = await _tenant_or_404(db, tenant_id)
-
-    try:
-        drive_id, drive_name = await resolve_shared_drive(drive, payload.shared_drive)
-    except DriveLinkError as exc:
-        if exc.upstream:
-            raise UpstreamUnavailableError(exc.message) from exc
-        raise ValidationError(exc.message) from exc
-
-    # Scoped to the TARGET tenant: the stale-folder cleanup inside relies on
-    # the ORM filter to pick this bureau's rows, and an unscoped session would
-    # clear every bureau's folder ids at once.
-    await bind_tenant_guc(db, tenant_id)
-    with tenant_scope(tenant_id):
-        previous = await save_drive_link(db, drive_id, drive_name)
-
-    from suliko.core.audit import record
-
-    await record(
-        db,
-        session,
-        action="platform.tenant_drive_changed",
-        entity_type="tenant",
-        entity_id=tenant.id,
-        tenant_id=tenant.id,
-        before={"shared_drive_id": previous},
-        after={"shared_drive_id": drive_id, "drive_name": drive_name},
-    )
-    return DriveLink(shared_drive_id=drive_id, drive_name=drive_name)
 
 
 # ── Users, in somebody else's tenant ────────────────────────────────────────
