@@ -213,8 +213,19 @@ class PortalAccountInvite(Base, IdMixin, TimestampMixin):
     )
     # SET NULL rather than CASCADE: the invite's own history (who was invited,
     # when, by whom) must survive the suliko.ge admin deactivating an account.
+    #
+    # Explicit, shortened `name=`: the naming convention's default —
+    # "fk_portal_account_invites_portal_translator_id_portal_translators" — is
+    # 65 characters, past PostgreSQL's 63-character identifier limit. Must
+    # match migration 0007's own explicit name, which is the DDL that actually
+    # runs (this table is excluded from 0001's metadata build).
     portal_translator_id: Mapped[int | None] = mapped_column(
-        ForeignKey("portal_translators.id", ondelete="SET NULL"), default=None
+        ForeignKey(
+            "portal_translators.id",
+            ondelete="SET NULL",
+            name="fk_portal_account_invites_portal_translator_id",
+        ),
+        default=None,
     )
 
     status: Mapped[InviteStatus] = mapped_column(

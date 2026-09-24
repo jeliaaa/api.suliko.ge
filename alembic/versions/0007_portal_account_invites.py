@@ -102,7 +102,15 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(
             ["portal_translator_id"],
             ["portal_translators.id"],
-            name="fk_portal_account_invites_portal_translator_id_portal_translators",
+            # Shortened: the full "..._portal_translator_id_portal_translators"
+            # name is 65 characters, past PostgreSQL's 63-character identifier
+            # limit — `validate_identifier` raises before the DDL ever reaches
+            # the server. This table is excluded from 0001's metadata build
+            # (see NEW_TABLES there), so this migration is the only DDL that
+            # ever creates it — but the model still needs the same explicit
+            # `name=` below, or the two would disagree for no reason and a
+            # future test comparing them would have to special-case it.
+            name="fk_portal_account_invites_portal_translator_id",
             ondelete="SET NULL",
         ),
         sa.ForeignKeyConstraint(
