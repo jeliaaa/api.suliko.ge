@@ -289,7 +289,7 @@ def test_every_tenant_table_inherits_tenantscoped() -> None:
     """
     import suliko.models  # noqa: F401  — populates the registry
 
-    # Two deliberate exemptions. Any OTHER model appearing here is a bug.
+    # Three deliberate exemptions. Any OTHER model appearing here is a bug.
     #
     # AuditLog: platform-level events (tenant created, impersonation started)
     # have no tenant at all, and the superuser must be able to read across
@@ -301,7 +301,12 @@ def test_every_tenant_table_inherits_tenantscoped() -> None:
     # bureaus to enter; as a TenantScoped table under RLS that read would return
     # nothing. Its tenant_id is written only by the suliko.ge admin endpoint and
     # read only to choose a tenant scope. See suliko/models/portal.py.
-    exempt = {"AuditLog", "PortalTranslatorLink"}
+    #
+    # PortalAccountInvite: same reasoning as PortalTranslatorLink, for the same
+    # reason — resolving an invite means searching across every bureau by
+    # contact details before any tenant is bound. Its tenant_id is written from
+    # the inviter's session, never from a request. See suliko/models/portal.py.
+    exempt = {"AuditLog", "PortalTranslatorLink", "PortalAccountInvite"}
 
     unprotected: list[str] = []
     for mapper in Base.registry.mappers:

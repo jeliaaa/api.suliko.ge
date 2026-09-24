@@ -30,10 +30,11 @@ from sqlalchemy.pool import StaticPool
 
 from suliko.api.portal_deps import ASSERTION_HEADER, get_platform_db, get_tenant_sessions
 from suliko.config import get_settings
-from suliko.core.errors import NotFoundError, ValidationError
+from suliko.core.errors import ConflictError, NotFoundError, ValidationError
 from suliko.db.base import Base
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
 from suliko.domain.plans import TenantPlan
+from suliko.domain.portal import registration_url
 from suliko.integrations.google_drive import (
     FOLDER_MIME_TYPE,
     DriveError,
@@ -44,15 +45,17 @@ from suliko.models.directory import Client, ClientType, Translator
 from suliko.models.drive import DriveSettings, OrderDocumentDriveFolder, OrderDriveFolder
 from suliko.models.order import CopyType, Order, OrderDocument, Urgency
 from suliko.models.portal import (
+    InviteStatus,
     PersonalOrder,
     PersonalOrderFile,
     PersonalOrderLanguagePair,
+    PortalAccountInvite,
     PortalTranslator,
     PortalTranslatorLink,
 )
 from suliko.models.reference import DocumentType
 from suliko.models.tenant import Tenant, TenantStatus
-from suliko.models.user import Role
+from suliko.models.user import Role, User, UserPermissionOverride
 from suliko.security.permissions import permissions_for_role
 from suliko.security.portal_tokens import sign_token
 from suliko.security.sessions import AuthenticatedSession
@@ -78,12 +81,15 @@ MODELS = [
     OrderDocument,
     PortalTranslator,
     PortalTranslatorLink,
+    PortalAccountInvite,
     PersonalOrder,
     PersonalOrderLanguagePair,
     PersonalOrderFile,
     DriveSettings,
     OrderDriveFolder,
     OrderDocumentDriveFolder,
+    User,
+    UserPermissionOverride,
 ]
 
 API = "/api/v1"
@@ -1103,3 +1109,391 @@ async def test_staff_assignment_puts_a_document_in_the_portal(
                     session=staff,
                     _=staff,
                 )
+
+
+# ── A bureau invites a translator, matched against suliko.ge ────────────────
+#
+# The other direction from the tests above: there, the suliko.ge admin links an
+# ACCOUNT to a directory ROW they already picked. Here a bureau invites by
+# email/phone, and the API does the matching — `domain.portal.account_matches`,
+# `link_account_to_directory_row` and `resolve_pending_invites`.
+
+_TENANT_NAMES = {ACME: ("acme", "Acme Translations"), GLOBEX: ("globex", "Globex Language")}
+
+
+def _manager_session(tenant_id: int) -> AuthenticatedSession:
+    """`TRANSLATORS_WRITE` needs at least MANAGER — `_staff_session` above
+    is STAFF, which only reads."""
+    slug, name = _TENANT_NAMES[tenant_id]
+    return AuthenticatedSession(
+        session_id=2,
+        user_id=2,
+        username="manager",
+        full_name="Bureau Manager",
+        email="manager@acme.test",
+        role=Role.MANAGER,
+        tenant_id=tenant_id,
+        tenant_slug=slug,
+        tenant_name=name,
+        plan=TenantPlan.BUREAU,
+        onboarding_required=False,
+        must_change_password=False,
+        has_mfa=False,
+        permissions=permissions_for_role(Role.MANAGER),
+        mfa_satisfied_at=None,
+        impersonated_by_user_id=None,
+    )
+
+
+def _admin_session(tenant_id: int) -> AuthenticatedSession:
+    """`USERS_MANAGE` — `POST /users/invite` — needs at least ADMIN."""
+    slug, name = _TENANT_NAMES[tenant_id]
+    return AuthenticatedSession(
+        session_id=3,
+        user_id=3,
+        username="admin",
+        full_name="Bureau Admin",
+        email="admin@acme.test",
+        role=Role.ADMIN,
+        tenant_id=tenant_id,
+        tenant_slug=slug,
+        tenant_name=name,
+        plan=TenantPlan.BUREAU,
+        onboarding_required=False,
+        must_change_password=False,
+        has_mfa=False,
+        permissions=permissions_for_role(Role.ADMIN),
+        mfa_satisfied_at=None,
+        impersonated_by_user_id=None,
+    )
+
+
+@pytest.fixture
+def sent_mail(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, str]]:
+    """Captures every `mail.send` call instead of logging or sending it."""
+    from suliko.core import mail as mail_module
+    from suliko.core.mail import MailResult
+
+    sent: list[dict[str, str]] = []
+
+    async def fake_send(to: str, subject: str, body: str) -> MailResult:
+        sent.append({"to": to, "subject": subject, "body": body})
+        return MailResult(delivered=True, reason="sent")
+
+    monkeypatch.setattr(mail_module, "send", fake_send)
+    return sent
+
+
+async def _invite_translator(
+    maker: async_sessionmaker[AsyncSession],
+    tenant_id: int,
+    session: AuthenticatedSession,
+    *,
+    full_name: str = "New Translator",
+    email: str,
+    phone: str | None = None,
+    translator_id: int | None = None,
+) -> Any:
+    from suliko.api.v1 import translators as translators_api
+
+    payload = translators_api.TranslatorInvite(
+        full_name=full_name, email=email, phone=phone, translator_id=translator_id
+    )
+    with tenant_scope(tenant_id):
+        async with maker() as db:
+            result = await translators_api.invite_translator(payload, db, session, session)
+            await db.commit()
+    return result
+
+
+async def test_invite_translator_links_immediately_on_a_matching_account(
+    client: httpx.AsyncClient,
+    maker: async_sessionmaker[AsyncSession],
+    sent_mail: list[dict[str, str]],
+) -> None:
+    await add_translator(client)  # GIORGI: phone "555123456", email "giorgi@example.com"
+
+    result = await _invite_translator(
+        maker,
+        ACME,
+        _manager_session(ACME),
+        full_name="Giorgi Kapanadze",
+        email="giorgi@example.com",
+    )
+
+    assert result.invite_status == "linked"
+    assert result.matched_display_name == "Giorgi Kapanadze"
+    assert "Orders tab" in sent_mail[-1]["body"]
+
+    me = (await client.get(f"{API}/portal/me", headers=as_user(GIORGI))).json()
+    assert me["organizations"] == [{"slug": "acme", "name": "Acme Translations"}]
+
+
+async def test_invite_translator_matches_by_normalized_phone(
+    client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    await add_translator(client)  # phone stored as "555123456"
+
+    result = await _invite_translator(
+        maker,
+        ACME,
+        _manager_session(ACME),
+        full_name="Giorgi",
+        email="someone-else@example.com",
+        phone="+995 555 12-34-56",
+    )
+
+    assert result.invite_status == "linked"
+    assert result.matched_display_name == "Giorgi Kapanadze"
+
+
+async def test_invite_translator_matches_by_email_case_insensitively(
+    client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    await add_translator(
+        client, user_id=NINO, display_name="Nino", phone=None, email="Nino@Example.com"
+    )
+
+    result = await _invite_translator(
+        maker, ACME, _manager_session(ACME), full_name="Nino", email="nino@example.com"
+    )
+
+    assert result.invite_status == "linked"
+    assert result.matched_display_name == "Nino"
+
+
+async def test_invite_translator_with_no_match_is_pending_and_emails_the_registration_link(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
+) -> None:
+    result = await _invite_translator(
+        maker,
+        ACME,
+        _manager_session(ACME),
+        full_name="Someone New",
+        email="someone.new@example.com",
+    )
+
+    assert result.invite_status == "pending"
+    assert result.matched_display_name is None
+
+    body = sent_mail[-1]["body"]
+    assert "someone.new@example.com" in body
+    assert registration_url() in body
+
+
+async def test_pending_translator_invite_resolves_when_admin_marks_the_account(
+    client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    result = await _invite_translator(
+        maker,
+        ACME,
+        _manager_session(ACME),
+        full_name="Nino",
+        email="nino@example.com",
+        phone="555999888",
+    )
+    assert result.invite_status == "pending"
+
+    await add_translator(client, user_id=NINO, display_name="Nino", phone="555999888", email=None)
+
+    me = (await client.get(f"{API}/portal/me", headers=as_user(NINO))).json()
+    assert me["organizations"] == [{"slug": "acme", "name": "Acme Translations"}]
+
+    with tenant_scope(ACME):
+        async with maker() as db:
+            invite = (
+                await db.execute(
+                    select(PortalAccountInvite).where(
+                        PortalAccountInvite.email == "nino@example.com"
+                    )
+                )
+            ).scalar_one()
+    assert invite.status is InviteStatus.LINKED
+
+
+async def test_pending_translator_invite_resolves_when_the_translator_opens_the_portal(
+    client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    """A pending invite left ambiguous by two matching accounts, resolved the
+    moment one of THEM shows up — not by the admin path, which already ran
+    (twice) before the invite even existed."""
+    await add_translator(
+        client, user_id=NINO, display_name="Nino One", phone=None, email="dup@example.com"
+    )
+    await add_translator(
+        client, user_id=STRANGER, display_name="Nino Two", phone=None, email="dup@example.com"
+    )
+
+    result = await _invite_translator(
+        maker, ACME, _manager_session(ACME), full_name="Nino", email="dup@example.com"
+    )
+    assert result.invite_status == "pending"  # ambiguous: two accounts match
+
+    response = await client.get(f"{API}/portal/me", headers=as_user(NINO))
+    assert response.json()["organizations"] == [{"slug": "acme", "name": "Acme Translations"}]
+
+
+async def test_invite_conflict_when_the_directory_row_is_already_linked(
+    client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    await giorgi_at_acme(client)  # links GIORGI to Acme's directory row 1
+    await add_translator(
+        client, user_id=NINO, display_name="Nino", phone=None, email="nino@example.com"
+    )
+
+    with pytest.raises(ConflictError):
+        await _invite_translator(
+            maker,
+            ACME,
+            _manager_session(ACME),
+            full_name="Nino",
+            email="nino@example.com",
+            translator_id=1,
+        )
+
+
+async def test_translator_invites_are_tenant_isolated(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """`PortalAccountInvite` carries no RLS and is not `TenantScoped` — this is
+    the one test that would catch a missing `tenant_id` filter in the router."""
+    from suliko.api.v1 import translators as translators_api
+
+    await _invite_translator(
+        maker, ACME, _manager_session(ACME), full_name="A", email="a@example.com"
+    )
+    await _invite_translator(
+        maker, GLOBEX, _manager_session(GLOBEX), full_name="B", email="b@example.com"
+    )
+
+    with tenant_scope(ACME):
+        async with maker() as db:
+            acme_session = _manager_session(ACME)
+            acme_invites = await translators_api.list_translator_invites(
+                db, acme_session, acme_session
+            )
+            acme_invite_id = acme_invites[0].id
+    assert [i.email for i in acme_invites] == ["a@example.com"]
+
+    with tenant_scope(GLOBEX):
+        async with maker() as db:
+            globex_session = _manager_session(GLOBEX)
+            globex_invites = await translators_api.list_translator_invites(
+                db, globex_session, globex_session
+            )
+            assert [i.email for i in globex_invites] == ["b@example.com"]
+
+            with pytest.raises(NotFoundError):
+                await translators_api.cancel_translator_invite(
+                    acme_invite_id, db, globex_session, globex_session
+                )
+
+
+async def test_cancelling_a_translator_invite_stops_it_resolving(
+    client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    from suliko.api.v1 import translators as translators_api
+
+    result = await _invite_translator(
+        maker, ACME, _manager_session(ACME), full_name="Nino", email="nino@example.com"
+    )
+    assert result.invite_status == "pending"
+
+    with tenant_scope(ACME):
+        async with maker() as db:
+            session = _manager_session(ACME)
+            invites = await translators_api.list_translator_invites(db, session, session)
+            await translators_api.cancel_translator_invite(invites[0].id, db, session, session)
+            await db.commit()
+
+    await add_translator(
+        client, user_id=NINO, display_name="Nino", phone=None, email="nino@example.com"
+    )
+
+    me = (await client.get(f"{API}/portal/me", headers=as_user(NINO))).json()
+    assert me["organizations"] == []
+
+
+# ── A bureau invites a staff member, matched against suliko.ge ──────────────
+#
+# `POST /users/invite` gains the same matching, but nothing to link into: a
+# CRM login is not the suliko.ge portal, so a match is a record, not a
+# connection. See `SulikoAccountOut` and `_invite_status_for` in
+# `api/v1/users.py`.
+
+
+async def test_staff_invite_records_the_suliko_account_match(
+    client: httpx.AsyncClient,
+    maker: async_sessionmaker[AsyncSession],
+    sent_mail: list[dict[str, str]],
+) -> None:
+    from suliko.api.v1 import users as users_api
+
+    await add_translator(client)  # GIORGI: phone "555123456", email "giorgi@example.com"
+
+    payload = users_api.UserInvite(
+        full_name="Giorgi Kapanadze", email="giorgi@example.com", role=Role.STAFF
+    )
+    with tenant_scope(ACME):
+        async with maker() as db:
+            session = _admin_session(ACME)
+            result = await users_api.invite_user(payload, db, session, session)
+            await db.commit()
+
+    assert result.suliko_account.status == "linked"
+    assert result.suliko_account.matched_display_name == "Giorgi Kapanadze"
+    assert result.user.suliko_account is not None
+    assert result.user.suliko_account.status == "linked"
+    assert "already registered on suliko.ge" in sent_mail[-1]["body"]
+
+    # The Users list carries the same status, batched the way overrides are.
+    with tenant_scope(ACME):
+        async with maker() as db:
+            session = _admin_session(ACME)
+            page = await users_api.list_users(db, session, session)
+    listed = next(u for u in page.items if u.email == "giorgi@example.com")
+    assert listed.suliko_account is not None
+    assert listed.suliko_account.status == "linked"
+
+
+async def test_staff_invite_with_no_match_is_pending_and_emails_the_registration_link(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
+) -> None:
+    from suliko.api.v1 import users as users_api
+
+    payload = users_api.UserInvite(
+        full_name="Someone New", email="someone.new@example.com", role=Role.STAFF
+    )
+    with tenant_scope(ACME):
+        async with maker() as db:
+            session = _admin_session(ACME)
+            result = await users_api.invite_user(payload, db, session, session)
+            await db.commit()
+
+    assert result.suliko_account.status == "pending"
+    assert result.suliko_account.matched_display_name is None
+
+    body = sent_mail[-1]["body"]
+    assert "someone.new@example.com" in body
+    assert registration_url() in body
+
+
+async def test_created_user_has_no_suliko_account(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """`POST /users` never asks suliko.ge anything — the admin chose the
+    password directly, which is the whole difference from an invite."""
+    from suliko.api.v1 import users as users_api
+
+    payload = users_api.UserCreate(
+        username="direct",
+        email="direct@example.com",
+        full_name="Direct Hire",
+        password="a-very-long-password-1",
+    )
+    with tenant_scope(ACME):
+        async with maker() as db:
+            session = _admin_session(ACME)
+            result = await users_api.create_user(payload, db, session, session)
+
+    assert result.suliko_account is None

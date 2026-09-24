@@ -72,6 +72,7 @@ from suliko.domain.portal import (
     assigned_orders,
     find_portal_translator,
     linked_organizations,
+    resolve_pending_invites,
 )
 from suliko.integrations.google_drive import DriveError, DriveFile, DriveNotConfiguredError
 from suliko.models.audit import ActorType
@@ -344,11 +345,20 @@ async def _folders(
 
 
 @router.get("/me", response_model=PortalMe)
-async def get_me(identity: PortalCaller, db: PlatformDb) -> PortalMe:
-    """Never 403: a user who is not a translator simply gets no Orders tab."""
+async def get_me(identity: PortalCaller, db: PlatformDb, tenants: TenantSessions) -> PortalMe:
+    """Never 403: a user who is not a translator simply gets no Orders tab.
+
+    Also where a bureau's invite catches up with an account that already
+    existed when the invite was written — `resolve_pending_invites` runs here
+    because this is the one moment we know a translator is present and active.
+    A GET that can write is unusual; it is idempotent, it is one indexed
+    SELECT on the common case of nothing pending, and there is no other signal
+    to hang this on short of a scheduler.
+    """
     translator = await find_portal_translator(db, identity.user_id)
     if translator is None or not translator.is_active:
         return PortalMe(is_translator=False)
+    await resolve_pending_invites(db, tenants, translator, actor_type=ActorType.PORTAL_TRANSLATOR)
     organizations = await linked_organizations(db, translator.id)
     return PortalMe(
         is_translator=True,

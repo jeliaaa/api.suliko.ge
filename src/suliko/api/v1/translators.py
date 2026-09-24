@@ -13,18 +13,31 @@ Follows `clients.py`. The differences that matter:
 
 from __future__ import annotations
 
-from datetime import date
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy import func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from suliko.api.deps import CurrentSession, Db, require
 from suliko.api.v1._shared import PageMeta, mask_tail
-from suliko.core.errors import NotFoundError
+from suliko.core import mail
+from suliko.core.errors import ConflictError, NotFoundError
+from suliko.domain.portal import (
+    account_matches,
+    link_account_to_directory_row,
+    normalize_email,
+    normalize_phone,
+    registration_url,
+)
 from suliko.models.directory import Translator
+from suliko.models.portal import InviteKind, InviteStatus, PortalAccountInvite
+from suliko.models.tenant import Tenant
 from suliko.security.permissions import Permission
 
 router = APIRouter(prefix="/translators", tags=["translators"])
@@ -153,6 +166,299 @@ async def list_translators(
     return TranslatorPage(
         items=[_summary(r) for r in rows],
         meta=PageMeta(total=total, limit=limit, offset=offset),
+    )
+
+
+# ── Inviting a translator, and matching them to their suliko.ge account ─────
+#
+# The literal "/invites" routes below are registered BEFORE "/{translator_id}"
+# on purpose: Starlette matches routes by position, and a request for
+# "/translators/invites" would otherwise be caught by the int-typed
+# "/{translator_id}" route first and fail its own validation instead of
+# reaching this one.
+
+
+class TranslatorInvite(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    full_name: str = Field(min_length=1, max_length=255)
+    email: EmailStr
+    phone: str | None = Field(default=None, max_length=50)
+    #: An existing directory row to attach the invite to. Null creates one —
+    #: exactly the choice the suliko.ge admin's own linking screen offers.
+    translator_id: int | None = None
+
+
+class TranslatorInviteOut(BaseModel):
+    translator: TranslatorDetail
+    #: 'linked' when exactly one suliko.ge account matched immediately;
+    #: 'pending' otherwise — no match, or more than one, either way waiting on
+    #: `domain.portal.resolve_pending_invites`.
+    invite_status: Literal["linked", "pending"]
+    #: Set only when linked immediately: which suliko.ge account it matched.
+    matched_display_name: str | None
+    email_sent: bool
+
+
+class TranslatorInviteSummary(BaseModel):
+    id: int
+    full_name: str
+    email: str
+    phone: str | None
+    translator_id: int
+    status: InviteStatus
+    created_at: datetime
+
+
+def _translator_invite_email(
+    full_name: str, tenant_name: str, email: str, *, linked: bool, matched_display_name: str | None
+) -> tuple[str, str]:
+    """Subject and plain-text body — the two outcomes read very differently.
+
+    Order matters in the pending body, and is the one the plan settled on:
+    which bureau invited them, that they need a suliko.ge account, the EXACT
+    address it must use, the registration link, then the phone-number escape
+    hatch — so someone who already has an account under a different-looking
+    address still finds their way in.
+    """
+    if linked:
+        matched = f" ({matched_display_name})" if matched_display_name else ""
+        body = (
+            f"Hello {full_name},\n\n"
+            f"{tenant_name} has invited you to translate for them on Suliko, and "
+            f"it looks like you already have a suliko.ge account under this "
+            f"address{matched}.\n\n"
+            "Sign in to suliko.ge and open the Orders tab — the bureau is "
+            "already waiting for you there.\n"
+        )
+        return f"{tenant_name} has invited you on Suliko", body
+
+    url = registration_url()
+    body = (
+        f"Hello {full_name},\n\n"
+        f"{tenant_name} has invited you to translate for them on Suliko.\n\n"
+        "To accept, you need a suliko.ge account using THIS email address:\n\n"
+        f"  {email}\n\n"
+        f"If you don't have one yet, register here: {url}\n\n"
+        "If you already have a suliko.ge account, make sure it uses this exact "
+        "email address — or the matching phone number. The moment it does, "
+        f"{tenant_name} will appear in your Orders tab automatically, with "
+        "nothing further for you to do.\n"
+    )
+    return f"{tenant_name} has invited you on Suliko", body
+
+
+@router.post("/invite", response_model=TranslatorInviteOut, status_code=status.HTTP_201_CREATED)
+async def invite_translator(
+    payload: TranslatorInvite,
+    db: Db,
+    session: CurrentSession,
+    _: Annotated[object, Depends(require(Permission.TRANSLATORS_WRITE))],
+) -> TranslatorInviteOut:
+    """Invite a translator, and try to connect them to their suliko.ge account.
+
+    Attaches to an existing directory row when `translator_id` is given,
+    otherwise creates one — see `directory_matches` / `GET /translators` for
+    how the bureau finds a row to attach to instead of creating a duplicate.
+
+    Then tries `domain.portal.account_matches` against the invited email and
+    phone. Exactly one match links immediately, through the same
+    `link_account_to_directory_row` the suliko.ge admin's manual link uses.
+    Zero or several matches leave the invite `pending`: it is not an error —
+    the invitee is emailed the suliko.ge registration link and told exactly
+    which address to use, and `resolve_pending_invites` finishes the job the
+    moment a matching account exists (see that function's docstring for the
+    two moments that happens).
+
+    `db` doubles as the platform session here: `portal_translators` and
+    `portal_account_invites` carry no row-level security and are not
+    `TenantScoped`, so the tenant-scoped ORM filter and the before-flush guard
+    both leave them alone — see `db/tenancy.py` and the exemption in
+    `tests/test_tenant_isolation.py`.
+    """
+    email = str(payload.email).strip().lower()
+    phone = (payload.phone or "").strip() or None
+
+    if payload.translator_id is not None:
+        directory_row = await db.get(Translator, payload.translator_id)
+        if directory_row is None:
+            raise NotFoundError("Translator not found.")
+    else:
+        directory_row = Translator(
+            name=payload.full_name.strip(), email=email, phone=phone, is_active=True
+        )
+        db.add(directory_row)
+        await db.flush()
+
+    tenant = await db.get(Tenant, session.tenant_id)
+    if tenant is None:  # pragma: no cover - a live session always has one
+        raise NotFoundError("Organisation not found.")
+
+    @asynccontextmanager
+    async def _same_tenant(_tenant_id: int) -> AsyncIterator[AsyncSession]:
+        # The invite is always for THIS bureau's own directory row, so there
+        # is no other tenant scope to enter — `link_account_to_directory_row`
+        # is written for the suliko.ge admin, who has none bound yet.
+        yield db
+
+    matches = await account_matches(db, phone=phone, email=email)
+
+    existing = (
+        await db.execute(
+            select(PortalAccountInvite).where(
+                PortalAccountInvite.tenant_id == session.tenant_id,
+                PortalAccountInvite.kind == InviteKind.TRANSLATOR,
+                PortalAccountInvite.translator_id == directory_row.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        clash = (
+            await db.execute(
+                select(PortalAccountInvite).where(
+                    PortalAccountInvite.tenant_id == session.tenant_id,
+                    PortalAccountInvite.kind == InviteKind.TRANSLATOR,
+                    PortalAccountInvite.email == email,
+                )
+            )
+        ).scalar_one_or_none()
+        if clash is not None:
+            raise ConflictError(
+                "That email address is already the invite for a different translator record."
+            )
+        existing = PortalAccountInvite(
+            tenant_id=session.tenant_id,
+            kind=InviteKind.TRANSLATOR,
+            translator_id=directory_row.id,
+            email=email,
+            invited_by_user_id=session.user_id,
+        )
+        db.add(existing)
+
+    existing.full_name = payload.full_name.strip()
+    existing.email = email
+    existing.phone = phone
+    existing.normalized_email = normalize_email(email)
+    existing.normalized_phone = normalize_phone(phone)
+
+    matched_display_name: str | None = None
+    if len(matches) == 1:
+        account, _reason = matches[0]
+        # `translator_id` is passed explicitly, so this can only attach the
+        # SAME row or raise — never create or reassign one.
+        await link_account_to_directory_row(
+            db, _same_tenant, account=account, tenant=tenant, translator_id=directory_row.id
+        )
+        matched_display_name = account.display_name
+        existing.portal_translator_id = account.id
+        existing.status = InviteStatus.LINKED
+        existing.resolved_at = datetime.now(UTC)
+    else:
+        existing.portal_translator_id = None
+        existing.status = InviteStatus.PENDING
+        existing.resolved_at = None
+
+    await db.flush()
+    await db.refresh(directory_row)
+
+    from suliko.core.audit import record
+
+    await record(
+        db,
+        session,
+        action="translator.invited",
+        entity_type="translator",
+        entity_id=directory_row.id,
+        after={
+            "email": email,
+            "invite_status": existing.status.value,
+            "candidate_count": len(matches),
+        },
+    )
+
+    subject, body = _translator_invite_email(
+        directory_row.name,
+        session.tenant_name,
+        email,
+        linked=existing.status is InviteStatus.LINKED,
+        matched_display_name=matched_display_name,
+    )
+    mail_result = await mail.send(email, subject, body)
+
+    return TranslatorInviteOut(
+        translator=_detail(directory_row),
+        invite_status=existing.status.value,  # type: ignore[arg-type]
+        matched_display_name=matched_display_name,
+        email_sent=mail_result.delivered,
+    )
+
+
+@router.get("/invites", response_model=list[TranslatorInviteSummary])
+async def list_translator_invites(
+    db: Db,
+    session: CurrentSession,
+    _: Annotated[object, Depends(require(Permission.TRANSLATORS_READ))],
+) -> list[TranslatorInviteSummary]:
+    """Every translator invite this bureau has sent, newest first.
+
+    `tenant_id` is filtered explicitly — `PortalAccountInvite` is a platform
+    table with no RLS and no `TenantScoped` mixin, so nothing does this
+    automatically. See the isolation test in `tests/test_portal_api.py`.
+    """
+    rows = (
+        (
+            await db.execute(
+                select(PortalAccountInvite)
+                .where(
+                    PortalAccountInvite.tenant_id == session.tenant_id,
+                    PortalAccountInvite.kind == InviteKind.TRANSLATOR,
+                )
+                .order_by(PortalAccountInvite.id.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        TranslatorInviteSummary(
+            id=row.id,
+            full_name=row.full_name,
+            email=row.email,
+            phone=row.phone,
+            translator_id=row.translator_id,  # type: ignore[arg-type]
+            status=row.status,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
+
+
+@router.delete("/invites/{invite_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def cancel_translator_invite(
+    invite_id: int,
+    db: Db,
+    session: CurrentSession,
+    _: Annotated[object, Depends(require(Permission.TRANSLATORS_WRITE))],
+) -> None:
+    """Stop waiting for a match. The directory row and any existing link are
+    untouched — this only cancels the invite record."""
+    row = await db.get(PortalAccountInvite, invite_id)
+    if row is None or row.tenant_id != session.tenant_id or row.kind is not InviteKind.TRANSLATOR:
+        # Another bureau's invite is indistinguishable from a missing one.
+        raise NotFoundError("Invite not found.")
+
+    row.status = InviteStatus.CANCELLED
+    await db.flush()
+
+    from suliko.core.audit import record
+
+    await record(
+        db,
+        session,
+        action="translator.invite_cancelled",
+        entity_type="translator",
+        entity_id=row.translator_id,
+        before={"email": row.email},
     )
 
 

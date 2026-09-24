@@ -22,17 +22,24 @@ So the split is:
 platform-level for the plainer reason that there is no tenant to scope them by.
 Access to all of it is decided by the portal identity (``api/portal_deps.py``),
 never by the ORM filter.
+
+``portal_account_invites`` is platform-level for the same reason as
+``portal_translator_links``: resolving one means finding out, later and for an
+account nobody has identified yet, that it now matches an invite some bureau
+wrote — a lookup that has to run before any tenant is bound. See
+``domain.portal.account_matches`` and ``domain.portal.resolve_pending_invites``.
 """
 
 from __future__ import annotations
 
 import enum
-from datetime import date
+from datetime import date, datetime
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     Date,
+    DateTime,
     Enum,
     ForeignKey,
     Index,
@@ -51,6 +58,26 @@ class FileKind(enum.StrEnum):
 
     SOURCE = "source"
     TRANSLATION = "translation"
+
+
+class InviteKind(enum.StrEnum):
+    """What being invited turns into once it resolves.
+
+    ``TRANSLATOR`` links to a bureau's ``translators`` directory row —
+    ``PortalTranslatorLink``, the same table the suliko.ge admin's manual
+    linking writes. ``STAFF`` links to a ``users`` row, which has no portal
+    relationship today; resolving it only records which suliko.ge account the
+    address belongs to, for the day that changes.
+    """
+
+    TRANSLATOR = "translator"
+    STAFF = "staff"
+
+
+class InviteStatus(enum.StrEnum):
+    PENDING = "pending"
+    LINKED = "linked"
+    CANCELLED = "cancelled"
 
 
 class PortalTranslator(Base, IdMixin, TimestampMixin):
@@ -111,6 +138,100 @@ class PortalTranslatorLink(Base, IdMixin, TimestampMixin):
     translator_id: Mapped[int] = mapped_column(
         ForeignKey("translators.id", ondelete="CASCADE"), nullable=False
     )
+
+
+class PortalAccountInvite(Base, IdMixin, TimestampMixin):
+    """A bureau's claim that one address belongs to a suliko.ge account.
+
+    Written the moment a bureau invites someone — a translator or a staff
+    member — by email or phone. If exactly one ``PortalTranslator`` matches at
+    that moment, the invite resolves immediately (``LINKED``). Otherwise it
+    waits as ``PENDING`` until a matching account exists: either a suliko.ge
+    admin marks one as a translator (``portal_admin.upsert_translator`` calls
+    ``resolve_pending_invites`` right after), or the translator themselves
+    opens the portal (``portal.get_me`` calls it too). Neither path needs a
+    scheduler — resolution is a side effect of the two moments a matching
+    account can newly exist or newly show up.
+
+    Platform-level for the reason the module docstring gives: it must be
+    searchable by contact details across every bureau before any tenant is
+    known, which is what makes the ``normalized_*`` columns worth indexing —
+    unlike ``domain.portal.account_matches`` (admin-triggered, rare),
+    resolution runs on every portal sign-in.
+
+    ``tenant_id`` is a plain column, written from the inviter's session and
+    never taken from the request, exactly like ``PortalTranslatorLink.tenant_id``.
+    """
+
+    __tablename__ = "portal_account_invites"
+    __table_args__ = (
+        # Re-inviting the same address updates this row rather than piling up
+        # duplicates that would all try to resolve at once.
+        UniqueConstraint(
+            "tenant_id", "kind", "email", name="uq_portal_account_invites_tenant_kind_email"
+        ),
+        # A directory row can be the target of at most one invite, matching
+        # the one-account-per-row rule `PortalTranslatorLink` already enforces.
+        UniqueConstraint("translator_id", name="uq_portal_account_invites_translator_id"),
+        Index("ix_portal_account_invites_tenant_status", "tenant_id", "status"),
+        Index("ix_portal_account_invites_normalized_email", "normalized_email"),
+        Index("ix_portal_account_invites_normalized_phone", "normalized_phone"),
+    )
+
+    tenant_id: Mapped[int] = mapped_column(
+        ForeignKey("tenants.id", ondelete="RESTRICT"), nullable=False
+    )
+    kind: Mapped[InviteKind] = mapped_column(
+        Enum(
+            InviteKind,
+            name="portal_invite_kind",
+            values_callable=enum_values,
+            native_enum=False,
+            length=20,
+        ),
+        nullable=False,
+    )
+    full_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    #: As the bureau typed it, lowercased. Free text, same as `Translator.email`.
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    phone: Mapped[str | None] = mapped_column(String(50), default=None)
+
+    #: `domain.portal.normalize_email` / `normalize_phone`, kept in step with
+    #: `email`/`phone` so resolution can filter in SQL instead of loading
+    #: every pending invite into Python on every portal sign-in.
+    normalized_email: Mapped[str | None] = mapped_column(String(255), default=None)
+    normalized_phone: Mapped[str | None] = mapped_column(String(32), default=None)
+
+    # CASCADE: the invite exists to seat someone in this directory row: if the
+    # row goes, so does the reason to keep chasing a match for it.
+    translator_id: Mapped[int | None] = mapped_column(
+        ForeignKey("translators.id", ondelete="CASCADE"), default=None
+    )
+    # CASCADE: same reasoning, for a staff invite.
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), default=None
+    )
+    # SET NULL rather than CASCADE: the invite's own history (who was invited,
+    # when, by whom) must survive the suliko.ge admin deactivating an account.
+    portal_translator_id: Mapped[int | None] = mapped_column(
+        ForeignKey("portal_translators.id", ondelete="SET NULL"), default=None
+    )
+
+    status: Mapped[InviteStatus] = mapped_column(
+        Enum(
+            InviteStatus,
+            name="portal_invite_status",
+            values_callable=enum_values,
+            native_enum=False,
+            length=20,
+        ),
+        default=InviteStatus.PENDING,
+        nullable=False,
+    )
+    invited_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), default=None
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
 
 class PersonalOrder(Base, IdMixin, TimestampMixin):

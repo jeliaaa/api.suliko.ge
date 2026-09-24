@@ -19,7 +19,7 @@ Password hashes are never returned, and never accepted from the client.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query
@@ -39,6 +39,8 @@ from suliko.domain.plans import (
     overridable_for_plan,
     permissions_for_plan,
 )
+from suliko.domain.portal import account_matches, normalize_email, normalize_phone, registration_url
+from suliko.models.portal import InviteKind, InviteStatus, PortalAccountInvite, PortalTranslator
 from suliko.models.user import Role, User, UserPermissionOverride
 from suliko.security.passwords import (
     generate_one_time_password,
@@ -108,6 +110,21 @@ class UserInvite(BaseModel):
     permissions: list[str] | None = None
 
 
+class SulikoAccountOut(BaseModel):
+    """Whether this invite's email or phone matched a suliko.ge account.
+
+    'linked' means exactly one account matched at invite time; 'pending'
+    means none did (or more than one), and stays that way until
+    `domain.portal.resolve_pending_invites` finds a match — see that
+    function's docstring for the two moments that can happen. A CRM login is
+    not the suliko.ge portal, so 'linked' here is a record of identity, not a
+    functional connection the way it is for a translator invite.
+    """
+
+    status: Literal["linked", "pending"]
+    matched_display_name: str | None
+
+
 class InviteOut(BaseModel):
     user: UserOut
     #: Shown to the inviter ONCE.
@@ -120,6 +137,7 @@ class InviteOut(BaseModel):
     #: Whether the email actually left. False is not an error: the account
     #: exists either way, and the password above is the fallback.
     email_sent: bool
+    suliko_account: SulikoAccountOut
 
 
 class PasswordReset(BaseModel):
@@ -146,6 +164,10 @@ class UserOut(BaseModel):
     permissions: list[str]
     last_login_at: datetime | None
     created_at: datetime
+    #: Null for anyone created through `POST /users` — nobody ever asked
+    #: suliko.ge about them. Everyone invited through `POST /users/invite` has
+    #: one, `linked` or `pending`.
+    suliko_account: SulikoAccountOut | None
 
 
 class UserPage(BaseModel):
@@ -153,7 +175,12 @@ class UserPage(BaseModel):
     meta: PageMeta
 
 
-def _out(row: User, plan: TenantPlan, overrides: Mapping[str, bool]) -> UserOut:
+def _out(
+    row: User,
+    plan: TenantPlan,
+    overrides: Mapping[str, bool],
+    suliko_account: SulikoAccountOut | None = None,
+) -> UserOut:
     return UserOut(
         id=row.id,
         username=row.username,
@@ -167,6 +194,7 @@ def _out(row: User, plan: TenantPlan, overrides: Mapping[str, bool]) -> UserOut:
         permissions=sorted(p.value for p in effective_permissions(row.role, plan, overrides)),
         last_login_at=row.last_login_at,
         created_at=row.created_at,
+        suliko_account=suliko_account,
     )
 
 
@@ -195,6 +223,41 @@ async def _overrides_for(db: Db, user_ids: Sequence[int]) -> dict[int, dict[str,
     for row in rows:
         out.setdefault(row.user_id, {})[row.permission] = row.granted
     return out
+
+
+async def _invite_status_for(db: Db, user_ids: Sequence[int]) -> dict[int, SulikoAccountOut]:
+    """The suliko.ge match recorded against each user's invite, keyed by user.
+
+    Same shape as `_overrides_for` and for the same reason. Only users invited
+    through `POST /users/invite` have a row here — `POST /users` never asks
+    suliko.ge anything, so a user created that way is simply absent from the
+    result, and the caller treats a miss as `None`.
+    """
+    if not user_ids:
+        return {}
+
+    rows = (
+        await db.execute(
+            select(PortalAccountInvite, PortalTranslator.display_name)
+            .outerjoin(
+                PortalTranslator,
+                PortalTranslator.id == PortalAccountInvite.portal_translator_id,
+            )
+            .where(
+                PortalAccountInvite.kind == InviteKind.STAFF,
+                PortalAccountInvite.user_id.in_(list(user_ids)),
+            )
+        )
+    ).all()
+
+    return {
+        invite.user_id: SulikoAccountOut(
+            status="linked" if invite.status is InviteStatus.LINKED else "pending",
+            matched_display_name=matched_display_name,
+        )
+        for invite, matched_display_name in rows
+        if invite.user_id is not None
+    }
 
 
 def _requested_permissions(names: Sequence[str], plan: TenantPlan) -> set[Permission]:
@@ -334,8 +397,9 @@ async def list_users(
 
     rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
     overrides = await _overrides_for(db, [r.id for r in rows])
+    invites = await _invite_status_for(db, [r.id for r in rows])
     return UserPage(
-        items=[_out(r, session.plan, overrides.get(r.id, {})) for r in rows],
+        items=[_out(r, session.plan, overrides.get(r.id, {}), invites.get(r.id)) for r in rows],
         meta=PageMeta(total=total, limit=limit, offset=offset),
     )
 
@@ -350,7 +414,27 @@ async def get_user(
     row = await db.get(User, user_id)
     if row is None:
         raise NotFoundError("User not found.")
-    return _out(row, session.plan, (await _overrides_for(db, [row.id])).get(row.id, {}))
+    overrides = (await _overrides_for(db, [row.id])).get(row.id, {})
+    suliko_account = (await _invite_status_for(db, [row.id])).get(row.id)
+    return _out(row, session.plan, overrides, suliko_account)
+
+
+def _suliko_account_paragraph(*, linked: bool, matched_display_name: str | None) -> str:
+    """The one paragraph `_invite_email` gains for this feature.
+
+    Placed right after the sign-in credentials: how to get into THIS account,
+    then what suliko.ge account this address is also expected to have.
+    """
+    if linked:
+        matched = f" ({matched_display_name})" if matched_display_name else ""
+        return (
+            f"This address is already registered on suliko.ge{matched}, "
+            "so nothing more to do there.\n"
+        )
+    return (
+        "This invitation also expects a suliko.ge account under this exact "
+        f"email address. If you don't have one yet, register here: {registration_url()}\n"
+    )
 
 
 def _invite_email(
@@ -360,8 +444,14 @@ def _invite_email(
     one_time_password: str,
     inviter: str,
     login_url: str,
+    *,
+    suliko_account: SulikoAccountOut,
 ) -> tuple[str, str]:
     """Subject and plain-text body. Everything they need in one message."""
+    account_paragraph = _suliko_account_paragraph(
+        linked=suliko_account.status == "linked",
+        matched_display_name=suliko_account.matched_display_name,
+    )
     body = (
         f"Hello {user.full_name},\n\n"
         f"{inviter} has added you to {tenant_name} on Suliko.\n\n"
@@ -372,6 +462,7 @@ def _invite_email(
         "You will be asked to choose your own password the first time you "
         "sign in. Until you do, this one is the only way into the account — "
         "and the person who invited you knows it, so do not keep it.\n\n"
+        f"{account_paragraph}\n"
         f"If you were not expecting this, tell {tenant_name} and ignore the "
         "message; the account cannot be used without the password above.\n"
     )
@@ -421,12 +512,13 @@ async def invite_user(
 
     one_time_password = generate_one_time_password()
 
+    phone = (payload.phone or "").strip() or None
     row = User(
         username=username,
         email=email,
         full_name=payload.full_name.strip(),
         position=(payload.position or "").strip() or None,
-        phone=(payload.phone or "").strip() or None,
+        phone=phone,
         password_hash=hash_password(one_time_password),
         role=payload.role,
         is_active=True,
@@ -436,6 +528,40 @@ async def invite_user(
     await db.flush()
 
     await _write_overrides(db, row, requested, plan=session.plan)
+
+    # Whether this address (or phone) belongs to a suliko.ge account — see
+    # `domain.portal.account_matches`. A CRM login is not the suliko.ge
+    # portal, so a match is recorded, not acted on: no directory row, no
+    # `PortalTranslatorLink`. `db` doubles as the platform session here for
+    # the same reason `api/v1/translators.py` documents at its invite route.
+    matches = await account_matches(db, phone=phone, email=email)
+    matched_display_name: str | None = None
+    invite = PortalAccountInvite(
+        tenant_id=session.tenant_id,
+        kind=InviteKind.STAFF,
+        user_id=row.id,
+        full_name=row.full_name,
+        email=email,
+        phone=phone,
+        normalized_email=normalize_email(email),
+        normalized_phone=normalize_phone(phone),
+        invited_by_user_id=session.user_id,
+    )
+    if len(matches) == 1:
+        account, _reason = matches[0]
+        matched_display_name = account.display_name
+        invite.portal_translator_id = account.id
+        invite.status = InviteStatus.LINKED
+        invite.resolved_at = datetime.now(UTC)
+    else:
+        invite.status = InviteStatus.PENDING
+    db.add(invite)
+    await db.flush()
+
+    suliko_account = SulikoAccountOut(
+        status="linked" if invite.status is InviteStatus.LINKED else "pending",
+        matched_display_name=matched_display_name,
+    )
 
     from suliko.core.audit import record
 
@@ -452,6 +578,7 @@ async def invite_user(
             "role": payload.role.value,
             "position": row.position,
             "permissions": sorted(p.value for p in requested),
+            "suliko_account_status": suliko_account.status,
         },
     )
 
@@ -463,14 +590,16 @@ async def invite_user(
         one_time_password,
         session.full_name,
         login_url,
+        suliko_account=suliko_account,
     )
     result = await mail.send(email, subject, body)
 
     overrides = (await _overrides_for(db, [row.id])).get(row.id, {})
     return InviteOut(
-        user=_out(row, session.plan, overrides),
+        user=_out(row, session.plan, overrides, suliko_account),
         one_time_password=one_time_password,
         email_sent=result.delivered,
+        suliko_account=suliko_account,
     )
 
 
@@ -593,7 +722,9 @@ async def update_user(
         before=before,
         after={**changes, **({"permissions": sorted(permissions)} if permissions else {})},
     )
-    return _out(row, session.plan, (await _overrides_for(db, [row.id])).get(row.id, {}))
+    overrides = (await _overrides_for(db, [row.id])).get(row.id, {})
+    suliko_account = (await _invite_status_for(db, [row.id])).get(row.id)
+    return _out(row, session.plan, overrides, suliko_account)
 
 
 @router.post("/{user_id}/password", status_code=http_status.HTTP_204_NO_CONTENT)

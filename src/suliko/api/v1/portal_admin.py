@@ -33,7 +33,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from suliko.api.portal_deps import Drive, PlatformDb, PortalAdmin, PortalIdentity, TenantSessions
 from suliko.core.errors import (
-    ConflictError,
     NotFoundError,
     UpstreamUnavailableError,
     ValidationError,
@@ -49,6 +48,8 @@ from suliko.domain.portal import (
     directory_matches,
     find_portal_translator,
     find_tenant_by_slug,
+    link_account_to_directory_row,
+    resolve_pending_invites,
     search_directory,
 )
 from suliko.models.audit import ActorType
@@ -420,6 +421,14 @@ async def upsert_translator(
         before=before,
         after=values,
     )
+
+    # Every bureau that invited this address before the account existed (or
+    # before it was marked a translator) is served the moment that changes —
+    # see `resolve_pending_invites`. Not for a deactivated account: nothing
+    # should auto-link into a translator the admin just turned off.
+    if row.is_active:
+        await resolve_pending_invites(db, tenants, row, actor_type=ActorType.PORTAL_ADMIN)
+
     return (await _translators_out(db, tenants, [row]))[0]
 
 
@@ -506,73 +515,26 @@ async def link_organization(
     translator = await _portal_translator(db, external_user_id)
     tenant = await _tenant(db, slug)
 
-    if payload.translator_id is not None:
-        taken = (
-            await db.execute(
-                select(PortalTranslatorLink).where(
-                    PortalTranslatorLink.tenant_id == tenant.id,
-                    PortalTranslatorLink.translator_id == payload.translator_id,
-                )
-            )
-        ).scalar_one_or_none()
-        if taken is not None and taken.portal_translator_id != translator.id:
-            raise ConflictError(
-                "That directory entry is already linked to another suliko.ge account."
-            )
-
-    created = False
-    async with tenants(tenant.id) as tenant_db:
-        if payload.translator_id is not None:
-            directory_row = await tenant_db.get(Translator, payload.translator_id)
-            if directory_row is None:
-                # Another bureau's row is indistinguishable from a missing one.
-                raise NotFoundError("That translator is not in this organisation's directory.")
-        else:
-            directory_row = Translator(
-                name=translator.display_name,
-                phone=translator.phone,
-                email=translator.email,
-                is_active=True,
-                comment="Added from the suliko.ge admin panel for a translator portal account.",
-            )
-            tenant_db.add(directory_row)
-            await tenant_db.flush()
-            created = True
-        directory_row_id = directory_row.id
-
-    link = (
-        await db.execute(
-            select(PortalTranslatorLink).where(
-                PortalTranslatorLink.portal_translator_id == translator.id,
-                PortalTranslatorLink.tenant_id == tenant.id,
-            )
-        )
-    ).scalar_one_or_none()
-    previous = link.translator_id if link else None
-    if link is None:
-        db.add(
-            PortalTranslatorLink(
-                portal_translator_id=translator.id,
-                tenant_id=tenant.id,
-                translator_id=directory_row_id,
-            )
-        )
-    else:
-        link.translator_id = directory_row_id
-    await db.flush()
+    result = await link_account_to_directory_row(
+        db, tenants, account=translator, tenant=tenant, translator_id=payload.translator_id
+    )
 
     await _audit(
         db,
         identity,
         action="portal.translator_linked",
         entity_type="translator",
-        entity_id=directory_row_id,
+        entity_id=result.translator_id,
         tenant_id=tenant.id,
-        before={"translator_id": previous} if previous is not None else None,
+        before=(
+            {"translator_id": result.previous_translator_id}
+            if result.previous_translator_id is not None
+            else None
+        ),
         after={
             "portal_translator": translator.external_user_id,
-            "translator_id": directory_row_id,
-            "created_directory_entry": created,
+            "translator_id": result.translator_id,
+            "created_directory_entry": result.created_directory_entry,
         },
     )
     return (await _translators_out(db, tenants, [translator]))[0]

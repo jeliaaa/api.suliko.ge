@@ -45,9 +45,12 @@ from suliko.models.order import (
 )
 from suliko.models.portal import (
     FileKind,
+    InviteKind,
+    InviteStatus,
     PersonalOrder,
     PersonalOrderFile,
     PersonalOrderLanguagePair,
+    PortalAccountInvite,
     PortalTranslator,
     PortalTranslatorLink,
 )
@@ -90,6 +93,8 @@ __all__ = [
     "HandoverMethod",
     "IntegrationCredential",
     "IntegrationProvider",
+    "InviteKind",
+    "InviteStatus",
     "Language",
     "LanguagePairPrice",
     "LoginAttempt",
@@ -114,6 +119,7 @@ __all__ = [
     "PersonalOrder",
     "PersonalOrderFile",
     "PersonalOrderLanguagePair",
+    "PortalAccountInvite",
     "PortalTranslator",
     "PortalTranslatorLink",
     "Role",

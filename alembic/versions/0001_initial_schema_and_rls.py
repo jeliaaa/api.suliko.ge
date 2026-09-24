@@ -93,6 +93,8 @@ LATER_REVISION_TABLES = frozenset(
         "order_document_drive_folders",
         # 0006
         "user_permission_overrides",
+        # 0007
+        "portal_account_invites",
     }
 )
 

@@ -29,6 +29,7 @@ LATER_REVISIONS = (
     # single-head and exclusion-list checks still see it.
     "0005_tenant_plans.py",
     "0006_user_invites_and_permission_overrides.py",
+    "0007_portal_account_invites.py",
 )
 
 

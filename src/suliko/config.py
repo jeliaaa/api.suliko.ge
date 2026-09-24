@@ -193,6 +193,12 @@ class Settings(BaseSettings):
     #: classic host-header poisoning bug, and the reason this is configuration.
     app_url: str = "http://localhost:3000"
 
+    #: suliko.ge's own base URL — a DIFFERENT site from `app_url` (this
+    #: bureau's CRM). An invite that matches no suliko.ge account links here so
+    #: the invitee can register; see `PortalAccountInvite` and
+    #: `domain/portal.py`'s registration-link helpers.
+    suliko_site_url: str = "https://suliko.ge"
+
     # ── CORS ────────────────────────────────────────────────────────────────
     # The Next.js BFF calls this API server-side. The one exception is portal
     # file transfer, where a browser holding a signed ticket uploads or
