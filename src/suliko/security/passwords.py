@@ -7,6 +7,7 @@ password, at which point the hash is transparently upgraded.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import secrets
@@ -93,6 +94,31 @@ def waste_time_verifying() -> None:
     """
     with suppress(VerifyMismatchError, VerificationError, InvalidHashError):
         _hasher.verify(_DUMMY_HASH, "definitely-not-the-password")
+
+
+# ── Async wrappers ────────────────────────────────────────────────────────────
+#
+# One Argon2id computation is ~64 MiB and tens of milliseconds of pure CPU. Run
+# inline in an async handler it blocks the event loop for that long, so with a
+# single worker a burst of sign-ins stalls every other request. The request
+# handlers call these; the synchronous versions above stay for the CLI and
+# tests, where there is no loop to block.
+
+
+async def hash_password_async(password: str) -> str:
+    return await asyncio.to_thread(hash_password, password)
+
+
+async def verify_and_maybe_rehash_async(password: str, hashed: str) -> tuple[bool, str | None]:
+    return await asyncio.to_thread(verify_and_maybe_rehash, password, hashed)
+
+
+async def verify_password_async(password: str, hashed: str) -> bool:
+    return await asyncio.to_thread(verify_password, password, hashed)
+
+
+async def waste_time_verifying_async() -> None:
+    await asyncio.to_thread(waste_time_verifying)
 
 
 # ── Opaque tokens (sessions, reset tokens, API keys) ─────────────────────────

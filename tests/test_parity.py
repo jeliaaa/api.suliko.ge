@@ -83,6 +83,19 @@ def test_status_labels_and_tones_match() -> None:
 
 
 @requires_frontend
+@pytest.mark.parametrize("name", ["EXCLUDED_FROM_AGGREGATES", "CLOSED_STATUSES"])
+def test_status_sets_match(name: str) -> None:
+    """Which statuses count as money and which as open. A mismatch shows one
+    number on the dashboard board and another in the figures above it."""
+    import suliko.domain.statuses as statuses
+
+    source = STATUSES_TS.read_text(encoding="utf-8")
+    match = re.search(rf"export const {name}: readonly string\[\] = \[(?P<body>[^\]]*)\]", source)
+    assert match, f"{name} not found in statuses.ts"
+    assert set(re.findall(r'"([^"]+)"', match["body"])) == set(getattr(statuses, name))
+
+
+@requires_frontend
 def test_permission_strings_match() -> None:
     ts = _parse_ts_permissions(PERMISSIONS_TS.read_text(encoding="utf-8"))
     py = {p.value for p in Permission}

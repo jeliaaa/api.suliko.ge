@@ -143,6 +143,21 @@ class RateLimiter:
     async def record_signup(self, ip_key: str) -> None:
         await self._hit_count(ip_key, get_settings().signup_window_seconds)
 
+    # ── Invitations ─────────────────────────────────────────────────────────
+
+    async def check_invite(self, tenant_key: str) -> int | None:
+        """Seconds to wait, or None. Keyed on the TENANT: the abuse this
+        bounds is one bureau sending mail through us, however many of its
+        users click the button."""
+        settings = get_settings()
+        window = settings.invite_window_seconds
+        if await self._current(tenant_key, window) >= settings.invite_max_per_tenant:
+            return window
+        return None
+
+    async def record_invite(self, tenant_key: str) -> None:
+        await self._hit_count(tenant_key, get_settings().invite_window_seconds)
+
     # ── Generic writes ──────────────────────────────────────────────────────
 
     async def check_write(self, key: str) -> int | None:

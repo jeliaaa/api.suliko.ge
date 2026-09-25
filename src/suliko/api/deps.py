@@ -17,6 +17,8 @@ reason: it cannot depend on ``get_db`` without creating that ordering problem.
 
 from __future__ import annotations
 
+import hmac
+import ipaddress
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Annotated
@@ -33,25 +35,82 @@ from suliko.core.errors import (
     PermissionDeniedError,
     StepUpRequiredError,
 )
+from suliko.core.gateway import HEADER_NAME as GATEWAY_HEADER
 from suliko.db.session import get_sessionmaker, session_scope
 from suliko.db.tenancy import reset_current_tenant_id, set_current_tenant_id
 from suliko.domain.plans import Feature, allows_feature
 from suliko.security.permissions import Permission, requires_step_up
 from suliko.security.sessions import AuthenticatedSession, resolve_session
 
+#: Set by the BFF to the BROWSER's address and user agent. Without them every
+#: request looks like it came from the BFF's own server — so the per-IP login
+#: and sign-up limits were shared by every user of every bureau at once: 20
+#: failed logins anywhere locked everybody out, and the whole platform could
+#: take 3 sign-ups an hour.
+CLIENT_IP_HEADER = "x-suliko-client-ip"
+CLIENT_UA_HEADER = "x-suliko-client-ua"
+
+
+def _parse_ip(value: str | None) -> str | None:
+    """A normalised IP, or None.
+
+    The value lands in PostgreSQL `INET` columns, where anything that is not
+    an address is a 500 on login. IIS ARR appends the port (``1.2.3.4:5678``)
+    and bracketed IPv6 carries one too (``[::1]:443``).
+    """
+    if not value:
+        return None
+    candidate = value.strip()
+    if candidate.startswith("["):
+        candidate = candidate[1:].split("]", 1)[0]
+    elif candidate.count(":") == 1:
+        candidate = candidate.split(":", 1)[0]
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return None
+
+
+def _from_our_bff(request: Request) -> bool:
+    """Whether the BFF-only headers can be believed on this request.
+
+    With a gateway secret configured, only a request that presented it; with
+    none, the API is loopback-only by configuration and every caller is ours.
+    """
+    expected = get_settings().bff_shared_secret.get_secret_value()
+    if not expected:
+        return True
+    return hmac.compare_digest(request.headers.get(GATEWAY_HEADER, ""), expected)
+
 
 def get_client_ip(request: Request) -> str | None:
     """The caller's IP.
 
-    Only the BFF talks to this API, so ``X-Forwarded-For`` is set by our own
-    proxy and can be trusted — but only the FIRST hop, and only because the
-    deployment terminates TLS in front of us. If this API is ever exposed
-    directly, this must stop trusting the header.
+    The BFF's own header first — it is the only place the browser's address
+    survives the hop through the BFF — and only when the request proved it
+    came from the BFF. Then the first ``X-Forwarded-For`` hop, set by the
+    reverse proxy in front of us (the path portal-ticket requests from
+    browsers take). Anything unparseable is dropped rather than stored.
     """
+    if _from_our_bff(request):
+        from_bff = _parse_ip(request.headers.get(CLIENT_IP_HEADER))
+        if from_bff:
+            return from_bff
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else None
+        first = _parse_ip(forwarded.split(",")[0])
+        if first:
+            return first
+    return _parse_ip(request.client.host) if request.client else None
+
+
+def get_client_user_agent(request: Request) -> str | None:
+    """The browser's user agent, for the session and login-attempt records."""
+    if _from_our_bff(request):
+        forwarded = request.headers.get(CLIENT_UA_HEADER)
+        if forwarded:
+            return forwarded[:255]
+    return request.headers.get("user-agent")
 
 
 def get_bearer_token(request: Request) -> str | None:
@@ -162,7 +221,15 @@ async def get_authenticated_session(
 
 
 CurrentSession = Annotated[AuthenticatedSession, Depends(get_authenticated_session)]
-Db = Annotated[AsyncSession, Depends(get_db)]
+
+#: `scope="function"` is load-bearing. `get_db` commits when it exits, and a
+#: yield dependency's default ("request") scope exits only AFTER the response
+#: has been sent (FastAPI >= 0.118). With that default, a write the database
+#: refuses at COMMIT — a RESTRICT foreign key on delete, a unique index — has
+#: already been answered 2xx, then silently rolls back; and a create followed
+#: by an immediate read can race the commit and 404. Function scope commits
+#: before the response exists, so the answer reflects what was stored.
+Db = Annotated[AsyncSession, Depends(get_db, scope="function")]
 
 
 def require_feature(feature: Feature) -> Callable[..., Awaitable[AuthenticatedSession]]:

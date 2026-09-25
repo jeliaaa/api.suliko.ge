@@ -24,6 +24,11 @@ from sqlalchemy.dialects.postgresql import asyncpg
 
 from suliko.api.v1 import reports
 
+#: A caller who may see profit. Only `has` and `timezone` are read.
+OWNER: Any = type(
+    "Caller", (), {"has": staticmethod(lambda _permission: True), "timezone": "Asia/Tbilisi"}
+)()
+
 
 class FakeResult:
     def __init__(self, rows: list[tuple[Any, ...]]) -> None:
@@ -70,7 +75,7 @@ class CompilingSession:
 async def test_the_dashboard_builds_valid_postgresql() -> None:
     db = CompilingSession()
 
-    summary = await reports.dashboard(db=db, _=None, today=dt.date(2026, 9, 15))  # type: ignore[arg-type]
+    summary = await reports.dashboard(db=db, session=OWNER, today=dt.date(2026, 9, 15))  # type: ignore[arg-type]
 
     # Four period totals, outstanding, the status board, open/overdue.
     assert len(db.compiled) == 7
@@ -89,7 +94,7 @@ async def test_the_month_comparison_is_like_for_like() -> None:
     would otherwise run past the end of the month.
     """
     db = CompilingSession()
-    summary = await reports.dashboard(db=db, _=None, today=dt.date(2026, 9, 15))  # type: ignore[arg-type]
+    summary = await reports.dashboard(db=db, session=OWNER, today=dt.date(2026, 9, 15))  # type: ignore[arg-type]
 
     assert summary.this_month.days_elapsed == 15
 
@@ -102,7 +107,7 @@ async def test_a_short_month_does_not_overrun_the_previous_one() -> None:
     """31 March compared with February: the partial window must stop at the
     28th rather than spilling into March."""
     db = CompilingSession()
-    summary = await reports.dashboard(db=db, _=None, today=dt.date(2026, 3, 31))  # type: ignore[arg-type]
+    summary = await reports.dashboard(db=db, session=OWNER, today=dt.date(2026, 3, 31))  # type: ignore[arg-type]
 
     assert summary.this_month.days_elapsed == 31
     # Compiles without error is the point; the clamp is arithmetic in the
@@ -133,7 +138,8 @@ def test_cancelled_orders_are_excluded_from_every_total() -> None:
             dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
         )
     )
-    assert "NOT IN ('cancelled')" in sql
+    # Rejected too, since 2026-09-24 — no more revenue than a cancelled job.
+    assert "NOT IN ('cancelled', 'rejected')" in sql
 
 
 # ── GROUP BY and its bind parameters ────────────────────────────────────────
@@ -187,7 +193,7 @@ async def test_a_grouped_expression_reuses_the_bind_parameter_it_selects() -> No
     production and the one that numbers parameters.
     """
     db = CompilingSession(dialect=asyncpg.dialect())
-    await reports.dashboard(db=db, _=None, today=dt.date(2026, 9, 15))  # type: ignore[arg-type]
+    await reports.dashboard(db=db, session=OWNER, today=dt.date(2026, 9, 15))  # type: ignore[arg-type]
 
     checked = 0
     for sql in db.compiled:
@@ -204,3 +210,66 @@ async def test_a_grouped_expression_reuses_the_bind_parameter_it_selects() -> No
                 )
 
     assert checked, "the status board groups by an expression; if that changed, so should this"
+
+
+# ── Review 2026-09: one window, and delivery is not profit ──────────────────
+
+
+class WindowSession:
+    """Records every statement `summary` runs, literal-bound; returns zeros."""
+
+    def __init__(self) -> None:
+        self.sql: list[str] = []
+
+    async def execute(self, stmt: Any) -> FakeResult:
+        self.sql.append(
+            str(stmt.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+        )
+        width = len(stmt.selected_columns)
+        result = FakeResult([tuple([0] * width)])
+        # Grouped queries (trend, client type) answer with no rows.
+        result.all = lambda: []  # type: ignore[method-assign]
+        return result
+
+
+async def test_every_summary_figure_uses_the_chosen_window() -> None:
+    """The first cut filtered only the headline totals; the cost breakdown and
+    client-type cards were all-time figures shown under the period's label."""
+    db = WindowSession()
+    await reports.summary(
+        db=db,  # type: ignore[arg-type]
+        _=None,
+        start=dt.date(2026, 7, 1),
+        end=dt.date(2026, 9, 30),
+        months=12,
+    )
+    assert len(db.sql) == 4
+    for sql in db.sql:
+        assert "orders.order_date >= '2026-07-01'" in sql, sql
+        assert "orders.order_date <= '2026-09-30'" in sql, sql
+
+
+def test_profit_does_not_include_the_courier_fee() -> None:
+    """Decided 2026-09-24, as the PHP: delivery is revenue passed through."""
+    sql = str(reports._per_order().compile(dialect=postgresql.dialect()))
+    profit = sql.split(" AS profit")[0].rsplit("AS revenue,", 1)[1]
+    assert "delivery_cost" not in profit
+    revenue = sql.split(" AS revenue")[0]
+    assert "orders.delivery_cost" in revenue.rsplit("SELECT", 1)[1]
+
+
+def test_the_cost_breakdown_has_no_delivery_line() -> None:
+    assert "delivery" not in reports.CostBreakdown.model_fields
+    assert "delivery_collected" in reports.ReportSummary.model_fields
+
+
+async def test_a_caller_without_reports_profit_gets_no_profit_or_margin() -> None:
+    staff: Any = type(
+        "Caller", (), {"has": staticmethod(lambda _p: False), "timezone": "Asia/Tbilisi"}
+    )()
+    db = CompilingSession()
+    summary = await reports.dashboard(db=db, session=staff, today=dt.date(2026, 9, 15))  # type: ignore[arg-type]
+    assert summary.all_time.profit is None
+    assert summary.all_time.margin is None
+    assert summary.this_month.profit_change is None
+    assert summary.all_time.revenue == Decimal("1000.00")

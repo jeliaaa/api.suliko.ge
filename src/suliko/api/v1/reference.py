@@ -14,6 +14,7 @@ not per page view.
 
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
 from typing import Annotated
 
@@ -22,9 +23,12 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from suliko.api.deps import Db, require
+from suliko.domain.clock import today_in
+from suliko.domain.pricing_context import due_days_from_settings
 from suliko.models.order import CopyType, HandoverMethod, Urgency
 from suliko.models.reference import DocumentType, Language, LanguagePairPrice, TenantSettings
 from suliko.security.permissions import Permission
+from suliko.security.sessions import AuthenticatedSession
 
 router = APIRouter(prefix="/reference", tags=["reference"])
 
@@ -58,6 +62,8 @@ class EnumOption(BaseModel):
     extra_cost: Decimal | None = None
     notarized: bool | None = None
     requires_address: bool | None = None
+    #: Urgency only: days from the order date to the default due date.
+    days: int | None = None
 
 
 class ReferenceData(BaseModel):
@@ -68,12 +74,15 @@ class ReferenceData(BaseModel):
     urgency_levels: list[EnumOption]
     handover_methods: list[EnumOption]
     copy_types: list[EnumOption]
+    #: The bureau's calendar date now, for date defaults on forms. The
+    #: browser's own clock is in whatever zone the laptop is set to.
+    today: date | None = None
 
 
 @router.get("", response_model=ReferenceData)
 async def get_reference(
     db: Db,
-    _: Annotated[object, Depends(require(Permission.ORDERS_READ))],
+    session: Annotated[AuthenticatedSession, Depends(require(Permission.ORDERS_READ))],
 ) -> ReferenceData:
     languages = [
         LanguageOut(code=row.code, name_en=row.name_en, name_ka=row.name_ka)
@@ -116,23 +125,32 @@ async def get_reference(
     express = Decimal(str(settings.urgency_multiplier_express)) if settings else Decimal("1.5")
     urgent = Decimal(str(settings.urgency_multiplier_urgent)) if settings else Decimal("2.0")
     delivery_fee = Decimal(str(settings.delivery_fee)) if settings else Decimal("10")
+    due_days = due_days_from_settings(settings)
 
     return ReferenceData(
         languages=languages,
         document_types=document_types,
         language_pairs=language_pairs,
+        today=today_in(session.timezone),
         urgency_levels=[
             EnumOption(
                 value=Urgency.STANDARD.value,
                 label="Standard (3-5 business days)",
                 multiplier=standard,
+                days=due_days[Urgency.STANDARD],
             ),
             EnumOption(
                 value=Urgency.EXPRESS.value,
                 label="Express (1-2 business days)",
                 multiplier=express,
+                days=due_days[Urgency.EXPRESS],
             ),
-            EnumOption(value=Urgency.URGENT.value, label="Urgent (same day)", multiplier=urgent),
+            EnumOption(
+                value=Urgency.URGENT.value,
+                label="Urgent (same day)",
+                multiplier=urgent,
+                days=due_days[Urgency.URGENT],
+            ),
         ],
         handover_methods=[
             EnumOption(

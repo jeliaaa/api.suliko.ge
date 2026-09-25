@@ -76,7 +76,7 @@ from suliko.models.tenant import Tenant, TenantStatus
 from suliko.models.user import Role, User
 from suliko.security.passwords import (
     generate_one_time_password,
-    hash_password,
+    hash_password_async,
 )
 from suliko.security.permissions import Permission
 from suliko.security.sessions import AuthenticatedSession, revoke_all_for_user
@@ -543,7 +543,7 @@ async def create_tenant_user(
             email=email,
             full_name=payload.full_name.strip(),
             position=(payload.position or "").strip() or None,
-            password_hash=hash_password(one_time_password),
+            password_hash=await hash_password_async(one_time_password),
             role=payload.role,
             is_active=True,
             must_change_password=True,
@@ -638,9 +638,12 @@ async def delete_tenant_user(
 async def platform_stats(db: Db, _: Superuser) -> PlatformTotals:
     """Everything, summed. The Reports tab one level up."""
     with bypass_tenant_scope():
-        by_status = dict(
-            (await db.execute(select(Tenant.status, func.count()).group_by(Tenant.status))).all()
-        )
+        by_status: dict[TenantStatus, int] = {
+            status: int(count)
+            for status, count in (
+                await db.execute(select(Tenant.status, func.count()).group_by(Tenant.status))
+            ).all()
+        }
 
         # Grouped by the STORED value, then folded onto the enforced one —
         # a tenant mid-onboarding has null stored and counts as the default.
@@ -656,7 +659,7 @@ async def platform_stats(db: Db, _: Superuser) -> PlatformTotals:
         revenue = (await db.scalar(select(func.coalesce(func.sum(OrderDocument.price), 0)))) or 0
 
     return PlatformTotals(
-        tenants=sum(int(v) for v in by_status.values()),
+        tenants=sum(by_status.values()),
         active_tenants=int(by_status.get(TenantStatus.ACTIVE, 0))
         + int(by_status.get(TenantStatus.TRIAL, 0)),
         suspended_tenants=int(by_status.get(TenantStatus.SUSPENDED, 0)),

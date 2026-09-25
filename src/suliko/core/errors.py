@@ -21,7 +21,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from suliko.config import get_settings
@@ -187,6 +187,74 @@ def _missing_schema_object(exc: SQLAlchemyError) -> str | None:
     return f'{kind} "{match.group(1)}"' if match else f"a {kind} it expects"
 
 
+#: SQLSTATE -> (status, error code, what to tell the caller). PostgreSQL's
+#: class 23 ("integrity constraint violation").
+_INTEGRITY_SQLSTATES: dict[str, tuple[int, str, str]] = {
+    "23505": (
+        status.HTTP_409_CONFLICT,
+        "conflict",
+        "A record with the same details already exists.",
+    ),
+    "23503": (
+        status.HTTP_409_CONFLICT,
+        "in_use",
+        "This is still used by other records (orders, payments or documents), "
+        "so it cannot be removed or changed that way.",
+    ),
+    "23514": (
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        "validation_failed",
+        "A value is outside the range this field allows.",
+    ),
+    "23502": (
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        "validation_failed",
+        "A required value is missing.",
+    ),
+}
+
+#: SQLite (the test database) has no SQLSTATE; its messages are stable enough
+#: to classify on, and doing so keeps the tests exercising the same mapping.
+_SQLITE_INTEGRITY = (
+    ("UNIQUE constraint failed", "23505"),
+    ("FOREIGN KEY constraint failed", "23503"),
+    ("CHECK constraint failed", "23514"),
+    ("NOT NULL constraint failed", "23502"),
+)
+
+
+def _describe_integrity_error(exc: IntegrityError) -> tuple[int, str, str]:
+    orig = getattr(exc, "orig", None)
+    sqlstate = str(getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None) or "")
+    if not sqlstate:
+        message = str(orig)
+        sqlstate = next((code for text, code in _SQLITE_INTEGRITY if text in message), "")
+    return _INTEGRITY_SQLSTATES.get(
+        sqlstate,
+        (
+            status.HTTP_409_CONFLICT,
+            "conflict",
+            "This change conflicts with data already stored.",
+        ),
+    )
+
+
+def _validation_summary(errors: list[dict[str, Any]]) -> str:
+    """One readable sentence for the top of a form.
+
+    "Request validation failed." told the person looking at the form nothing;
+    naming the first field and Pydantic's own message usually tells them
+    exactly what to fix. The full list stays in `errors` for field mapping.
+    """
+    if not errors:
+        return "Request validation failed."
+    first = errors[0]
+    loc = [str(part) for part in first.get("loc", ()) if part not in ("body", "query", "path")]
+    field = ".".join(loc)
+    message = str(first.get("msg", "is invalid"))
+    return f"{field}: {message}" if field else message
+
+
 def install_error_handlers(app: FastAPI) -> None:
     settings = get_settings()
 
@@ -218,22 +286,41 @@ def install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(RequestValidationError)
     async def _validation(request: Request, exc: RequestValidationError) -> JSONResponse:
-        # Pydantic's errors describe our own schema, not user secrets, so they
-        # are safe to return — they make integration far easier to debug.
+        # Pydantic's errors describe our own schema, so where and why is safe
+        # to return and makes integration far easier to debug. What is NOT
+        # returned is `input`: that is the value the caller sent, and for a
+        # too-short password or an integration secret, echoing it puts the
+        # secret into every log and proxy the response passes through.
         # jsonable_encoder because a custom validator's error carries the
         # raised exception object in `ctx`, which json.dumps cannot encode —
         # without it, any `raise ValueError` in a validator became a 500.
+        errors = [
+            {key: value for key, value in error.items() if key not in ("input", "url")}
+            for error in exc.errors()
+        ]
         return _problem(
             request,
             status.HTTP_422_UNPROCESSABLE_CONTENT,
             "validation_failed",
-            "Request validation failed.",
-            {"errors": jsonable_encoder(exc.errors())},
+            _validation_summary(errors),
+            {"errors": jsonable_encoder(errors)},
         )
 
     @app.exception_handler(StarletteHTTPException)
     async def _http(request: Request, exc: StarletteHTTPException) -> JSONResponse:
         return _problem(request, exc.status_code, "http_error", str(exc.detail))
+
+    @app.exception_handler(IntegrityError)
+    async def _integrity(request: Request, exc: IntegrityError) -> JSONResponse:
+        # A constraint said no. That is the caller's data meeting a rule, not
+        # a fault in the service: a second record with the same unique value,
+        # or a delete of something other records still point at. Answered as
+        # such rather than as "an internal error occurred", which sends the
+        # user to support for something they can fix themselves. The driver's
+        # message quotes values, so it is logged, never returned.
+        status_code, code, detail = _describe_integrity_error(exc)
+        log.info("integrity_error", path=request.url.path, code=code)
+        return _problem(request, status_code, code, detail)
 
     @app.exception_handler(SQLAlchemyError)
     async def _db(request: Request, exc: SQLAlchemyError) -> JSONResponse:

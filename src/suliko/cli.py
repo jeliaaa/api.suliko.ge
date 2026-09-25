@@ -33,7 +33,7 @@ from sqlalchemy import select, text
 
 from suliko.config import get_settings
 from suliko.core.crypto import encrypt_for_tenant
-from suliko.db.session import dispose_engine, get_engine, get_sessionmaker
+from suliko.db.session import bind_tenant_guc, dispose_engine, get_engine, get_sessionmaker
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
 from suliko.domain.reference_seed import seed_reference_data
 from suliko.models.directory import Client, ClientType  # noqa: F401 — registry
@@ -150,6 +150,12 @@ async def create_tenant(slug: str, display_name: str, locale: str = "ka") -> int
                 slug=slug,
                 display_name=display_name,
                 status=TenantStatus.ACTIVE,
+                # A console-created organisation is a bureau set up by the
+                # platform, not a self-signup mid-onboarding. With no plan it
+                # was enforced as a freelancer — which, among other things,
+                # withheld every platform permission from the superuser
+                # `bootstrap` creates inside it.
+                plan="bureau",
                 locale=locale,
             )
             db.add(tenant)
@@ -157,10 +163,18 @@ async def create_tenant(slug: str, display_name: str, locale: str = "ka") -> int
 
             # One settings row per tenant, carrying the pricing knobs.
             db.add(TenantSettings(tenant_id=tenant.id, default_language=locale))
-            await db.commit()
+            tenant_id = int(tenant.id)
 
-            ok(f"created tenant {slug!r} (id {tenant.id})")
-            return int(tenant.id)
+        # The same starter catalogues a self-signup gets — without them the
+        # first "New order" has no document type to choose. Outside the bypass
+        # block: under it new rows are not stamped with their tenant.
+        await bind_tenant_guc(db, tenant_id)
+        with tenant_scope(tenant_id):
+            await seed_reference_data(db)
+        await db.commit()
+
+        ok(f"created tenant {slug!r} (id {tenant_id}), with starter catalogues")
+        return tenant_id
 
 
 # ── Superuser ───────────────────────────────────────────────────────────────

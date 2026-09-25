@@ -5,7 +5,8 @@ description = "Suliko CRM backend — multi-tenant translation bureau management
 requires-python = ">=3.12"
 
 dependencies = [
-    "fastapi>=0.115",
+    # >=0.141: `Depends(..., scope="function")` — see `api.deps.Db`. Verified on 0.141.1.
+    "fastapi>=0.141",
     "uvicorn[standard]>=0.32",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
@@ -28,6 +29,10 @@ dependencies = [
     # Renders the TOTP enrolment URI as a scannable QR in the terminal, so a
     # superuser can be enrolled over SSH or RDP with no GUI.
     "qrcode>=8.0",
+    # IANA timezone data for `zoneinfo`. Linux ships it with the OS; Windows —
+    # where this API is deployed — does not, and without it every tenant's
+    # "today" falls back to failing. See domain/clock.py.
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]
@@ -96,7 +101,7 @@ exclude = ["alembic/versions/"]
 
 [[tool.mypy.overrides]]
 # Neither ships type stubs or a py.typed marker.
-module = ["pyotp.*", "asyncpg.*"]
+module = ["pyotp.*", "asyncpg.*", "qrcode.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

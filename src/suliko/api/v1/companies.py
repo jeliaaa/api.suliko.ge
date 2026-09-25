@@ -34,7 +34,7 @@ informally sent. It is not built yet, and the numbering below says so.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import date
 from decimal import Decimal
 from typing import Annotated, Literal
 
@@ -47,8 +47,9 @@ from sqlalchemy.orm import joinedload
 from suliko.api.deps import CurrentSession, Db, require
 from suliko.api.v1._shared import mask_tail
 from suliko.core.errors import ConflictError, NotFoundError
+from suliko.domain.clock import today_in
 from suliko.domain.orders import base_order_query
-from suliko.models.directory import Client
+from suliko.models.directory import Client, ClientType
 from suliko.models.order import Order, OrderDocument
 from suliko.models.reference import Company, CompanyBankAccount
 from suliko.security.permissions import Permission
@@ -495,7 +496,7 @@ def _party(company: Company | None, locale: str) -> InvoiceParty:
 async def order_invoice(
     order_id: int,
     db: Db,
-    _: Annotated[object, Depends(require(Permission.ORDERS_READ))],
+    session: Annotated[CurrentSession, Depends(require(Permission.ORDERS_READ))],
     locale: Literal["ka", "en"] = "ka",
 ) -> InvoiceOut:
     """Assemble an invoice for one order.
@@ -550,7 +551,10 @@ async def order_invoice(
             languages=f"{d.source_language.upper()} → {d.target_language.upper()}",
             pages=d.page_count,
             # Per page, derived for display only. The authority is `amount`.
-            unit_price=(d.price / d.page_count) if d.page_count else d.price,
+            # Rounded: 100 / 3 is not a price anyone can print.
+            unit_price=(d.price / d.page_count).quantize(Decimal("0.01"))
+            if d.page_count
+            else d.price,
             amount=d.price,
         )
         for d in docs
@@ -558,12 +562,36 @@ async def order_invoice(
 
     total = documents_total + order.delivery_cost
 
+    # The buyer's ID. A company's registration number is public and belongs on
+    # its invoice. A person's national ID is not: every client screen shows it
+    # masked, so printing it in full to anyone who can read orders made the
+    # invoice the way round that. It prints in full for the people who issue
+    # invoices (`finance.read`) — and that read is recorded.
+    client = order.client
+    raw_id = (client.personal_number or "") if client else ""
+    is_person = client is not None and client.client_type is ClientType.B2C
+    if is_person and raw_id and not session.has(Permission.FINANCE_READ):
+        buyer_id = mask_tail(raw_id) or ""
+    else:
+        buyer_id = raw_id
+        if is_person and raw_id:
+            from suliko.core.audit import record
+
+            await record(
+                db,
+                session,
+                action="client.personal_number_printed",
+                entity_type="client",
+                entity_id=order.client_id,
+                after={"order_id": order.id, "document": "invoice"},
+            )
+
     return InvoiceOut(
         # Provisional: derived from the order id, not allocated from a
         # sequence. See the module docstring before treating it as legal.
         number=f"{order.id}",
         is_provisional=True,
-        issued_on=datetime.now(UTC).date(),
+        issued_on=today_in(session.timezone),
         locale=locale,
         seller=_party(legal, locale),
         seller_brand=(
@@ -574,7 +602,7 @@ async def order_invoice(
         buyer=InvoiceParty(
             name=order.client.name if order.client else "",
             address=(order.client.address or "") if order.client else "",
-            id_number=(order.client.personal_number or "") if order.client else "",
+            id_number=buyer_id,
             email=(order.client.email or "") if order.client else "",
             phone=(order.client.phone or "") if order.client else "",
             site="",

@@ -186,14 +186,20 @@ def price_document(
             certification_cost = cert_per_page * page_count * VAT_RATE
             notary_cost += certification_cost
 
-    price = translation_cost + notary_cost
     translator_cost = translation_cost * cfg.translator_share
 
+    # The price is the sum of the ROUNDED parts, not the rounded sum of the
+    # raw ones. Otherwise 12.345 + 5.005 shows as 12.35 + 5.01 on the
+    # breakdown and 17.35 as the price — a tetri the client can see is missing.
+    # Same rule `quote_order` already applies one level up.
+    translation_rounded = money(translation_cost)
+    notary_rounded = money(notary_cost)
+
     return PriceBreakdown(
-        translation_cost=money(translation_cost),
-        notary_cost=money(notary_cost),
+        translation_cost=translation_rounded,
+        notary_cost=notary_rounded,
         certification_cost=money(certification_cost),
-        price=money(price),
+        price=translation_rounded + notary_rounded,
         translator_cost=money(translator_cost),
         base_rate_per_page=base_rate,
         document_type_multiplier=doc.document_type_multiplier,

@@ -2,7 +2,7 @@
 
 Port of the PHP's ``includes/statuses.php`` and the twin of
 ``app.suliko.ge/src/shared/lib/statuses.ts``. All three must agree;
-``tests/test_statuses.py`` checks this file against the TypeScript one.
+``tests/test_parity.py`` checks this file against the TypeScript one.
 
 The keys are the values actually stored in ``order_status_events.status`` —
 including the ``payed`` misspelling and the space-separated values. They are
@@ -65,14 +65,25 @@ STATUS_DEFINITIONS: MappingProxyType[str, StatusDefinition] = MappingProxyType(
     }
 )
 
-#: Excluded from every financial aggregate, mirroring the PHP's
-#: `!= 'cancelled'` guard on the dashboard, report and finance queries.
-EXCLUDED_FROM_AGGREGATES: frozenset[str] = frozenset({"cancelled"})
+#: Excluded from every financial aggregate. The PHP excluded only
+#: `cancelled`; a rejected order is no more revenue — and no more a debt the
+#: client owes — than a cancelled one, so both are out (decided 2026-09-24).
+EXCLUDED_FROM_AGGREGATES: frozenset[str] = frozenset({"cancelled", "rejected"})
 
 #: An order in any other status is still open.
-CLOSED_STATUSES: frozenset[str] = frozenset({"completed", "cancelled"})
+CLOSED_STATUSES: frozenset[str] = frozenset({"completed", "cancelled", "rejected"})
 
 INITIAL_STATUS = "new"
+
+
+def sql_values(statuses: frozenset[str]) -> tuple[str, ...]:
+    """A status set as a deterministic tuple, for ``NOT IN (...)``.
+
+    Iterating a frozenset of strings follows the per-process hash seed, so the
+    rendered SQL would differ from run to run — harmless to PostgreSQL, but it
+    defeats statement caching and makes the SQL-level tests flaky.
+    """
+    return tuple(sorted(statuses))
 
 
 def normalise(status: str | None) -> str:

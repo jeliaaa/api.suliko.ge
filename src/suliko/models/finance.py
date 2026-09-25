@@ -51,6 +51,11 @@ class ClientPayment(Base, IdMixin, TenantScoped, TimestampMixin):
         CheckConstraint("amount > 0", name="amount_positive"),
         Index("ix_client_payments_tenant_client", "tenant_id", "client_id"),
         Index("ix_client_payments_tenant_date", "tenant_id", "payment_date"),
+        # The duplicate-submit guard. Checking for the key and then inserting
+        # races two retries past each other; the index is what actually holds.
+        # NULLs are distinct in a unique index, so payments without a key are
+        # unaffected.
+        Index("uq_client_payments_idempotency", "tenant_id", "idempotency_key", unique=True),
     )
 
     client_id: Mapped[int] = mapped_column(
@@ -75,7 +80,7 @@ class ClientPayment(Base, IdMixin, TenantScoped, TimestampMixin):
     )
 
     # Deduplicates a double-submitted payment form or a retried request.
-    # Unique per tenant; see docs/03-SECURITY-AND-TENANCY.md §5.1 rule 9.
+    # Unique per tenant — enforced by `uq_client_payments_idempotency`.
     idempotency_key: Mapped[str | None] = mapped_column(String(64), default=None)
 
 
@@ -123,6 +128,11 @@ class TranslatorPayment(Base, IdMixin, TenantScoped, TimestampMixin):
         CheckConstraint("amount > 0", name="amount_positive"),
         Index("ix_translator_payments_tenant_translator", "tenant_id", "translator_id"),
         Index("ix_translator_payments_tenant_date", "tenant_id", "payment_date"),
+        # The duplicate-submit guard. Checking for the key and then inserting
+        # races two retries past each other; the index is what actually holds.
+        # NULLs are distinct in a unique index, so payments without a key are
+        # unaffected.
+        Index("uq_translator_payments_idempotency", "tenant_id", "idempotency_key", unique=True),
     )
 
     translator_id: Mapped[int] = mapped_column(
@@ -179,6 +189,11 @@ class NotaryPayment(Base, IdMixin, TenantScoped, TimestampMixin):
     __table_args__ = (
         CheckConstraint("amount > 0", name="amount_positive"),
         Index("ix_notary_payments_tenant_date", "tenant_id", "payment_date"),
+        # The duplicate-submit guard. Checking for the key and then inserting
+        # races two retries past each other; the index is what actually holds.
+        # NULLs are distinct in a unique index, so payments without a key are
+        # unaffected.
+        Index("uq_notary_payments_idempotency", "tenant_id", "idempotency_key", unique=True),
         Index("ix_notary_payments_tenant_via", "tenant_id", "paid_via_translator_payment_id"),
     )
 

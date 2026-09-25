@@ -89,6 +89,14 @@ class Settings(BaseSettings):
     signup_max_per_ip: int = 3
     signup_window_seconds: int = 3600  # 1 hour
 
+    #: Invitations (staff and translator) per TENANT per window. Each one
+    #: sends mail from the platform's own address with text the tenant wrote,
+    #: so an unthrottled invite form is a way to use us to spam or phish.
+    invite_max_per_tenant: int = 30
+    invite_window_seconds: int = 86400  # 1 day
+    #: How long an invitation's set-your-password link stays usable.
+    invite_link_ttl_hours: int = 168  # 7 days
+
     # ── Crypto ──────────────────────────────────────────────────────────────
     # Master key wrapping per-tenant data keys (envelope encryption).
     # Generate with:

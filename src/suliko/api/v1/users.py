@@ -19,8 +19,10 @@ Password hashes are never returned, and never accepted from the client.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
+from collections.abc import Set as AbstractSet
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Query
 from fastapi import status as http_status
@@ -31,7 +33,14 @@ from suliko.api.deps import CurrentSession, Db, require
 from suliko.api.v1._shared import PageMeta
 from suliko.config import get_settings
 from suliko.core import mail
-from suliko.core.errors import ConflictError, NotFoundError, ValidationError
+from suliko.core.errors import (
+    ConflictError,
+    NotFoundError,
+    PermissionDeniedError,
+    RateLimitedError,
+    ValidationError,
+)
+from suliko.core.ratelimit import RateLimiter, get_rate_limiter
 from suliko.domain.plans import (
     NON_OVERRIDABLE,
     TenantPlan,
@@ -42,9 +51,10 @@ from suliko.domain.plans import (
 from suliko.domain.portal import account_matches, normalize_email, normalize_phone, registration_url
 from suliko.models.portal import InviteKind, InviteStatus, PortalAccountInvite, PortalTranslator
 from suliko.models.user import Role, User, UserPermissionOverride
+from suliko.security import reset_tokens
 from suliko.security.passwords import (
-    generate_one_time_password,
-    hash_password,
+    generate_token,
+    hash_password_async,
     validate_password_strength,
 )
 from suliko.security.permissions import Permission, permissions_for_role
@@ -127,15 +137,17 @@ class SulikoAccountOut(BaseModel):
 
 class InviteOut(BaseModel):
     user: UserOut
-    #: Shown to the inviter ONCE.
+    #: The set-your-own-password link, shown to the inviter ONCE.
     #:
-    #: Returned deliberately, even though it also goes out by email: the
-    #: inviter can already set this person's password through
-    #: `POST /users/{id}/password`, so this grants them nothing new — and
-    #: without it, a bounced or delayed email means starting over.
-    one_time_password: str
+    #: Returned so a bounced or delayed email is not a dead end: the inviter
+    #: can pass the link on themselves. It grants them nothing new (they can
+    #: already set this person's password through `POST /users/{id}/password`)
+    #: and, unlike the one-time password it replaces, it works once and
+    #: expires — a password in an inbox stayed valid until someone changed it.
+    invite_link: str
+    invite_expires_at: datetime
     #: Whether the email actually left. False is not an error: the account
-    #: exists either way, and the password above is the fallback.
+    #: exists either way, and the link above is the fallback.
     email_sent: bool
     suliko_account: SulikoAccountOut
 
@@ -288,7 +300,7 @@ def _requested_permissions(names: Sequence[str], plan: TenantPlan) -> set[Permis
 async def _write_overrides(
     db: Db,
     user: User,
-    requested: set[Permission],
+    requested: AbstractSet[Permission],
     *,
     plan: TenantPlan,
 ) -> None:
@@ -336,7 +348,7 @@ async def _active_owner_count(db: Db) -> int:
     ) or 0
 
 
-def _guard_grantable(session: CurrentSession, requested: set[Permission]) -> None:
+def _guard_grantable(session: CurrentSession, requested: AbstractSet[Permission]) -> None:
     """Nobody may hand out a permission they do not themselves hold.
 
     Without this, `users.manage` is a full escalation: an admin who cannot
@@ -360,6 +372,31 @@ def _guard_assignable(actor_role: Role, target_role: Role) -> None:
         )
     if RANK[target_role] > RANK[actor_role]:
         raise ValidationError("You cannot assign a role above your own.")
+
+
+def _guard_target(session: CurrentSession, row: User) -> None:
+    """Nobody may act on an account at or above their own rank.
+
+    `users.manage` reaches every row in the tenant, so without this an admin
+    could set the owner's password (or change the owner's email and use
+    "forgot password") and sign in as them — the role guards above only stop
+    someone changing a ROLE, not taking over the account that holds it.
+
+    Owners are the one exception to "same rank": co-owners have to be able to
+    manage each other, or a departed owner could never be deactivated. A
+    superuser row is never touched from a tenant screen at all — it is created
+    and maintained from the server console.
+
+    Acting on yourself is not decided here; the handlers carry their own
+    self-rules (no own role, own access, own deactivation or own deletion).
+    """
+    if row.id == session.user_id:
+        return
+    if row.role is Role.SUPERUSER:
+        raise PermissionDeniedError("A platform account cannot be changed from here.")
+    actor, target = RANK[session.role], RANK[row.role]
+    if target > actor or (target == actor and session.role is not Role.OWNER):
+        raise PermissionDeniedError("You cannot change an account at or above your own role.")
 
 
 @router.get("", response_model=UserPage)
@@ -441,9 +478,9 @@ def _invite_email(
     user: User,
     tenant_name: str,
     tenant_slug: str,
-    one_time_password: str,
+    invite_link: str,
     inviter: str,
-    login_url: str,
+    valid_days: int,
     *,
     suliko_account: SulikoAccountOut,
 ) -> tuple[str, str]:
@@ -455,16 +492,14 @@ def _invite_email(
     body = (
         f"Hello {user.full_name},\n\n"
         f"{inviter} has added you to {tenant_name} on Suliko.\n\n"
-        f"Sign in at: {login_url}\n\n"
+        f"Choose your password here:\n\n{invite_link}\n\n"
+        f"The link works once and expires in {valid_days} days. After that, "
+        "sign in with:\n\n"
         f"  Organisation: {tenant_slug}\n"
-        f"  Username:     {user.username}\n"
-        f"  Password:     {one_time_password}\n\n"
-        "You will be asked to choose your own password the first time you "
-        "sign in. Until you do, this one is the only way into the account — "
-        "and the person who invited you knows it, so do not keep it.\n\n"
+        f"  Username:     {user.username}\n\n"
         f"{account_paragraph}\n"
         f"If you were not expecting this, tell {tenant_name} and ignore the "
-        "message; the account cannot be used without the password above.\n"
+        "message; nobody can use the account without the link above.\n"
     )
     return f"You have been added to {tenant_name} on Suliko", body
 
@@ -475,20 +510,28 @@ async def invite_user(
     db: Db,
     session: CurrentSession,
     _: Annotated[object, Depends(require(Permission.USERS_MANAGE))],
+    limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
 ) -> InviteOut:
     """Add someone to the bureau and email them a way in.
 
-    The difference from `POST /users` is who chooses the password. Here nobody
-    does: a one-time password is generated, emailed, and the account is
-    flagged `must_change_password` — so the invite can be sent without anyone
-    inventing a password for someone else and without it living in a chat
-    message afterwards.
+    The difference from `POST /users` is who chooses the password. Here the
+    invitee does: the account is created with a password nobody knows, and the
+    email carries a single-use, expiring set-password link (the reset-token
+    machinery, with a longer life). Nothing that works as a credential sits in
+    an inbox indefinitely, and nobody else ever knows the password.
 
     The username is the email address, matching sign-up. Both are unique per
     tenant, so the clash below is a genuine "already invited", not a
     collision with another bureau.
     """
     _guard_assignable(session.role, payload.role)
+
+    tenant_key = f"invite:tenant:{session.tenant_id}"
+    if retry := await limiter.check_invite(tenant_key):
+        raise RateLimitedError(
+            "This organisation has sent too many invitations today. Try again tomorrow.",
+            retry_after=retry,
+        )
 
     email = str(payload.email).strip().lower()
     username = email if len(email) <= 100 else email.split("@")[0][:100]
@@ -510,7 +553,8 @@ async def invite_user(
     )
     _guard_grantable(session, requested)
 
-    one_time_password = generate_one_time_password()
+    # A password nobody knows, so the account is unusable until the link is.
+    unusable_password = generate_token()
 
     phone = (payload.phone or "").strip() or None
     row = User(
@@ -519,7 +563,7 @@ async def invite_user(
         full_name=payload.full_name.strip(),
         position=(payload.position or "").strip() or None,
         phone=phone,
-        password_hash=hash_password(one_time_password),
+        password_hash=await hash_password_async(unusable_password),
         role=payload.role,
         is_active=True,
         must_change_password=True,
@@ -582,22 +626,30 @@ async def invite_user(
         },
     )
 
-    login_url = f"{get_settings().app_url.rstrip('/')}/login"
+    settings = get_settings()
+    ttl_seconds = settings.invite_link_ttl_hours * 3600
+    token = await reset_tokens.issue(db, row, ttl_seconds=ttl_seconds)
+    invite_link = (
+        f"{settings.app_url.rstrip('/')}/{session.tenant_locale}/reset-password"
+        f"?token={quote(token, safe='')}&invite=1&org={quote(session.tenant_slug, safe='')}"
+    )
     subject, body = _invite_email(
         row,
         session.tenant_name,
         session.tenant_slug,
-        one_time_password,
+        invite_link,
         session.full_name,
-        login_url,
+        max(1, settings.invite_link_ttl_hours // 24),
         suliko_account=suliko_account,
     )
+    await limiter.record_invite(tenant_key)
     result = await mail.send(email, subject, body)
 
     overrides = (await _overrides_for(db, [row.id])).get(row.id, {})
     return InviteOut(
         user=_out(row, session.plan, overrides, suliko_account),
-        one_time_password=one_time_password,
+        invite_link=invite_link,
+        invite_expires_at=datetime.now(UTC) + timedelta(seconds=ttl_seconds),
         email_sent=result.delivered,
         suliko_account=suliko_account,
     )
@@ -611,16 +663,24 @@ async def create_user(
     _: Annotated[object, Depends(require(Permission.USERS_MANAGE))],
 ) -> UserOut:
     _guard_assignable(session.role, payload.role)
+    # The new account starts with the role's whole bundle. Without this, an
+    # admin whose owner revoked, say, `finance.refund` could mint a fresh
+    # admin with a password of their own choosing and have it back.
+    _guard_grantable(
+        session, permissions_for_role(payload.role) & permissions_for_plan(session.plan)
+    )
 
     problems = validate_password_strength(payload.password)
     if problems:
         raise ValidationError(" ".join(problems))
 
+    username = payload.username.lower()
+    email = str(payload.email).strip().lower()
     clash = (
         (
             await db.execute(
                 select(User).where(
-                    or_(User.username == payload.username, User.email == payload.email)
+                    or_(func.lower(User.username) == username, func.lower(User.email) == email)
                 )
             )
         )
@@ -633,12 +693,15 @@ async def create_user(
         raise ConflictError("That username or email is already in use.")
 
     row = User(
-        username=payload.username,
-        email=payload.email,
+        username=username,
+        email=email,
         full_name=payload.full_name,
-        password_hash=hash_password(payload.password),
+        password_hash=await hash_password_async(payload.password),
         role=payload.role,
         is_active=True,
+        # Somebody other than the account holder chose this password, exactly
+        # as with an invite — so it is theirs to replace on first sign-in.
+        must_change_password=True,
     )
     db.add(row)
     await db.flush()
@@ -667,19 +730,50 @@ async def update_user(
     row = await db.get(User, user_id)
     if row is None:
         raise NotFoundError("User not found.")
+    _guard_target(session, row)
 
     changes = payload.model_dump(exclude_unset=True)
     # `permissions` is not a column; it is handled separately below.
     permissions = changes.pop("permissions", None)
+    if changes.get("email") is not None:
+        changes["email"] = str(changes["email"]).strip().lower()
     before = {k: getattr(row, k) for k in changes}
 
     role_changed = "role" in changes and changes["role"] != row.role
     deactivating = changes.get("is_active") is False and row.is_active
+    email_changed = "email" in changes and changes["email"] != row.email
+
+    if deactivating and row.id == session.user_id:
+        raise ValidationError("You cannot deactivate your own account. Ask another administrator.")
+
+    if email_changed:
+        clash = await db.scalar(
+            select(func.count())
+            .select_from(User)
+            .where(func.lower(User.email) == changes["email"], User.id != row.id)
+        )
+        if clash:
+            raise ConflictError("Somebody in this organisation already uses that email.")
+
+    # What they can do today, before anything below changes it — the baseline
+    # for "what is this edit granting?" and "what may the editor not touch?".
+    current_overrides = (await _overrides_for(db, [row.id])).get(row.id, {})
+    current_effective = effective_permissions(row.role, session.plan, current_overrides)
 
     if role_changed:
         if row.id == session.user_id:
             raise ValidationError("You cannot change your own role. Ask another administrator.")
         _guard_assignable(session.role, changes["role"])
+        if permissions is None:
+            # The existing overrides carry over onto the new role's bundle, so
+            # a promotion hands out whatever that bundle adds. The editor must
+            # hold all of it — otherwise promoting someone is a way round an
+            # owner's revocation of the editor's own access.
+            _guard_grantable(
+                session,
+                effective_permissions(changes["role"], session.plan, current_overrides)
+                - current_effective,
+            )
 
     # The tenant must keep at least one active owner who can administer it.
     losing_owner = row.role is Role.OWNER and (
@@ -701,14 +795,21 @@ async def update_user(
 
     if permissions is not None:
         requested = _requested_permissions(permissions, session.plan)
-        _guard_grantable(session, requested)
+        held = set(session.permissions)
+        # Only what the editor does NOT already see on this person is a grant.
+        _guard_grantable(session, requested - current_effective)
+        # And what the editor does not hold, they can neither grant nor take
+        # away: those boxes are disabled on their form and never submitted, so
+        # reading their absence as "revoke" would silently strip, say, an
+        # owner-granted `tenant.billing` every time an admin saves.
+        requested = (requested & held) | (set(current_effective) - held)
         await _write_overrides(db, row, requested, plan=session.plan)
 
-    # A demotion, a deactivation or an access change must bite immediately,
-    # not at next login — the session carries a permission set built at
-    # resolve time, and leaving it alone would let the old one stand for up to
-    # the idle timeout.
-    if role_changed or deactivating or permissions is not None:
+    # A demotion, a deactivation, an access change or a new sign-in address
+    # must bite immediately, not at next login — the session carries a
+    # permission set built at resolve time, and leaving it alone would let the
+    # old one stand for up to the idle timeout.
+    if role_changed or deactivating or email_changed or permissions is not None:
         await revoke_all_for_user(db, row.id)
 
     from suliko.core.audit import record
@@ -744,12 +845,15 @@ async def reset_password(
     row = await db.get(User, user_id)
     if row is None:
         raise NotFoundError("User not found.")
+    # Setting someone's password IS signing in as them, so this is the
+    # takeover path the rank guard exists for.
+    _guard_target(session, row)
 
     problems = validate_password_strength(payload.password)
     if problems:
         raise ValidationError(" ".join(problems))
 
-    row.password_hash = hash_password(payload.password)
+    row.password_hash = await hash_password_async(payload.password)
     # Somebody else chose it, so somebody else knows it. Same flag the invite
     # sets: they can sign in, and the only thing they can do is replace it.
     row.must_change_password = True
@@ -761,6 +865,39 @@ async def reset_password(
     # The password itself is never logged — core.crypto.redact would strip it,
     # but it is simply not passed in the first place.
     await record(db, session, action="user.password_reset", entity_type="user", entity_id=row.id)
+
+
+@router.delete("/{user_id}/mfa", status_code=http_status.HTTP_204_NO_CONTENT)
+async def reset_user_mfa(
+    user_id: int,
+    db: Db,
+    session: CurrentSession,
+    _: Annotated[object, Depends(require(Permission.USERS_MANAGE))],
+) -> None:
+    """Remove someone's second factor — a lost or replaced phone.
+
+    They enrol again at their next sign-in (and are made to, when their role
+    requires it). The rank guard applies: this is as good as a password reset
+    for an account protected by both, so nobody may do it to a senior.
+    """
+    row = await db.get(User, user_id)
+    if row is None:
+        raise NotFoundError("User not found.")
+    if row.id == session.user_id:
+        raise ValidationError("Use your own Account screen to change your two-factor settings.")
+    _guard_target(session, row)
+
+    from sqlalchemy import delete
+
+    from suliko.models.user import MfaMethod, MfaRecoveryCode
+
+    await db.execute(delete(MfaMethod).where(MfaMethod.user_id == row.id))
+    await db.execute(delete(MfaRecoveryCode).where(MfaRecoveryCode.user_id == row.id))
+    await revoke_all_for_user(db, row.id)
+
+    from suliko.core.audit import record
+
+    await record(db, session, action="user.mfa_reset", entity_type="user", entity_id=row.id)
 
 
 @router.delete("/{user_id}", status_code=http_status.HTTP_204_NO_CONTENT)
@@ -781,6 +918,7 @@ async def delete_user(
 
     if row.id == session.user_id:
         raise ValidationError("You cannot delete your own account.")
+    _guard_target(session, row)
 
     if row.role is Role.OWNER and await _active_owner_count(db) <= 1:
         raise ConflictError("This is the last active owner and cannot be deleted.")

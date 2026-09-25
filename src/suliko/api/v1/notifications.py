@@ -20,7 +20,7 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Depends, Query
 from fastapi import status as http_status
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import Select, func, select, update
+from sqlalchemy import Select, func, or_, select, update
 
 from suliko.api.deps import CurrentSession, Db, require, require_feature
 from suliko.api.v1._shared import PageMeta
@@ -214,9 +214,32 @@ async def mark_read(
 
 # ── Order comments ──────────────────────────────────────────────────────────
 
-#: `@username`. Deliberately narrow: letters, digits, dot, underscore, hyphen,
-#: which is what the username field allows.
-MENTION_PATTERN = re.compile(r"@([A-Za-z0-9._-]{2,100})")
+#: `@username`, where a username may be a whole email address — invites and
+#: sign-up use the email as the username, so "@nino@acme.ge" must capture all
+#: of it rather than stop at the second "@". "@nino" (the part before the @)
+#: also works when exactly one colleague's username starts that way.
+MENTION_PATTERN = re.compile(r"@([A-Za-z0-9._%+-]{2,100}(?:@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)?)")
+
+
+def mention_names(body: str) -> set[str]:
+    """The mentioned names, lower-cased, without trailing sentence dots."""
+    return {name.rstrip(".").lower() for name in MENTION_PATTERN.findall(body)} - {""}
+
+
+def resolve_mentions(names: set[str], users: list[User]) -> list[User]:
+    """Match names to users: a full username, or an unambiguous local part."""
+    by_username = {user.username.lower(): user for user in users}
+    found: dict[int, User] = {}
+    for name in names:
+        exact = by_username.get(name)
+        if exact is not None:
+            found[exact.id] = exact
+            continue
+        if "@" not in name:
+            local = [u for u in users if u.username.lower().split("@", 1)[0] == name]
+            if len(local) == 1:
+                found[local[0].id] = local[0]
+    return list(found.values())
 
 
 class CommentIn(BaseModel):
@@ -332,14 +355,21 @@ async def create_comment(
 
     # Resolve @mentions to real users. Unknown names are left as plain text —
     # a typo should not silently become a mention of nobody.
-    names = {name.lower() for name in MENTION_PATTERN.findall(payload.body)}
+    names = mention_names(payload.body)
     mentioned: list[User] = []
     if names:
-        mentioned = list(
+        candidates = list(
             (
                 await db.execute(
                     select(User).where(
-                        func.lower(User.username).in_(names),
+                        or_(
+                            func.lower(User.username).in_(names),
+                            *[
+                                func.lower(User.username).like(f"{name}@%")
+                                for name in names
+                                if "@" not in name
+                            ],
+                        ),
                         User.is_active.is_(True),
                     )
                 )
@@ -347,6 +377,7 @@ async def create_comment(
             .scalars()
             .all()
         )
+        mentioned = resolve_mentions(names, candidates)
 
     for user in mentioned:
         if user.id == session.user_id:

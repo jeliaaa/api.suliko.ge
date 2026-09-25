@@ -254,6 +254,11 @@ def test_the_quote_and_the_order_apply_the_same_rule() -> None:
     import inspect
 
     from suliko.api.v1 import calculator, orders
+    from suliko.domain import pricing_context
 
-    assert "pricing_for_plan" in inspect.getsource(orders.create_order)
-    assert "pricing_for_plan" in inspect.getsource(calculator._pricing_config)
+    # Both price through the one loader...
+    assert "load_pricing_context" in inspect.getsource(orders.create_order)
+    assert "load_pricing_context" in inspect.getsource(calculator.quote)
+    # ...which applies the plan on both branches (settings row or none).
+    source = inspect.getsource(pricing_context.config_from_settings)
+    assert source.count("pricing_for_plan(") == 2

@@ -31,6 +31,7 @@ from sqlalchemy.pool import StaticPool
 from suliko.api.portal_deps import ASSERTION_HEADER, get_platform_db, get_tenant_sessions
 from suliko.config import get_settings
 from suliko.core.errors import ConflictError, NotFoundError, ValidationError
+from suliko.core.ratelimit import RateLimiter
 from suliko.db.base import Base
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
 from suliko.domain.plans import TenantPlan
@@ -55,7 +56,7 @@ from suliko.models.portal import (
 )
 from suliko.models.reference import DocumentType
 from suliko.models.tenant import Tenant, TenantStatus
-from suliko.models.user import Role, User, UserPermissionOverride
+from suliko.models.user import PasswordResetToken, Role, User, UserPermissionOverride
 from suliko.security.permissions import permissions_for_role
 from suliko.security.portal_tokens import sign_token
 from suliko.security.sessions import AuthenticatedSession
@@ -90,6 +91,8 @@ MODELS = [
     OrderDocumentDriveFolder,
     User,
     UserPermissionOverride,
+    # An invite is a set-password link now: the reset-token row it spends.
+    PasswordResetToken,
 ]
 
 API = "/api/v1"
@@ -1063,7 +1066,7 @@ async def test_staff_assignment_puts_a_document_in_the_portal(
 ) -> None:
     from suliko.api.v1 import orders as orders_api
 
-    async def no_detail(order_id: int, db: AsyncSession) -> None:
+    async def no_detail(order_id: int, db: AsyncSession, *_: object) -> None:
         # The detail query uses PostgreSQL's DISTINCT ON; it is not what is
         # under test here.
         return None
@@ -1080,7 +1083,6 @@ async def test_staff_assignment_puts_a_document_in_the_portal(
                 orders_api.OrderDocumentUpdate(translator_id=1),
                 db=db,
                 session=staff,
-                _=staff,
             )
             await db.commit()
 
@@ -1097,7 +1099,6 @@ async def test_staff_assignment_puts_a_document_in_the_portal(
                     orders_api.OrderDocumentUpdate(translator_id=3),
                     db=db,
                     session=staff,
-                    _=staff,
                 )
             # A document that belongs to a different order.
             with pytest.raises(NotFoundError):
@@ -1107,7 +1108,6 @@ async def test_staff_assignment_puts_a_document_in_the_portal(
                     orders_api.OrderDocumentUpdate(translator_id=1),
                     db=db,
                     session=staff,
-                    _=staff,
                 )
 
 
@@ -1201,7 +1201,9 @@ async def _invite_translator(
     )
     with tenant_scope(tenant_id):
         async with maker() as db:
-            result = await translators_api.invite_translator(payload, db, session, session)
+            result = await translators_api.invite_translator(
+                payload, db, session, session, RateLimiter(None)
+            )
             await db.commit()
     return result
 
@@ -1279,6 +1281,7 @@ async def test_invite_translator_with_no_match_is_pending_and_emails_the_registr
     body = sent_mail[-1]["body"]
     assert "someone.new@example.com" in body
     assert registration_url() in body
+
 
 
 async def test_pending_translator_invite_resolves_when_admin_marks_the_account(
@@ -1437,7 +1440,7 @@ async def test_staff_invite_records_the_suliko_account_match(
     with tenant_scope(ACME):
         async with maker() as db:
             session = _admin_session(ACME)
-            result = await users_api.invite_user(payload, db, session, session)
+            result = await users_api.invite_user(payload, db, session, session, RateLimiter(None))
             await db.commit()
 
     assert result.suliko_account.status == "linked"
@@ -1467,7 +1470,7 @@ async def test_staff_invite_with_no_match_is_pending_and_emails_the_registration
     with tenant_scope(ACME):
         async with maker() as db:
             session = _admin_session(ACME)
-            result = await users_api.invite_user(payload, db, session, session)
+            result = await users_api.invite_user(payload, db, session, session, RateLimiter(None))
             await db.commit()
 
     assert result.suliko_account.status == "pending"
@@ -1476,6 +1479,14 @@ async def test_staff_invite_with_no_match_is_pending_and_emails_the_registration
     body = sent_mail[-1]["body"]
     assert "someone.new@example.com" in body
     assert registration_url() in body
+
+    # A single-use, expiring set-password link — and no password. The old
+    # one-time password stayed valid in the inbox until someone changed it.
+    assert "/reset-password?token=" in body
+    assert "&invite=1&org=acme" in body
+    assert "Password:" not in body
+    assert result.invite_link in body
+    assert "one_time_password" not in users_api.InviteOut.model_fields
 
 
 async def test_created_user_has_no_suliko_account(

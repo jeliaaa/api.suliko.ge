@@ -14,6 +14,10 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from suliko.db.base import Base, IdMixin, TimestampMixin, enum_values
 
+#: Where a bureau works unless it says otherwise. The product is sold in
+#: Georgia first; Georgia has kept UTC+4 with no daylight saving since 2005.
+DEFAULT_TIMEZONE = "Asia/Tbilisi"
+
 
 class TenantStatus(enum.StrEnum):
     TRIAL = "trial"
@@ -47,6 +51,16 @@ class Tenant(Base, IdMixin, TimestampMixin):
     )
     plan: Mapped[str | None] = mapped_column(String(50), default=None)
     locale: Mapped[str] = mapped_column(String(5), default="ka", nullable=False)
+    #: IANA zone name. "Today" — an order's default date, what is overdue,
+    #: which month a payment falls in — is a calendar question, and answering
+    #: it in UTC puts everything between midnight and 04:00 Tbilisi time on
+    #: the previous day. Read through `domain.clock`, never directly.
+    timezone: Mapped[str] = mapped_column(
+        String(64),
+        default=DEFAULT_TIMEZONE,
+        server_default=DEFAULT_TIMEZONE,
+        nullable=False,
+    )
     suspended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
     @property

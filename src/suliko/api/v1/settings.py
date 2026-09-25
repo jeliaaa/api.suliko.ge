@@ -20,8 +20,10 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy import select
 
 from suliko.api.deps import CurrentSession, Db, require
-from suliko.core.errors import ConflictError, NotFoundError
+from suliko.core.errors import ConflictError, NotFoundError, ValidationError
+from suliko.domain.clock import is_valid_zone
 from suliko.models.reference import DocumentType, Language, LanguagePairPrice, TenantSettings
+from suliko.models.tenant import Tenant
 from suliko.security.permissions import Permission
 
 router = APIRouter(prefix="/settings", tags=["settings"])
@@ -31,6 +33,11 @@ router = APIRouter(prefix="/settings", tags=["settings"])
 
 
 class GeneralSettings(BaseModel):
+    #: The bureau's name as the app shell and emails show it. Lives on the
+    #: tenant row; edited here because it is the bureau's own setting.
+    organisation_name: str
+    #: IANA zone. Decides "today" everywhere — see `domain.clock`.
+    timezone: str
     default_language: str
     system_email: str | None
     urgency_multiplier_standard: Decimal
@@ -38,6 +45,10 @@ class GeneralSettings(BaseModel):
     urgency_multiplier_urgent: Decimal
     delivery_fee: Decimal
     default_translator_share: Decimal
+    #: Days from order date to the default due date, per urgency.
+    due_days_standard: int
+    due_days_express: int
+    due_days_urgent: int
 
 
 class GeneralSettingsUpdate(BaseModel):
@@ -53,7 +64,42 @@ class GeneralSettingsUpdate(BaseModel):
     urgency_multiplier_urgent: Decimal | None = Field(default=None, ge=Decimal("0.1"), le=10)
     delivery_fee: Decimal | None = Field(default=None, ge=0, le=10_000)
     #: What share of the translation fee the translator receives.
-    default_translator_share: Decimal | None = Field(default=None, ge=0, le=1)
+    default_translator_share: Decimal | None = Field(
+        default=None, ge=0, le=1, max_digits=4, decimal_places=3
+    )
+    due_days_standard: int | None = Field(default=None, ge=0, le=365)
+    due_days_express: int | None = Field(default=None, ge=0, le=365)
+    due_days_urgent: int | None = Field(default=None, ge=0, le=365)
+    organisation_name: str | None = Field(default=None, min_length=1, max_length=255)
+    timezone: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+#: Fields that live on the tenant row rather than the settings row.
+_TENANT_FIELDS = ("organisation_name", "timezone")
+
+
+def _general_out(row: TenantSettings, tenant: Tenant) -> GeneralSettings:
+    return GeneralSettings(
+        organisation_name=tenant.display_name,
+        timezone=tenant.timezone,
+        default_language=row.default_language,
+        system_email=row.system_email,
+        urgency_multiplier_standard=row.urgency_multiplier_standard,
+        urgency_multiplier_express=row.urgency_multiplier_express,
+        urgency_multiplier_urgent=row.urgency_multiplier_urgent,
+        delivery_fee=row.delivery_fee,
+        default_translator_share=row.default_translator_share,
+        due_days_standard=row.due_days_standard,
+        due_days_express=row.due_days_express,
+        due_days_urgent=row.due_days_urgent,
+    )
+
+
+async def _tenant(db: Db, session: CurrentSession) -> Tenant:
+    tenant = await db.get(Tenant, session.tenant_id)
+    if tenant is None:  # pragma: no cover - a live session always has one
+        raise NotFoundError("Organisation not found.")
+    return tenant
 
 
 async def _settings_row(db: Db) -> TenantSettings:
@@ -73,10 +119,10 @@ async def _settings_row(db: Db) -> TenantSettings:
 @router.get("/general", response_model=GeneralSettings)
 async def get_general(
     db: Db,
-    _: Annotated[object, Depends(require(Permission.SETTINGS_MANAGE))],
+    session: Annotated[CurrentSession, Depends(require(Permission.SETTINGS_MANAGE))],
 ) -> GeneralSettings:
     row = await _settings_row(db)
-    return GeneralSettings.model_validate(row, from_attributes=True)
+    return _general_out(row, await _tenant(db, session))
 
 
 @router.patch("/general", response_model=GeneralSettings)
@@ -87,11 +133,30 @@ async def update_general(
     _: Annotated[object, Depends(require(Permission.SETTINGS_MANAGE))],
 ) -> GeneralSettings:
     row = await _settings_row(db)
+    tenant = await _tenant(db, session)
     changes = payload.model_dump(exclude_unset=True)
-    before = {k: getattr(row, k) for k in changes}
+    for key, value in changes.items():
+        if value is None and key not in ("system_email",):
+            raise ValidationError(f"{key} cannot be empty.")
+    if "timezone" in changes and not is_valid_zone(str(changes["timezone"])):
+        raise ValidationError(
+            f"Unknown timezone {changes['timezone']!r}. Use an IANA name such as Asia/Tbilisi."
+        )
+
+    before = {
+        k: (tenant.display_name if k == "organisation_name" else getattr(tenant, k))
+        if k in _TENANT_FIELDS
+        else getattr(row, k)
+        for k in changes
+    }
 
     for field, value in changes.items():
-        setattr(row, field, value)
+        if field == "organisation_name":
+            tenant.display_name = str(value).strip()
+        elif field == "timezone":
+            tenant.timezone = str(value)
+        else:
+            setattr(row, field, value)
     await db.flush()
 
     from suliko.core.audit import record
@@ -107,7 +172,7 @@ async def update_general(
         before=before,
         after=changes,
     )
-    return GeneralSettings.model_validate(row, from_attributes=True)
+    return _general_out(row, tenant)
 
 
 # ── Document types ──────────────────────────────────────────────────────────

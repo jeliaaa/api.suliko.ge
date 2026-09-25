@@ -27,7 +27,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from suliko.api.deps import CurrentSession, Db, require
 from suliko.api.v1._shared import PageMeta, mask_tail
 from suliko.core import mail
-from suliko.core.errors import ConflictError, NotFoundError
+from suliko.core.errors import ConflictError, NotFoundError, RateLimitedError
+from suliko.core.ratelimit import RateLimiter, get_rate_limiter
 from suliko.domain.portal import (
     account_matches,
     link_account_to_directory_row,
@@ -89,13 +90,14 @@ class TranslatorSummary(BaseModel):
     #: Drives the Active / None account badge.
     has_portal_account: bool
     bank_iban_masked: str | None
+    #: Per-page rate; the order builder pre-fills translator cost from it.
+    default_rate: Decimal | None
 
 
 class TranslatorDetail(TranslatorSummary):
     office_address: str | None
     comment: str | None
     experience_from: date | None
-    default_rate: Decimal | None
     bank_inn: str | None
     bank_code: str | None
     portal_username: str | None
@@ -115,6 +117,7 @@ def _summary(row: Translator) -> TranslatorSummary:
         is_active=row.is_active,
         has_portal_account=row.has_portal_account,
         bank_iban_masked=mask_tail(row.bank_iban),
+        default_rate=row.default_rate,
     )
 
 
@@ -124,7 +127,6 @@ def _detail(row: Translator) -> TranslatorDetail:
         office_address=row.office_address,
         comment=row.comment,
         experience_from=row.experience_from,
-        default_rate=row.default_rate,
         bank_inn=row.bank_inn,
         bank_code=row.bank_code,
         portal_username=row.portal_username,
@@ -254,6 +256,7 @@ async def invite_translator(
     db: Db,
     session: CurrentSession,
     _: Annotated[object, Depends(require(Permission.TRANSLATORS_WRITE))],
+    limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
 ) -> TranslatorInviteOut:
     """Invite a translator, and try to connect them to their suliko.ge account.
 
@@ -383,6 +386,15 @@ async def invite_translator(
         linked=existing.status is InviteStatus.LINKED,
         matched_display_name=matched_display_name,
     )
+    # Same per-tenant quota as staff invites: both send mail from the
+    # platform's address with text this bureau wrote.
+    tenant_key = f"invite:tenant:{session.tenant_id}"
+    if retry := await limiter.check_invite(tenant_key):
+        raise RateLimitedError(
+            "This organisation has sent too many invitations today. Try again tomorrow.",
+            retry_after=retry,
+        )
+    await limiter.record_invite(tenant_key)
     mail_result = await mail.send(email, subject, body)
 
     return TranslatorInviteOut(

@@ -18,7 +18,7 @@ from typing import Annotated
 from urllib.parse import quote
 
 import structlog
-from fastapi import APIRouter, Depends, Request, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from suliko.api.deps import (
     Db,
     get_client_ip,
+    get_client_user_agent,
     get_current_session,
     get_session_for_password_change,
 )
@@ -45,15 +46,22 @@ from suliko.domain.plans import effective_permissions, effective_plan
 from suliko.domain.reference_seed import seed_reference_data
 from suliko.models.reference import TenantSettings
 from suliko.models.tenant import Tenant, TenantStatus
-from suliko.models.user import LoginAttempt, MfaMethod, MfaRecoveryCode, Role, User
+from suliko.models.user import (
+    LoginAttempt,
+    MfaMethod,
+    MfaRecoveryCode,
+    Role,
+    User,
+    UserPermissionOverride,
+)
 from suliko.security import reset_tokens
 from suliko.security import totp as totp_service
 from suliko.security.passwords import (
-    hash_password,
+    hash_password_async,
     hash_token,
     validate_password_strength,
-    verify_and_maybe_rehash,
-    waste_time_verifying,
+    verify_and_maybe_rehash_async,
+    waste_time_verifying_async,
 )
 from suliko.security.permissions import requires_mfa
 from suliko.security.sessions import (
@@ -136,11 +144,16 @@ async def login(
     accounts.
     """
     ip = get_client_ip(request)
-    user_agent = request.headers.get("user-agent")
+    user_agent = get_client_user_agent(request)
+    # Slugs are stored lower-case and usernames are email addresses, so the
+    # case someone types them in means nothing. "Suliko" / "Nino@Mail.ge"
+    # failing as "invalid username or password" was a support call each.
+    tenant_slug = payload.tenant_slug.strip().lower()
+    username = payload.username.strip()
 
     # Per-account and per-IP, so one attacker cannot lock a real user out
     # platform-wide by hammering their username from everywhere.
-    account_key = f"login:acct:{payload.tenant_slug}:{payload.username.lower()}"
+    account_key = f"login:acct:{tenant_slug}:{username.lower()}"
     ip_key = f"login:ip:{ip or 'unknown'}"
 
     if retry := await limiter.check_login(account_key, ip_key):
@@ -149,31 +162,43 @@ async def login(
     async with get_sessionmaker()() as db:
         with bypass_tenant_scope():
             tenant = (
-                await db.execute(select(Tenant).where(Tenant.slug == payload.tenant_slug))
+                await db.execute(select(Tenant).where(Tenant.slug == tenant_slug))
             ).scalar_one_or_none()
 
             user: User | None = None
             if tenant is not None and tenant.is_usable:
-                user = (
-                    await db.execute(
-                        select(User).where(
-                            User.tenant_id == tenant.id,
-                            User.username == payload.username,
+                candidates = (
+                    (
+                        await db.execute(
+                            select(User).where(
+                                User.tenant_id == tenant.id,
+                                func.lower(User.username) == username.lower(),
+                            )
                         )
                     )
-                ).scalar_one_or_none()
+                    .scalars()
+                    .all()
+                )
+                # Usernames are unique per tenant as stored, not per case. An
+                # imported tenant can hold "Nino" and "nino"; then only the
+                # exact spelling signs in, rather than guessing between two.
+                exact = [c for c in candidates if c.username == username]
+                if exact:
+                    user = exact[0]
+                elif len(candidates) == 1:
+                    user = candidates[0]
 
         if user is None or not user.is_active:
-            waste_time_verifying()
+            await waste_time_verifying_async()
             await limiter.record_login_failure(account_key, ip_key)
-            await _record_attempt(db, payload.username, ip, user_agent, False, "no_such_user")
+            await _record_attempt(db, username, ip, user_agent, False, "no_such_user")
             await db.commit()
             raise AuthenticationError("Invalid username or password.")
 
-        ok, new_hash = verify_and_maybe_rehash(payload.password, user.password_hash)
+        ok, new_hash = await verify_and_maybe_rehash_async(payload.password, user.password_hash)
         if not ok:
             await limiter.record_login_failure(account_key, ip_key)
-            await _record_attempt(db, payload.username, ip, user_agent, False, "bad_password")
+            await _record_attempt(db, username, ip, user_agent, False, "bad_password")
             await db.commit()
             raise AuthenticationError("Invalid username or password.")
 
@@ -245,11 +270,24 @@ async def login(
             )
 
             user.last_login_at = datetime.now(UTC)
-            await _record_attempt(db, payload.username, ip, user_agent, True)
+            await _record_attempt(db, username, ip, user_agent, True)
+            overrides = {
+                row.permission: row.granted
+                for row in (
+                    await db.execute(
+                        select(UserPermissionOverride).where(
+                            UserPermissionOverride.user_id == user.id
+                        )
+                    )
+                ).scalars()
+            }
 
         await limiter.clear_login_failures(account_key)
         await db.commit()
 
+        # A user is only ever loaded from a usable tenant (above), so this
+        # cannot fire; it is here so the type checker knows it too.
+        assert tenant is not None
         response.status_code = status.HTTP_200_OK
         return LoginResponse(
             session_token=issued.token,
@@ -265,8 +303,12 @@ async def login(
             # Masked by the plan, exactly as resolve_session does. Reporting
             # the raw role bundle here would have the frontend paint tabs
             # that every request behind them then refuses.
+            # With the user's own overrides, as resolve_session computes it —
+            # otherwise the first page after login paints a different sidebar
+            # from every page after it.
             permissions=sorted(
-                p.value for p in effective_permissions(user.role, effective_plan(tenant.plan))
+                p.value
+                for p in effective_permissions(user.role, effective_plan(tenant.plan), overrides)
             ),
         )
 
@@ -507,7 +549,7 @@ async def signup(
                 username=username,
                 email=email,
                 full_name=payload.full_name.strip(),
-                password_hash=hash_password(payload.password),
+                password_hash=await hash_password_async(payload.password),
                 role=Role.OWNER,
                 is_active=True,
             )
@@ -521,7 +563,7 @@ async def signup(
                 db,
                 user,
                 ip=ip,
-                user_agent=request.headers.get("user-agent"),
+                user_agent=get_client_user_agent(request),
                 # An owner is in MFA_REQUIRED_ROLES. With MFA_REQUIRE_ENROLMENT
                 # off (the default) there is no factor to owe yet; with it on,
                 # this session is unsatisfied and the frontend says so rather
@@ -609,6 +651,7 @@ def _reset_email(user: User, tenant: Tenant, link: str, ttl_minutes: int) -> tup
 async def forgot_password(
     payload: ForgotPasswordRequest,
     request: Request,
+    background: BackgroundTasks,
     limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
 ) -> None:
     """Send a reset link, if there is anywhere to send it.
@@ -623,8 +666,9 @@ async def forgot_password(
     """
     ip = get_client_ip(request)
     identifier = payload.identifier.strip()
+    tenant_slug = payload.tenant_slug.strip().lower()
 
-    account_key = f"pwreset:acct:{payload.tenant_slug}:{identifier.lower()}"
+    account_key = f"pwreset:acct:{tenant_slug}:{identifier.lower()}"
     ip_key = f"pwreset:ip:{ip or 'unknown'}"
 
     if retry := await limiter.check_password_reset(account_key, ip_key):
@@ -636,7 +680,7 @@ async def forgot_password(
     async with get_sessionmaker()() as db:
         with bypass_tenant_scope():
             tenant = (
-                await db.execute(select(Tenant).where(Tenant.slug == payload.tenant_slug))
+                await db.execute(select(Tenant).where(Tenant.slug == tenant_slug))
             ).scalar_one_or_none()
 
             user: User | None = None
@@ -647,7 +691,7 @@ async def forgot_password(
                             select(User).where(
                                 User.tenant_id == tenant.id,
                                 or_(
-                                    User.username == identifier,
+                                    func.lower(User.username) == identifier.lower(),
                                     func.lower(User.email) == identifier.lower(),
                                 ),
                             )
@@ -662,7 +706,7 @@ async def forgot_password(
             # is trying, without the caller learning anything.
             log.info(
                 "password_reset_requested_for_unknown_account",
-                tenant_slug=payload.tenant_slug,
+                tenant_slug=tenant_slug,
                 ip=ip,
             )
             return
@@ -691,7 +735,11 @@ async def forgot_password(
         f"?token={quote(token, safe='')}"
     )
     subject, body = _reset_email(user, tenant, link, settings.password_reset_ttl_minutes)
-    await mail.send(user.email, subject, body)
+    # After the response, not before it. Sending inline made a known account
+    # take seconds (SMTP handshake, TLS, login) and an unknown one return at
+    # once — the response time alone told anyone which addresses were
+    # registered with which bureau.
+    background.add_task(mail.send, user.email, subject, body)
 
 
 @router.post("/password/reset", status_code=status.HTTP_204_NO_CONTENT)
@@ -717,7 +765,11 @@ async def reset_password(payload: ResetPasswordRequest, request: Request) -> Non
             )
 
         with bypass_tenant_scope():
-            user.password_hash = hash_password(payload.password)
+            user.password_hash = await hash_password_async(payload.password)
+            # They chose this one themselves, proving they hold the mailbox.
+            # Leaving the flag set sent an invited user who reset instead of
+            # using their one-time password straight into a second change.
+            user.must_change_password = False
         await db.flush()
         await revoke_all_for_user(db, user.id)
 
@@ -763,7 +815,7 @@ async def change_password(
     if user is None:
         raise AuthenticationError("Your account is no longer available.")
 
-    ok, _ = verify_and_maybe_rehash(payload.current_password, user.password_hash)
+    ok, _ = await verify_and_maybe_rehash_async(payload.current_password, user.password_hash)
     if not ok:
         # 422 rather than 401: the session is perfectly valid, one field is
         # wrong. A 401 here would log the user out of the UI mid-form.
@@ -776,7 +828,7 @@ async def change_password(
     if problems:
         raise ValidationError(" ".join(problems))
 
-    user.password_hash = hash_password(payload.new_password)
+    user.password_hash = await hash_password_async(payload.new_password)
     # Whatever they were handed, they have now replaced. This is the only
     # place the flag is cleared — an admin resetting someone's password sets
     # it again, which is the point.
@@ -815,6 +867,10 @@ class SessionInfo(BaseModel):
     permissions: list[str]
     mfa_satisfied: bool
     is_impersonated: bool
+    #: IANA zone for formatting dates and deciding "today" on screen.
+    timezone: str
+    #: Whether this user has a confirmed second factor (Account screen).
+    has_mfa: bool
 
 
 @router.get("/session", response_model=SessionInfo)
@@ -843,6 +899,8 @@ async def current_session(
         # mfa_satisfied_at is null.
         mfa_satisfied=(session.mfa_satisfied_at is not None or not get_settings().mfa_enforced),
         is_impersonated=session.is_impersonated,
+        timezone=session.timezone,
+        has_mfa=session.has_mfa,
     )
 
 

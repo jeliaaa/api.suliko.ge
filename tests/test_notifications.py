@@ -141,3 +141,29 @@ def test_an_unknown_name_is_not_a_mention() -> None:
 )
 def test_group_of(key: str, group: str) -> None:
     assert _group_of(key) == group
+
+
+# ── Mentions of email usernames (review 2026-09) ────────────────────────────
+
+
+def test_a_mention_captures_a_whole_email_username() -> None:
+    """Invites and sign-up make the email the username; the old pattern
+    stopped at the second "@" and matched nobody."""
+    from suliko.api.v1.notifications import mention_names
+
+    assert mention_names("Can @nino@acme.ge check page 2?") == {"nino@acme.ge"}
+    assert mention_names("Thanks @giorgi.") == {"giorgi"}
+
+
+def test_a_local_part_mention_resolves_only_when_unambiguous() -> None:
+    from types import SimpleNamespace
+
+    from suliko.api.v1.notifications import resolve_mentions
+
+    nino = SimpleNamespace(id=1, username="nino@acme.ge")
+    nino2 = SimpleNamespace(id=2, username="nino@other.ge")
+    ana = SimpleNamespace(id=3, username="ana@acme.ge")
+
+    assert resolve_mentions({"ana"}, [nino, ana]) == [ana]  # type: ignore[list-item]
+    assert resolve_mentions({"nino"}, [nino, nino2]) == []  # type: ignore[list-item]
+    assert resolve_mentions({"nino@acme.ge"}, [nino, nino2]) == [nino]  # type: ignore[list-item]

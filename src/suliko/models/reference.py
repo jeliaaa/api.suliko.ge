@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from sqlalchemy import Boolean, Index, Numeric, String, UniqueConstraint
+from sqlalchemy import Boolean, Index, Integer, Numeric, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from suliko.db.base import Base, IdMixin, TenantScoped, TimestampMixin
@@ -131,4 +131,20 @@ class TenantSettings(Base, IdMixin, TenantScoped, TimestampMixin):
     )
     default_translator_share: Mapped[Decimal] = mapped_column(
         Numeric(4, 3), default=Decimal("0.5"), nullable=False
+    )
+
+    # Days from the order date to the default due date, per urgency. The PHP
+    # hard-codes these in its client portal and partner API (same day, +2,
+    # +5); here they pre-fill the order form and stay editable per order.
+    # `server_default` as well as `default`: see adding-a-column-migration —
+    # a fresh database (0001, from metadata) and a migrated one (0008) must
+    # end up with the same DDL.
+    due_days_standard: Mapped[int] = mapped_column(
+        Integer, default=5, server_default="5", nullable=False
+    )
+    due_days_express: Mapped[int] = mapped_column(
+        Integer, default=2, server_default="2", nullable=False
+    )
+    due_days_urgent: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
     )

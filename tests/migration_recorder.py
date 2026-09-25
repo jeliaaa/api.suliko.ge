@@ -22,6 +22,8 @@ class RecordedOps:
 
     tables: dict[str, sa.Table] = field(default_factory=dict)
     indexes: list[tuple[str, str, list[str]]] = field(default_factory=list)
+    #: Keyword options each index was created with (``unique``, ...), by name.
+    index_options: dict[str, dict[str, Any]] = field(default_factory=dict)
     statements: list[str] = field(default_factory=list)
     dropped: list[str] = field(default_factory=list)
     #: Columns added to tables an EARLIER revision owns, as (table, column).
@@ -51,8 +53,9 @@ class RecordedOps:
         self.tables[name] = table
         return table
 
-    def create_index(self, name: str, table: str, columns: list[str], **_kwargs: Any) -> None:
+    def create_index(self, name: str, table: str, columns: list[str], **kwargs: Any) -> None:
         self.indexes.append((name, table, list(columns)))
+        self.index_options[name] = dict(kwargs)
 
     def drop_table(self, name: str) -> None:
         self.dropped.append(name)

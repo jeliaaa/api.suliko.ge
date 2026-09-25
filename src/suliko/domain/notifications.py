@@ -22,8 +22,10 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from suliko.domain.plans import TenantPlan, effective_permissions
 from suliko.models.collaboration import Notification, NotificationKind
-from suliko.models.user import User
+from suliko.models.user import User, UserPermissionOverride
+from suliko.security.permissions import Permission
 
 
 async def _active_user_ids(db: AsyncSession, exclude: int | None = None) -> list[int]:
@@ -69,6 +71,53 @@ async def notify(
             )
         )
     return len(recipients)
+
+
+async def notify_permitted(
+    db: AsyncSession,
+    *,
+    permission: Permission,
+    plan: TenantPlan,
+    kind: NotificationKind,
+    body: str,
+    actor_user_id: int | None = None,
+    actor_name: str | None = None,
+    order_id: int | None = None,
+    subject_label: str | None = None,
+) -> int:
+    """Notify every active user who holds `permission`, except the actor.
+
+    For events whose content is itself restricted. "Payment received - 450
+    GEL" broadcast to the whole office tells staff without `finance.read`
+    exactly what the Finances screen withholds from them. Effective access is
+    role, then overrides, then plan — the same computation a request makes.
+    """
+    users = (await db.execute(select(User.id, User.role).where(User.is_active.is_(True)))).all()
+    ids = [int(user_id) for user_id, _role in users]
+    overrides: dict[int, dict[str, bool]] = {}
+    if ids:
+        for row in (
+            await db.execute(
+                select(UserPermissionOverride).where(UserPermissionOverride.user_id.in_(ids))
+            )
+        ).scalars():
+            overrides.setdefault(row.user_id, {})[row.permission] = row.granted
+
+    recipients = [
+        int(user_id)
+        for user_id, role in users
+        if permission in effective_permissions(role, plan, overrides.get(int(user_id), {}))
+    ]
+    return await notify(
+        db,
+        user_ids=recipients,
+        kind=kind,
+        body=body,
+        actor_user_id=actor_user_id,
+        actor_name=actor_name,
+        order_id=order_id,
+        subject_label=subject_label,
+    )
 
 
 async def notify_everyone(

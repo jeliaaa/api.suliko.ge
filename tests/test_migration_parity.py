@@ -30,6 +30,8 @@ LATER_REVISIONS = (
     "0005_tenant_plans.py",
     "0006_user_invites_and_permission_overrides.py",
     "0007_portal_account_invites.py",
+    # Columns and indexes only — see test_migration_0008.py.
+    "0008_tenant_timezone_and_money_guards.py",
 )
 
 

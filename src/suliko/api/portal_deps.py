@@ -149,6 +149,7 @@ def get_tenant_sessions() -> TenantSessionFactory:
 PortalCaller = Annotated[PortalIdentity, Depends(get_portal_identity)]
 PortalFileCaller = Annotated[PortalIdentity, Depends(get_portal_file_identity)]
 PortalAdmin = Annotated[PortalIdentity, Depends(require_portal_admin)]
-PlatformDb = Annotated[AsyncSession, Depends(get_platform_db)]
+# Function scope for the same reason as `api.deps.Db`: commit before responding.
+PlatformDb = Annotated[AsyncSession, Depends(get_platform_db, scope="function")]
 TenantSessions = Annotated[TenantSessionFactory, Depends(get_tenant_sessions)]
 Drive = Annotated[DriveClient, Depends(get_drive_client)]

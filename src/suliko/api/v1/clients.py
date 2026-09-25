@@ -17,8 +17,10 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy import func, or_, select
+from sqlalchemy.sql import ColumnElement
 
 from suliko.api.deps import CurrentSession, Db, require
+from suliko.api.v1._shared import LIKE_ESCAPE, digits_of, like_pattern, phone_digits
 from suliko.core.errors import NotFoundError
 from suliko.models.directory import Client, ClientType
 from suliko.security.permissions import Permission
@@ -149,18 +151,22 @@ async def list_clients(
 ) -> ClientPage:
     stmt = select(Client)
 
-    if search:
+    if search and search.strip():
         # ILIKE with a leading wildcard cannot use a btree index. Fine at the
         # current scale (~700 clients per tenant); when it stops being fine,
         # the fix is a pg_trgm GIN index, not a different query.
-        pattern = f"%{search}%"
-        stmt = stmt.where(
-            or_(
-                Client.name.ilike(pattern),
-                Client.email.ilike(pattern),
-                Client.phone.ilike(pattern),
-            )
-        )
+        pattern = like_pattern(search)
+        conditions: list[ColumnElement[bool]] = [
+            Client.name.ilike(pattern, escape=LIKE_ESCAPE),
+            Client.email.ilike(pattern, escape=LIKE_ESCAPE),
+            Client.phone.ilike(pattern, escape=LIKE_ESCAPE),
+            Client.personal_number.ilike(pattern, escape=LIKE_ESCAPE),
+        ]
+        # Phones are stored as typed; "555 12 34 56" should find "555123456".
+        digits = digits_of(search)
+        if len(digits) >= 4:
+            conditions.append(phone_digits(Client.phone).like(f"%{digits}%"))
+        stmt = stmt.where(or_(*conditions))
 
     if client_type is not None:
         stmt = stmt.where(Client.client_type == client_type)
@@ -168,7 +174,13 @@ async def list_clients(
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
 
     column = Client.name if sort.lstrip("-") == "name" else Client.id
-    stmt = stmt.order_by(column.desc() if sort.startswith("-") else column.asc())
+    descending = sort.startswith("-")
+    # Id tie-break: two clients with the same name otherwise swap between
+    # pages, and one of them is never shown.
+    stmt = stmt.order_by(
+        column.desc() if descending else column.asc(),
+        Client.id.desc() if descending else Client.id.asc(),
+    )
 
     rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
 
@@ -176,6 +188,65 @@ async def list_clients(
         items=[_to_summary(c) for c in rows],
         meta=PageMeta(total=total, limit=limit, offset=offset),
     )
+
+
+class PossibleDuplicate(BaseModel):
+    id: int
+    name: str
+    client_type: ClientType
+    #: Which of the submitted details matched: "phone", "email", "personal_number".
+    matched_on: list[str]
+
+
+@router.get("/duplicates", response_model=list[PossibleDuplicate])
+async def possible_duplicates(
+    db: Db,
+    _: Annotated[object, Depends(require(Permission.CLIENTS_READ))],
+    phone: Annotated[str | None, Query(max_length=50)] = None,
+    email: Annotated[str | None, Query(max_length=255)] = None,
+    personal_number: Annotated[str | None, Query(max_length=50)] = None,
+    exclude_id: int | None = None,
+) -> list[PossibleDuplicate]:
+    """Existing clients sharing a phone, email or ID number.
+
+    For the new-client form's "this client may already exist" warning — the
+    PHP app had one, and without it the same person is entered twice and their
+    orders, payments and balance split across two records nobody reconciles.
+    A warning, not a refusal: two family members can share a phone.
+    """
+    checks: list[tuple[str, ColumnElement[bool]]] = []
+    digits = digits_of(phone or "")
+    if len(digits) >= 6:
+        # Compare the last 9 digits, so "+995 555 123 456" matches "555123456".
+        checks.append(("phone", phone_digits(Client.phone).like(f"%{digits[-9:]}")))
+    if email and email.strip():
+        checks.append(("email", func.lower(Client.email) == email.strip().lower()))
+    if personal_number and personal_number.strip():
+        checks.append(("personal_number", Client.personal_number == personal_number.strip()))
+    if not checks:
+        return []
+
+    stmt = select(Client).where(or_(*(condition for _, condition in checks)))
+    if exclude_id is not None:
+        stmt = stmt.where(Client.id != exclude_id)
+    rows = (await db.execute(stmt.order_by(Client.id).limit(10))).scalars().all()
+
+    out: list[PossibleDuplicate] = []
+    for row in rows:
+        matched: list[str] = []
+        row_digits = digits_of(row.phone or "")
+        if len(digits) >= 6 and row_digits.endswith(digits[-9:]):
+            matched.append("phone")
+        if email and (row.email or "").lower() == email.strip().lower():
+            matched.append("email")
+        if personal_number and row.personal_number == personal_number.strip():
+            matched.append("personal_number")
+        out.append(
+            PossibleDuplicate(
+                id=row.id, name=row.name, client_type=row.client_type, matched_on=matched
+            )
+        )
+    return out
 
 
 @router.get("/{client_id}", response_model=ClientDetail)

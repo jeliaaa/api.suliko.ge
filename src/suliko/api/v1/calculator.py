@@ -22,17 +22,12 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
 
 from suliko.api.deps import CurrentSession, Db, require
-from suliko.domain.plans import TenantPlan, pricing_for_plan
-from suliko.domain.pricing import (
-    DocumentPricingInput,
-    PricingConfig,
-    quote_order,
-)
+from suliko.core.errors import ValidationError
+from suliko.domain.pricing import DocumentPricingInput, quote_order
+from suliko.domain.pricing_context import load_pricing_context
 from suliko.models.order import CopyType, HandoverMethod, Urgency
-from suliko.models.reference import DocumentType, LanguagePairPrice, TenantSettings
 from suliko.security.permissions import Permission
 
 router = APIRouter(prefix="/calculator", tags=["calculator"])
@@ -48,6 +43,9 @@ class QuoteDocument(BaseModel):
     document_type_id: int
     page_count: int = Field(ge=1, le=10_000)
     copy_type: CopyType = CopyType.ORIGINAL
+    #: Overrides what the copy type implies — a notarised translation of an
+    #: original. None = derive from the copy type.
+    is_notarized: bool | None = None
 
 
 class QuoteRequest(BaseModel):
@@ -63,7 +61,8 @@ class QuoteLine(BaseModel):
     notary_cost: Decimal
     certification_cost: Decimal
     price: Decimal
-    translator_cost: Decimal
+    #: Null without `reports.profit`.
+    translator_cost: Decimal | None
     base_rate_per_page: Decimal
     document_type_multiplier: Decimal
     urgency_multiplier: Decimal
@@ -79,35 +78,12 @@ class QuoteResponse(BaseModel):
     documents_total: Decimal
     delivery_cost: Decimal
     total: Decimal
-    translator_cost_total: Decimal
+    #: Null without `reports.profit`. The notary cost stays: it is part of the
+    #: price the client is quoted, not the bureau's margin.
+    translator_cost_total: Decimal | None
     notary_cost_total: Decimal
-    gross_profit: Decimal
+    gross_profit: Decimal | None
     currency: str = "GEL"
-
-
-async def _pricing_config(db: Db, plan: TenantPlan) -> PricingConfig:
-    """Per-tenant multipliers, falling back to the documented defaults.
-
-    Then adjusted for the plan — see `domain/plans.pricing_for_plan`. Both
-    branches go through it, so a tenant with no settings row is not the one
-    case where a freelancer is charged a translator share.
-    """
-    settings = (await db.execute(select(TenantSettings))).scalars().first()
-    if settings is None:
-        return pricing_for_plan(PricingConfig.defaults(), plan)
-
-    return pricing_for_plan(
-        PricingConfig(
-            urgency_multipliers={
-                Urgency.STANDARD: Decimal(str(settings.urgency_multiplier_standard)),
-                Urgency.EXPRESS: Decimal(str(settings.urgency_multiplier_express)),
-                Urgency.URGENT: Decimal(str(settings.urgency_multiplier_urgent)),
-            },
-            delivery_fee=Decimal(str(settings.delivery_fee)),
-            translator_share=Decimal(str(settings.default_translator_share)),
-        ),
-        plan,
-    )
 
 
 @router.post("/quote", response_model=QuoteResponse)
@@ -117,42 +93,36 @@ async def quote(
     session: CurrentSession,
     __: Annotated[object, Depends(require(Permission.ORDERS_READ))],
 ) -> QuoteResponse:
-    config = await _pricing_config(db, session.plan)
-
-    # Load every rate and multiplier the request touches in two queries rather
-    # than one per line — a 50-document quote should not be 100 round trips.
-    pair_keys = {(d.source_language.lower(), d.target_language.lower()) for d in payload.documents}
-    rates = {
-        (row.source_language.lower(), row.target_language.lower()): Decimal(str(row.price_per_page))
-        for row in (
-            await db.execute(select(LanguagePairPrice).where(LanguagePairPrice.is_active))
-        ).scalars()
-        if (row.source_language.lower(), row.target_language.lower()) in pair_keys
-    }
-
     type_ids = {d.document_type_id for d in payload.documents}
-    multipliers = {
-        row.id: Decimal(str(row.price_multiplier))
-        for row in (
-            await db.execute(select(DocumentType).where(DocumentType.id.in_(type_ids)))
-        ).scalars()
-    }
+    # The same loader order creation uses, so the quote and the stored order
+    # cannot read the tenant's settings two different ways.
+    ctx = await load_pricing_context(db, session.plan, type_ids)
+    missing = type_ids - set(ctx.multipliers)
+    if missing:
+        # Creating the order would refuse these; quoting them at a made-up
+        # multiplier of 1.0 would show a price the order then cannot have.
+        raise ValidationError(f"Unknown document type(s): {sorted(missing)}")
 
     inputs = [
         DocumentPricingInput(
             page_count=d.page_count,
             # None when the pair is not configured — the engine then applies
             # its documented fallback and flags it rather than silently
-            # inventing a rate.
-            base_rate_per_page=rates.get((d.source_language.lower(), d.target_language.lower())),
-            document_type_multiplier=multipliers.get(d.document_type_id, Decimal("1.0")),
+            # inventing a rate. (Creating the order refuses it without a
+            # typed-in price.)
+            base_rate_per_page=ctx.rate(d.source_language, d.target_language),
+            document_type_multiplier=ctx.multipliers[d.document_type_id],
             copy_type=d.copy_type,
             urgency=payload.urgency,
+            is_notarized=d.is_notarized,
         )
         for d in payload.documents
     ]
 
-    result = quote_order(inputs, payload.handover_method, config)
+    result = quote_order(inputs, payload.handover_method, ctx.config)
+    # What the job would COST is margin, and staff without reports.profit do
+    # not see margins — the same rule the order endpoints apply.
+    show_costs = session.has(Permission.REPORTS_PROFIT)
 
     return QuoteResponse(
         documents=[
@@ -161,7 +131,7 @@ async def quote(
                 notary_cost=b.notary_cost,
                 certification_cost=b.certification_cost,
                 price=b.price,
-                translator_cost=b.translator_cost,
+                translator_cost=b.translator_cost if show_costs else None,
                 base_rate_per_page=b.base_rate_per_page,
                 document_type_multiplier=b.document_type_multiplier,
                 urgency_multiplier=b.urgency_multiplier,
@@ -174,7 +144,7 @@ async def quote(
         documents_total=result.documents_total,
         delivery_cost=result.delivery_cost,
         total=result.total,
-        translator_cost_total=result.translator_cost_total,
+        translator_cost_total=result.translator_cost_total if show_costs else None,
         notary_cost_total=result.notary_cost_total,
-        gross_profit=result.gross_profit,
+        gross_profit=result.gross_profit if show_costs else None,
     )

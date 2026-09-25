@@ -7,8 +7,10 @@ from suliko.api.v1 import (
     calculator,
     clients,
     companies,
+    exports,
     finances,
     integrations,
+    mfa,
     notaries,
     notifications,
     order_files,
@@ -27,6 +29,7 @@ from suliko.api.v1 import (
 
 api_router = APIRouter()
 api_router.include_router(auth.router)
+api_router.include_router(mfa.router)
 api_router.include_router(reference.router)
 api_router.include_router(clients.router)
 api_router.include_router(translators.router)
@@ -42,6 +45,7 @@ api_router.include_router(companies.router)
 api_router.include_router(companies.invoice_router)
 api_router.include_router(integrations.router)
 api_router.include_router(finances.router)
+api_router.include_router(exports.router)
 api_router.include_router(notifications.router)
 api_router.include_router(notifications.comments_router)
 api_router.include_router(service_pages.router)

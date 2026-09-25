@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from suliko.config import get_settings
 from suliko.db.tenancy import bypass_tenant_scope
 from suliko.domain.plans import TenantPlan, effective_permissions, effective_plan, parse
-from suliko.models.tenant import Tenant
+from suliko.models.tenant import DEFAULT_TIMEZONE, Tenant
 from suliko.models.user import MfaMethod, Role, User, UserPermissionOverride, UserSession
 from suliko.security.passwords import generate_token, hash_token
 from suliko.security.permissions import Permission
@@ -69,6 +69,12 @@ class AuthenticatedSession:
     permissions: frozenset[Permission]
     mfa_satisfied_at: datetime | None
     impersonated_by_user_id: int | None
+    #: The bureau's IANA zone, for every "today" question — see `domain.clock`.
+    #: Defaulted so a session built anywhere else (tests, tooling) still has a
+    #: sane answer.
+    timezone: str = DEFAULT_TIMEZONE
+    #: The bureau's default UI locale — for links built into its emails.
+    tenant_locale: str = "ka"
 
     @property
     def is_impersonated(self) -> bool:
@@ -243,6 +249,8 @@ async def resolve_session(db: AsyncSession, token: str) -> AuthenticatedSession 
             permissions=effective_permissions(user.role, plan, overrides),
             mfa_satisfied_at=user_session.mfa_satisfied_at,
             impersonated_by_user_id=user_session.impersonated_by_user_id,
+            timezone=tenant.timezone or DEFAULT_TIMEZONE,
+            tenant_locale=tenant.locale or "ka",
         )
 
 
