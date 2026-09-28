@@ -66,6 +66,19 @@ def test_session_resolution_rejects_a_suspended_tenant() -> None:
     )
 
 
+def test_session_resolution_reports_whether_the_email_is_verified() -> None:
+    """`AuthenticatedSession.email_verified` has to come from the user row
+    resolve_session already loaded, not be left at its dataclass default —
+    every session would otherwise report "not verified" regardless of
+    `users.email_verified_at`, and the banner would never go away."""
+    from suliko.security.sessions import resolve_session
+
+    source = inspect.getsource(resolve_session)
+    assert "email_verified=user.email_verified_at is not None" in source, (
+        "resolve_session no longer derives email_verified from the user row."
+    )
+
+
 def test_login_binds_the_tenant_guc_before_writing() -> None:
     """Login opens its session before it knows the tenant, so nothing has set
     ``suliko.tenant_id`` — the GUC the row-level-security policies read.

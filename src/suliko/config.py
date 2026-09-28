@@ -97,6 +97,18 @@ class Settings(BaseSettings):
     #: How long an invitation's set-your-password link stays usable.
     invite_link_ttl_hours: int = 168  # 7 days
 
+    #: How long a signup's email-confirmation link stays usable. Longer than
+    #: a password reset: nothing is blocked on it (see `api/v1/auth.py`), so
+    #: there is no urgency pushing the other way, and an owner who signs up
+    #: on a Friday should not come back Monday to a dead link.
+    email_verification_ttl_hours: int = 72
+    #: Resends per ACCOUNT per window. Authenticated — the caller already
+    #: holds a session for the account — so this bounds "click resend
+    #: repeatedly", not enumeration or third-party spam the way the anonymous
+    #: forgot-password limiter does.
+    email_verification_resend_max: int = 5
+    email_verification_resend_window_seconds: int = 3600  # 1 hour
+
     # ── Crypto ──────────────────────────────────────────────────────────────
     # Master key wrapping per-tenant data keys (envelope encryption).
     # Generate with:

@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from suliko.api.v1.auth import _reset_email
+from suliko.api.v1.auth import _reset_email, _verification_email
 from suliko.core import mail
 from suliko.models.tenant import Tenant, TenantStatus
 from suliko.models.user import Role, User
@@ -150,3 +150,44 @@ def test_the_reset_mail_never_carries_a_password() -> None:
 
     assert "SECRETHASH" not in body
     assert "argon2" not in body
+
+
+# ── What the verification mail says ─────────────────────────────────────────
+
+
+def test_the_verification_mail_carries_the_link_and_its_lifetime() -> None:
+    user, tenant = _people()
+    link = "https://app.suliko.ge/ka/verify-email?token=rst_abc"
+
+    subject, body = _verification_email(user, tenant, link, 72)
+
+    assert "confirm" in subject.lower()
+    assert link in body
+    assert "3 days" in body
+    assert tenant.display_name in body
+
+
+def test_the_verification_mail_says_nothing_is_blocked_on_it() -> None:
+    """Unlike a reset link, this one gates nothing — the account already
+    works. The mail should not read like a warning."""
+    user, tenant = _people()
+
+    _, body = _verification_email(user, tenant, "https://example.test/x", 72)
+
+    assert "on hold" in body.lower() or "not on hold" in body.lower()
+
+
+def test_the_verification_mail_never_carries_a_password() -> None:
+    user, tenant = _people()
+    user.password_hash = "$argon2id$v=19$m=65536,t=3,p=4$SECRETHASH"
+
+    _, body = _verification_email(user, tenant, "https://example.test/x", 72)
+
+    assert "SECRETHASH" not in body
+    assert "argon2" not in body
+
+
+def test_verification_ttl_under_a_day_is_shown_in_hours() -> None:
+    user, tenant = _people()
+    _, body = _verification_email(user, tenant, "https://example.test/x", 6)
+    assert "6 hours" in body

@@ -228,6 +228,8 @@ async def create_superuser(
                 password_hash=hash_password(password),
                 role=Role.SUPERUSER,
                 is_active=True,
+                # Created from a shell on the server itself.
+                email_verified_at=datetime.now(UTC),
             )
             db.add(user)
             await db.flush()

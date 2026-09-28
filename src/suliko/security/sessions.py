@@ -75,6 +75,12 @@ class AuthenticatedSession:
     timezone: str = DEFAULT_TIMEZONE
     #: The bureau's default UI locale — for links built into its emails.
     tenant_locale: str = "ka"
+    #: Whether `users.email_verified_at` is set. Computed once here rather
+    #: than re-read per page. Defaulted, like the two above, so a session
+    #: built anywhere else (tests, tooling) still has a sane answer — the
+    #: safe default for an unknown session is "not verified", not the
+    #: reverse. See `api/v1/auth.py`'s `POST /auth/verify-email`.
+    email_verified: bool = False
 
     @property
     def is_impersonated(self) -> bool:
@@ -251,6 +257,7 @@ async def resolve_session(db: AsyncSession, token: str) -> AuthenticatedSession 
             impersonated_by_user_id=user_session.impersonated_by_user_id,
             timezone=tenant.timezone or DEFAULT_TIMEZONE,
             tenant_locale=tenant.locale or "ka",
+            email_verified=user.email_verified_at is not None,
         )
 
 

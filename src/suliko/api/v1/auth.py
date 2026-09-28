@@ -482,10 +482,27 @@ async def _unique_slug(db: AsyncSession, name: str) -> str:
     raise ConflictError("Could not allocate an organisation handle. Try a different name.")
 
 
+def _verification_email(user: User, tenant: Tenant, link: str, ttl_hours: int) -> tuple[str, str]:
+    """Subject and plain-text body. No HTML — see core/mail.py."""
+    days = ttl_hours // 24
+    validity = f"{days} day{'s' if days != 1 else ''}" if days else f"{ttl_hours} hours"
+    body = (
+        f"Hello {user.full_name or user.username},\n\n"
+        f"Welcome to Suliko. Confirm this address to finish setting up "
+        f"{tenant.display_name}:\n\n{link}\n\n"
+        f"The link works once and expires in {validity}. Nothing about your "
+        f"account is on hold while you do this — it is only so we know this "
+        f"address is really yours.\n\n"
+        f"If you did not sign up for Suliko, you can ignore this email.\n"
+    )
+    return "Confirm your email for Suliko", body
+
+
 @router.post("/signup", response_model=SignupResponse, status_code=status.HTTP_201_CREATED)
 async def signup(
     payload: SignupRequest,
     request: Request,
+    background: BackgroundTasks,
     limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
 ) -> SignupResponse:
     """Create a new bureau and its owner, and sign them in.
@@ -576,6 +593,16 @@ async def signup(
             )
             user.last_login_at = datetime.now(UTC)
 
+            # Minted now so it commits atomically with the user it belongs to;
+            # sent below, after the commit — see the note on the same pattern
+            # in `forgot_password`.
+            verification_token = await reset_tokens.issue(
+                db,
+                user,
+                ttl_seconds=settings.email_verification_ttl_hours * 3600,
+                purpose=reset_tokens.EMAIL_VERIFICATION,
+            )
+
         from suliko.core.audit import record
 
         await record(
@@ -592,11 +619,136 @@ async def signup(
 
     log.info("tenant_signed_up", tenant_id=tenant_id, slug=slug)
 
+    # After the commit, same reasoning as `forgot_password`: a link that
+    # reaches an inbox before its row is durable is a link that does not
+    # work. Not gating anything on this succeeding — see `_verification_email`
+    # — so unlike that endpoint there is no timing side-channel to protect
+    # against and this can simply run as a background task.
+    link = (
+        f"{settings.app_url.rstrip('/')}/{tenant.locale}/verify-email"
+        f"?token={quote(verification_token, safe='')}"
+    )
+    subject, body = _verification_email(user, tenant, link, settings.email_verification_ttl_hours)
+    background.add_task(mail.send, user.email, subject, body)
+
     return SignupResponse(
         session_token=issued.token,
         tenant_slug=slug,
         username=username,
     )
+
+
+# ── Email verification ──────────────────────────────────────────────────────
+#
+#   POST /auth/verify-email          spend the signup link       (anonymous)
+#   POST /auth/verify-email/resend   mail a fresh one             (signed in)
+#
+# Nothing in the API refuses anything for want of this today — see the
+# docstring on `User.email_verified_at`. This pair exists so the frontend can
+# ask for it and mean it, not so a screen goes dark without it. Enforcing it
+# anywhere is a decision for later, made once, not implicitly by whichever
+# endpoint happens to check first.
+
+
+class VerifyEmailRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=200)
+
+
+class VerifyEmailResponse(BaseModel):
+    #: So the frontend can offer "sign in to <organisation>" — the browser
+    #: completing this is often not the one that is actually signed in (the
+    #: link was opened on a phone, say).
+    tenant_slug: str
+
+
+@router.post("/verify-email", response_model=VerifyEmailResponse)
+async def verify_email(payload: VerifyEmailRequest) -> VerifyEmailResponse:
+    """Spend a signup confirmation link.
+
+    Unauthenticated on purpose, like the password-reset endpoints: the token
+    alone proves the address, which is the entire point, and demanding a
+    session on top would fail for anyone who opened the link on a device they
+    are not signed in on.
+    """
+    async with get_sessionmaker()() as db:
+        user = await reset_tokens.consume(
+            db, payload.token, purpose=reset_tokens.EMAIL_VERIFICATION
+        )
+        if user is None:
+            # One message for expired, spent, forged and unknown alike — same
+            # reasoning as the password-reset endpoint.
+            raise ValidationError(
+                "This confirmation link is no longer valid. Sign in and ask "
+                "for a new one from your account page."
+            )
+
+        with bypass_tenant_scope():
+            if user.email_verified_at is None:
+                user.email_verified_at = datetime.now(UTC)
+            tenant = await db.get(Tenant, user.tenant_id)
+        assert tenant is not None
+        await db.flush()
+
+        from suliko.core.audit import record
+
+        await record(
+            db,
+            None,
+            action="user.email_verified",
+            entity_type="user",
+            entity_id=user.id,
+            tenant_id=user.tenant_id,
+        )
+        await db.commit()
+
+    log.info("email_verified", user_id=user.id, tenant_id=user.tenant_id)
+    return VerifyEmailResponse(tenant_slug=tenant.slug)
+
+
+@router.post("/verify-email/resend", status_code=status.HTTP_204_NO_CONTENT)
+async def resend_verification_email(
+    session: Annotated[AuthenticatedSession, Depends(get_current_session)],
+    db: Db,
+    limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
+) -> None:
+    """Mail a fresh confirmation link to the signed-in user's own address.
+
+    Never to an address the caller supplies — there is only "your own", which
+    is what makes this safe to leave unauthenticated-adjacent but still gate
+    on a session: no form field here is a way to make us mail a stranger.
+
+    A no-op, not an error, once already verified: the banner that offers this
+    button stops rendering at that point, but a stale tab or a double click
+    must not burn a rate-limit slot on nothing.
+    """
+    user = await db.get(User, session.user_id)
+    if user is None:
+        raise AuthenticationError("Your account is no longer available.")
+    if user.email_verified_at is not None:
+        return
+
+    account_key = f"emailverify:user:{user.id}"
+    if retry := await limiter.check_email_verification_resend(account_key):
+        raise RateLimitedError("Too many requests. Try again later.", retry_after=retry)
+    await limiter.record_email_verification_resend(account_key)
+
+    settings = get_settings()
+    token = await reset_tokens.issue(
+        db,
+        user,
+        ttl_seconds=settings.email_verification_ttl_hours * 3600,
+        purpose=reset_tokens.EMAIL_VERIFICATION,
+    )
+    tenant = await db.get(Tenant, user.tenant_id)
+    assert tenant is not None
+    link = (
+        f"{settings.app_url.rstrip('/')}/{tenant.locale}/verify-email"
+        f"?token={quote(token, safe='')}"
+    )
+    subject, body = _verification_email(user, tenant, link, settings.email_verification_ttl_hours)
+    # Inline, not backgrounded: this endpoint IS the "send it" action — there
+    # is no larger response the person is waiting on behind it, unlike signup.
+    await mail.send(user.email, subject, body)
 
 
 # ── Passwords ───────────────────────────────────────────────────────────────
@@ -770,6 +922,13 @@ async def reset_password(payload: ResetPasswordRequest, request: Request) -> Non
             # Leaving the flag set sent an invited user who reset instead of
             # using their one-time password straight into a second change.
             user.must_change_password = False
+            # Same proof an email-confirmation link is for: this link only
+            # ever reached them by arriving in this address's inbox. Covers
+            # an invited user (who never gets a separate verification email)
+            # and anyone who forgot their password before clicking the one
+            # from signup.
+            if user.email_verified_at is None:
+                user.email_verified_at = datetime.now(UTC)
         await db.flush()
         await revoke_all_for_user(db, user.id)
 
@@ -871,6 +1030,9 @@ class SessionInfo(BaseModel):
     timezone: str
     #: Whether this user has a confirmed second factor (Account screen).
     has_mfa: bool
+    #: Whether this address has been confirmed — drives the banner. Not
+    #: enforced anywhere yet; see the note above `POST /auth/verify-email`.
+    email_verified: bool
 
 
 @router.get("/session", response_model=SessionInfo)
@@ -901,6 +1063,7 @@ async def current_session(
         is_impersonated=session.is_impersonated,
         timezone=session.timezone,
         has_mfa=session.has_mfa,
+        email_verified=session.email_verified,
     )
 
 

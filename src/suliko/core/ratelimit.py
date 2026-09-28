@@ -158,6 +158,22 @@ class RateLimiter:
     async def record_invite(self, tenant_key: str) -> None:
         await self._hit_count(tenant_key, get_settings().invite_window_seconds)
 
+    # ── Email verification ──────────────────────────────────────────────────
+
+    async def check_email_verification_resend(self, account_key: str) -> int | None:
+        """Seconds to wait, or None. Keyed on the ACCOUNT: unlike the anonymous
+        forgot-password form, only someone already signed in as this user can
+        reach this endpoint at all, so there is no third party to spam and no
+        IP-side counter needed — only "stop mashing the button"."""
+        settings = get_settings()
+        window = settings.email_verification_resend_window_seconds
+        if await self._current(account_key, window) >= settings.email_verification_resend_max:
+            return window
+        return None
+
+    async def record_email_verification_resend(self, account_key: str) -> None:
+        await self._hit_count(account_key, get_settings().email_verification_resend_window_seconds)
+
     # ── Generic writes ──────────────────────────────────────────────────────
 
     async def check_write(self, key: str) -> int | None:

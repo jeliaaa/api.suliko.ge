@@ -82,6 +82,20 @@ class User(Base, IdMixin, TenantScoped, TimestampMixin):
         Boolean, default=False, server_default=false(), nullable=False
     )
 
+    #: NULL until the address is confirmed. Set once, opportunistically,
+    #: wherever proof of mailbox control happens: clicking the signup
+    #: confirmation link, or setting a password from an invite or a
+    #: forgot-password link — all three are "I received something sent to
+    #: this address". Never unset, and nothing here enforces anything on it;
+    #: see `api/v1/auth.py`'s `POST /auth/verify-email` for what does. Null
+    #: for every account that predates this column, and for a user an admin
+    #: created directly (`create_user` stamps it immediately instead — no
+    #: email loop happened there to prove, and there is no reason to nag a
+    #: trusted admin's own hire).
+    email_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+
     # Set when the user must re-authenticate everywhere: password change,
     # role change, offboarding. Sessions older than this are rejected, which
     # revokes them without a delete sweep.
@@ -237,6 +251,15 @@ class PasswordResetToken(Base, IdMixin, TenantScoped, TimestampMixin):
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    #: "password_reset" (forgot-password AND an invite's set-password link
+    #: both use this — the token proves the same thing for both) or
+    #: "email_verification". Kept apart so issuing one kind never spends an
+    #: outstanding link of the other — see `security/reset_tokens.py`.
+    #: `server_default` for the same reason `must_change_password` has one:
+    #: a fresh database and one migrated by revision 0009 must agree.
+    purpose: Mapped[str] = mapped_column(
+        String(20), default="password_reset", server_default="password_reset", nullable=False
+    )
 
 
 class LoginAttempt(Base, IdMixin, TimestampMixin):
