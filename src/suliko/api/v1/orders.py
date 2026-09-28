@@ -377,7 +377,6 @@ async def _changed_by_names(db: AsyncSession, user_ids: set[int]) -> dict[int, s
 # ── Endpoints ───────────────────────────────────────────────────────────────
 
 
-@router.get("", response_model=OrderPage)
 def list_extras(
     rows: list[tuple[int, str, str, str | None]],
 ) -> dict[int, tuple[list[str], list[str]]]:
@@ -416,6 +415,7 @@ async def _load_list_extras(
     return list_extras([(r[0], r[1], r[2], r[3]) for r in result.all()])
 
 
+@router.get("", response_model=OrderPage)
 async def list_orders(
     db: Db,
     session: OrdersReader,

@@ -192,3 +192,79 @@ async def test_tokens_are_unique_per_issue(db: AsyncSession) -> None:
     user = await _user(db)
     issued = {await reset_tokens.issue(db, user, ttl_seconds=HOUR) for _ in range(10)}
     assert len(issued) == 10
+
+
+async def test_a_new_user_starts_unverified(db: AsyncSession) -> None:
+    """The fixture builds a user the same way `POST /auth/signup` does — no
+    `email_verified_at` passed — so this pins the column's own default rather
+    than a value the test set up itself."""
+    assert (await _user(db)).email_verified_at is None
+
+
+# ── Purpose keeps kinds of token from clobbering each other ─────────────────
+#
+# The table now holds two unrelated errands: a password-reset (or invite)
+# link, and an email-verification link. See the module docstring.
+
+
+async def test_a_token_defaults_to_the_password_reset_purpose(db: AsyncSession) -> None:
+    await reset_tokens.issue(db, await _user(db), ttl_seconds=HOUR)
+    assert (await _rows(db))[0].purpose == reset_tokens.PASSWORD_RESET
+
+
+async def test_consuming_the_wrong_purpose_is_refused(db: AsyncSession) -> None:
+    """A verification link handed to the password-reset endpoint — or a
+    reset link handed to the verification one — must fail exactly like a
+    forged token, not succeed by accident because the hash matched."""
+    reset_token = await reset_tokens.issue(db, await _user(db), ttl_seconds=HOUR)
+    verify_token = await reset_tokens.issue(
+        db, await _user(db), ttl_seconds=HOUR, purpose=reset_tokens.EMAIL_VERIFICATION
+    )
+
+    assert await reset_tokens.consume(db, verify_token) is None
+    assert (
+        await reset_tokens.consume(db, reset_token, purpose=reset_tokens.EMAIL_VERIFICATION)
+        is None
+    )
+
+    # Each still works against its own purpose.
+    assert await reset_tokens.consume(db, reset_token) is not None
+    assert (
+        await reset_tokens.consume(db, verify_token, purpose=reset_tokens.EMAIL_VERIFICATION)
+        is not None
+    )
+
+
+async def test_issuing_one_purpose_does_not_invalidate_the_other(db: AsyncSession) -> None:
+    """Someone who requests a password reset while an email-confirmation link
+    is still outstanding must not silently lose the second one, and the
+    reverse — they are unrelated errands that happen to share a table."""
+    user = await _user(db)
+    verify_token = await reset_tokens.issue(
+        db, user, ttl_seconds=HOUR, purpose=reset_tokens.EMAIL_VERIFICATION
+    )
+    reset_token = await reset_tokens.issue(db, user, ttl_seconds=HOUR)
+
+    assert (
+        await reset_tokens.consume(db, verify_token, purpose=reset_tokens.EMAIL_VERIFICATION)
+        is not None
+    )
+    assert await reset_tokens.consume(db, reset_token) is not None
+
+
+async def test_a_second_link_of_the_same_purpose_still_kills_the_first(
+    db: AsyncSession,
+) -> None:
+    user = await _user(db)
+    first = await reset_tokens.issue(
+        db, user, ttl_seconds=HOUR, purpose=reset_tokens.EMAIL_VERIFICATION
+    )
+    second = await reset_tokens.issue(
+        db, user, ttl_seconds=HOUR, purpose=reset_tokens.EMAIL_VERIFICATION
+    )
+
+    assert await reset_tokens.consume(db, first, purpose=reset_tokens.EMAIL_VERIFICATION) is None
+    assert (
+        await reset_tokens.consume(db, second, purpose=reset_tokens.EMAIL_VERIFICATION)
+        is not None
+    )

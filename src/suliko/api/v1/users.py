@@ -702,6 +702,12 @@ async def create_user(
         # Somebody other than the account holder chose this password, exactly
         # as with an invite — so it is theirs to replace on first sign-in.
         must_change_password=True,
+        # No email loop happened to prove this address — an admin typed it —
+        # but that admin is already trusted with `users.manage` inside a
+        # tenant that is not a stranger's self-signup. Verification exists to
+        # slow down anonymous signup abuse, not to gatekeep a colleague an
+        # admin vouches for.
+        email_verified_at=datetime.now(UTC),
     )
     db.add(row)
     await db.flush()

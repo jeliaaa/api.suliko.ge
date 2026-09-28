@@ -19,7 +19,19 @@ to pay a KDF on the verification path.
 
 Requesting a second link must kill the first. Otherwise every request a user
 makes while flailing at a login screen leaves another live key to their
-account sitting in their inbox for an hour.
+account sitting in their inbox for an hour. Scoped to tokens of the SAME
+``purpose`` — see below — so unrelated errands do not clobber each other.
+
+## Purposes, one table
+
+Three things end up minting a row here — a forgot-password request, an
+invite's set-password link, and now a signup's email-confirmation link — and
+all of them are really the same proof, "this address received something we
+sent it". The first two are close enough (both end at `reset_password`
+setting a new one) that they share the ``password_reset`` purpose; email
+verification is a distinct errand with a distinct consumer, so it gets its
+own. A row's purpose is checked on issue (which outstanding tokens it may
+retire) and on consume (which token a caller's link may possibly be).
 """
 
 from __future__ import annotations
@@ -47,15 +59,28 @@ def _aware(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
-async def issue(db: AsyncSession, user: User, *, ttl_seconds: int) -> str:
-    """Mint a reset token for ``user`` and return the plaintext, once.
+#: Default purpose: a link that proves nothing but "I received mail sent to
+#: this address". A forgot-password request and an invite's set-password link
+#: are the same proof, so they share this one rather than each getting their
+#: own string to keep in sync.
+PASSWORD_RESET = "password_reset"  # noqa: S105 -- a token *purpose* label, not a secret
+EMAIL_VERIFICATION = "email_verification"
+
+
+async def issue(
+    db: AsyncSession, user: User, *, ttl_seconds: int, purpose: str = PASSWORD_RESET
+) -> str:
+    """Mint a token for ``user`` and return the plaintext, once.
 
     The caller is responsible for committing.
     """
     now = datetime.now(UTC)
 
-    # Spend every outstanding token for this user, so only the newest link
-    # works. Stamped rather than deleted: `used_at` is the audit trail of a
+    # Spend every outstanding token of the SAME purpose for this user, so only
+    # the newest link of that kind works. A verification link being issued
+    # must not silently kill an unrelated outstanding password-reset link, or
+    # the reverse — the two are unrelated errands that happen to share a
+    # table. Stamped rather than deleted: `used_at` is the audit trail of a
     # link having existed at all.
     with bypass_tenant_scope():
         outstanding = (
@@ -63,6 +88,7 @@ async def issue(db: AsyncSession, user: User, *, ttl_seconds: int) -> str:
                 await db.execute(
                     select(PasswordResetToken).where(
                         PasswordResetToken.user_id == user.id,
+                        PasswordResetToken.purpose == purpose,
                         PasswordResetToken.used_at.is_(None),
                     )
                 )
@@ -82,6 +108,7 @@ async def issue(db: AsyncSession, user: User, *, ttl_seconds: int) -> str:
                 user_id=user.id,
                 token_hash=hash_token(token),
                 expires_at=now + timedelta(seconds=ttl_seconds),
+                purpose=purpose,
             )
         )
         await db.flush()
@@ -89,18 +116,20 @@ async def issue(db: AsyncSession, user: User, *, ttl_seconds: int) -> str:
     return token
 
 
-async def consume(db: AsyncSession, token: str) -> User | None:
-    """Spend a token and return the user it belongs to, or None.
+async def consume(db: AsyncSession, token: str, *, purpose: str = PASSWORD_RESET) -> User | None:
+    """Spend a token of ``purpose`` and return the user it belongs to, or None.
 
     None covers every failure identically — unknown, already used, expired,
-    or belonging to a deactivated user. The caller cannot tell them apart and
-    must not: distinguishing "expired" from "never existed" tells an attacker
-    holding a stolen link whether it was ever real.
+    belonging to a deactivated user, or minted for a DIFFERENT purpose (a
+    password-reset link handed to the email-verification endpoint is just as
+    invalid as a forged one). The caller cannot tell these apart and must not:
+    distinguishing "expired" from "never existed" tells an attacker holding a
+    stolen link whether it was ever real.
 
-    Spending happens here, before the caller sets the password, so a token can
-    never be replayed even if the write that follows fails. Callers therefore
-    reject anything they can reject — a too-weak password, most obviously —
-    BEFORE calling this, or a typo costs the user another email.
+    Spending happens here, before the caller acts on it, so a token can never
+    be replayed even if the write that follows fails. Callers therefore reject
+    anything they can reject — a too-weak password, most obviously — BEFORE
+    calling this, or a typo costs the user another email.
     """
     now = datetime.now(UTC)
 
@@ -111,7 +140,12 @@ async def consume(db: AsyncSession, token: str) -> User | None:
             )
         ).scalar_one_or_none()
 
-        if row is None or row.used_at is not None or _aware(row.expires_at) <= now:
+        if (
+            row is None
+            or row.purpose != purpose
+            or row.used_at is not None
+            or _aware(row.expires_at) <= now
+        ):
             return None
 
         user = await db.get(User, row.user_id)
@@ -124,4 +158,4 @@ async def consume(db: AsyncSession, token: str) -> User | None:
     return user
 
 
-__all__ = ["consume", "issue"]
+__all__ = ["EMAIL_VERIFICATION", "PASSWORD_RESET", "consume", "issue"]

@@ -32,6 +32,8 @@ LATER_REVISIONS = (
     "0007_portal_account_invites.py",
     # Columns and indexes only — see test_migration_0008.py.
     "0008_tenant_timezone_and_money_guards.py",
+    # Columns only — see test_migration_0009.py.
+    "0009_email_verification.py",
 )
 
 

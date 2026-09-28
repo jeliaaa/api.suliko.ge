@@ -547,6 +547,9 @@ async def create_tenant_user(
             role=payload.role,
             is_active=True,
             must_change_password=True,
+            # Created directly by a platform operator — the most trusted path
+            # there is. See the same reasoning on `create_user`.
+            email_verified_at=datetime.now(UTC),
         )
         db.add(row)
         await db.flush()
