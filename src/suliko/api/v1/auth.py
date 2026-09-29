@@ -42,7 +42,7 @@ from suliko.core.errors import (
 from suliko.core.ratelimit import RateLimiter, get_rate_limiter
 from suliko.db.session import bind_tenant_guc, get_sessionmaker, session_scope
 from suliko.db.tenancy import bypass_tenant_scope, tenant_scope
-from suliko.domain.plans import effective_permissions, effective_plan
+from suliko.domain.plans import TenantPlan, effective_permissions, effective_plan
 from suliko.domain.reference_seed import seed_reference_data
 from suliko.models.reference import TenantSettings
 from suliko.models.tenant import Tenant, TenantStatus
@@ -482,6 +482,22 @@ async def _unique_slug(db: AsyncSession, name: str) -> str:
     raise ConflictError("Could not allocate an organisation handle. Try a different name.")
 
 
+class EmailTakenError(ConflictError):
+    error_code = "email_taken"
+
+
+def _existing_account(plan: str | None, display_name: str) -> dict[str, str]:
+    """How an account already holding a sign-up's address is described to it.
+
+    A bureau is named. A freelancer is not: their workspace is usually named
+    after the person, and "freelancer" already tells the visitor to sign in
+    instead. An unchosen plan counts as freelancer, as it is enforced.
+    """
+    if effective_plan(plan) is TenantPlan.BUREAU:
+        return {"kind": "bureau", "name": display_name}
+    return {"kind": "freelancer"}
+
+
 def _verification_email(user: User, tenant: Tenant, link: str, ttl_hours: int) -> tuple[str, str]:
     """Subject and plain-text body. No HTML — see core/mail.py."""
     days = ttl_hours // 24
@@ -535,6 +551,29 @@ async def signup(
     await limiter.record_signup(ip_key)
 
     async with get_sessionmaker()() as db:
+        # Across every organisation, not just the new (empty) one. Checked after
+        # `record_signup` so each probe of an address spends a sign-up attempt.
+        with bypass_tenant_scope():
+            holders = (
+                await db.execute(
+                    select(Tenant.plan, Tenant.display_name)
+                    .join(User, User.tenant_id == Tenant.id)
+                    .where(func.lower(User.email) == email)
+                    .order_by(Tenant.id)
+                )
+            ).all()
+        if holders:
+            accounts: list[dict[str, str]] = []
+            for plan, name in holders:
+                account = _existing_account(plan, name)
+                if account not in accounts:
+                    accounts.append(account)
+            labels = ", ".join(a.get("name", "Freelancer") for a in accounts)
+            raise EmailTakenError(
+                f"An account with this email already exists: {labels}.",
+                accounts=accounts,
+            )
+
         slug = await _unique_slug(db, payload.organisation_name)
 
         with bypass_tenant_scope():
