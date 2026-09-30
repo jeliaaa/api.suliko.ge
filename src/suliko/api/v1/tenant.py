@@ -12,11 +12,12 @@ while it holds, and the frontend sends the owner to the onboarding screen
 until they choose. There is no separate "has seen the tour" flag, because a
 plan that has been chosen is exactly the thing onboarding exists to produce.
 
-Changing plan later is allowed and is how a freelancer becomes a bureau. The
-other direction is closed to owners (2026-09-30): an organisation on the
-Bureau plan stays a bureau, and freelance work belongs in the person's own
-personal account (`tenants.is_personal`), which may still move either way.
-The platform admin can still change any tenant's plan.
+Owners can change very little here now (2026-09-30). An organisation on the
+Bureau plan stays a bureau, and the personal account (`tenants.is_personal`)
+stays Freelancer: a freelancer who wants a team creates a bureau from the
+account switcher rather than converting their own workspace. What is left is
+the onboarding choice after sign-up, and a Freelancer-plan organisation moving
+up to Bureau. The platform admin can still change any tenant's plan.
 """
 
 from __future__ import annotations
@@ -70,15 +71,24 @@ class BureauPlanLockedError(ConflictError):
     error_code = "bureau_plan_locked"
 
 
+class PersonalPlanLockedError(ConflictError):
+    error_code = "personal_plan_locked"
+
+
 def bureau_stays_bureau(tenant: Tenant, wanted: TenantPlan) -> bool:
     """True when this change is refused: an organisation on the Bureau plan
-    moving to Freelancer. The personal account is exempt — it is the
-    freelancer's own place, and may try the Bureau plan and come back."""
+    moving to Freelancer. Freelance work belongs in the personal account."""
     return (
         not tenant.is_personal
         and parse(tenant.plan) is TenantPlan.BUREAU
         and wanted is TenantPlan.FREELANCER
     )
+
+
+def personal_stays_freelancer(tenant: Tenant, wanted: TenantPlan) -> bool:
+    """True when this change is refused: the personal account leaving the
+    Freelancer plan. A team gets its own bureau, from the account switcher."""
+    return tenant.is_personal and wanted is not TenantPlan.FREELANCER
 
 
 class PlanChoice(BaseModel):
@@ -140,6 +150,11 @@ async def choose_plan(
         raise NotFoundError("Tenant not found.")
 
     before = current.plan
+    if personal_stays_freelancer(current, payload.plan):
+        raise PersonalPlanLockedError(
+            "Your personal account stays on the Freelancer plan. "
+            "To work with a team, create a bureau from the account switcher."
+        )
     if bureau_stays_bureau(current, payload.plan):
         raise BureauPlanLockedError(
             "A bureau cannot switch to the Freelancer plan. "
