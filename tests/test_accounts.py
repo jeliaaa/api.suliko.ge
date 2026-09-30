@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
@@ -18,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from suliko.core.errors import ValidationError
 from suliko.db.base import Base
-from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter
+from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
 from suliko.domain.accounts import (
     UNUSABLE_PASSWORD_HASH,
     create_bureau,
@@ -30,7 +31,13 @@ from suliko.domain.accounts import (
 )
 from suliko.models.reference import DocumentType, Language, LanguagePairPrice, TenantSettings
 from suliko.models.tenant import Tenant, TenantStatus
-from suliko.models.user import Account, Role, User
+from suliko.models.user import (
+    Account,
+    MfaMethod,
+    Role,
+    User,
+    UserPermissionOverride,
+)
 from suliko.security import login_tickets
 from suliko.security.passwords import verify_password
 
@@ -42,6 +49,8 @@ TABLES = [
     Language.__table__,
     DocumentType.__table__,
     LanguagePairPrice.__table__,
+    MfaMethod.__table__,
+    UserPermissionOverride.__table__,
 ]
 
 NINO = 1
@@ -75,7 +84,9 @@ async def db() -> AsyncIterator[AsyncSession]:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as conn:
         await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=TABLES))
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+    # autoflush off, as in production (db/session.py): nothing is written
+    # before an explicit flush or the commit, which is what the tenant guard sees.
+    maker = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
     async with maker() as session:
         with bypass_tenant_scope():
             for tenant_id, slug, status in (
@@ -275,6 +286,40 @@ async def test_a_bureau_needs_a_name(db: AsyncSession) -> None:
     account = await _nobody(db)
     with pytest.raises(ValidationError):
         await create_bureau(db, account, "   x  ")
+
+
+# ── Switching organisation ──────────────────────────────────────────────────
+
+
+async def test_switching_writes_nothing_to_another_organisation_at_commit(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`/auth/switch` runs bound to the organisation being LEFT and commits
+    after `_start_session`. Everything written for the target must already be
+    flushed inside the target's scope, or the tenant guard refuses the commit
+    (production, 2026-09-30: "Refusing to modify User belonging to tenant 10
+    while acting as tenant 5")."""
+    from suliko.api.v1 import auth
+
+    # `user_sessions` has an INET column SQLite cannot create (see
+    # test_tenant_access.py); the session row is not what this is about.
+    async def fake_session(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(token="t")
+
+    monkeypatch.setattr(auth, "create_session", fake_session)
+
+    account = await db.get(Account, NINO)
+    assert account is not None
+    target = next(m for m in await memberships(db, NINO) if m.tenant.id == OTHER)
+
+    with tenant_scope(BUREAU):
+        response = await auth._start_session(db, target, account, ip=None, user_agent=None)
+        await db.commit()
+
+    assert response.tenant_slug == "beta"
+    with bypass_tenant_scope():
+        await db.refresh(target.user)
+    assert target.user.last_login_at is not None
 
 
 # ── Signing out everywhere ──────────────────────────────────────────────────

@@ -433,6 +433,11 @@ async def _start_session(
                 )
             ).scalars()
         }
+        # Written HERE, inside this membership's scope. On `/auth/switch` the
+        # request is bound to the organisation being LEFT, and the commit runs
+        # after this block — a `last_login_at` still pending then is a write to
+        # another tenant's row, and the tenant guard (rightly) refuses it.
+        await db.flush()
     account.last_login_at = now
 
     return LoginResponse(
