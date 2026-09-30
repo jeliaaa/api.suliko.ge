@@ -231,6 +231,10 @@ class Settings(BaseSettings):
     #: Interface language a self-signed-up bureau starts in. Georgian, because
     #: that is who this is sold to; they can change it in Settings.
     default_signup_locale: str = "ka"
+    #: Self sign-up (`POST /auth/signup`). Off: for now people join by an
+    #: organisation's invitation, and anyone can open a personal account from
+    #: the sign-in chooser once they have one (decided 2026-09-30).
+    signup_enabled: bool = False
     api_v1_prefix: str = "/api/v1"
 
     @field_validator("database_url")

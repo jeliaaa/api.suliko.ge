@@ -17,7 +17,7 @@ import pytest
 from suliko.api.v1.auth import _reset_email, _verification_email
 from suliko.core import mail
 from suliko.models.tenant import Tenant, TenantStatus
-from suliko.models.user import Role, User
+from suliko.models.user import Account, Role, User
 
 
 def _configure(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> None:
@@ -127,26 +127,33 @@ def _people() -> tuple[User, Tenant]:
     return user, tenant
 
 
+def _account() -> Account:
+    return Account(
+        email="nino@acme.ge",
+        full_name="Nino Beridze",
+        password_hash="$argon2id$v=19$m=65536,t=3,p=4$SECRETHASH",
+    )
+
+
 def test_the_reset_mail_carries_the_link_and_its_lifetime() -> None:
-    user, tenant = _people()
+    account = _account()
     link = "https://app.suliko.ge/ka/reset-password?token=rst_abc"
 
-    subject, body = _reset_email(user, tenant, link, 60)
+    subject, body = _reset_email(account, link, 60)
 
     assert "password" in subject.lower()
     assert link in body
     assert "1 hour" in body
-    assert tenant.display_name in body
+    assert account.email in body
+    # One password for every organisation — the mail says so.
+    assert "every organisation" in body
     # Says what to do if it wasn't you, because most recipients of an
     # unexpected reset mail did not ask for it.
     assert "ignore" in body.lower()
 
 
 def test_the_reset_mail_never_carries_a_password() -> None:
-    user, tenant = _people()
-    user.password_hash = "$argon2id$v=19$m=65536,t=3,p=4$SECRETHASH"
-
-    _, body = _reset_email(user, tenant, "https://example.test/x", 60)
+    _, body = _reset_email(_account(), "https://example.test/x", 60)
 
     assert "SECRETHASH" not in body
     assert "argon2" not in body

@@ -60,7 +60,7 @@ STATUS_DEFINITIONS: MappingProxyType[str, StatusDefinition] = MappingProxyType(
         "sent to custom recipient": StatusDefinition("Sent to Custom Recipient", T.INFO),
         "reviewed": StatusDefinition("Reviewed", T.NEW),
         "ready_for_pickup": StatusDefinition("Ready for Pickup", T.PICKUP),
-        "completed": StatusDefinition("Completed", T.SUCCESS),
+        "completed": StatusDefinition("Delivered", T.SUCCESS),
         "cancelled": StatusDefinition("Cancelled", T.NEUTRAL),
     }
 )
@@ -74,6 +74,19 @@ EXCLUDED_FROM_AGGREGATES: frozenset[str] = frozenset({"cancelled", "rejected"})
 CLOSED_STATUSES: frozenset[str] = frozenset({"completed", "cancelled", "rejected"})
 
 INITIAL_STATUS = "new"
+
+#: What an order can be moved TO, in the order a person works through them.
+#: Everything else in STATUS_DEFINITIONS is history: stored on older orders
+#: and shown as it was, but no longer offered. A bureau adds its own on top
+#: (``custom_options``, list ``order_status``). Twin of the TypeScript list.
+SELECTABLE_STATUSES: tuple[str, ...] = (
+    "new",
+    "confirmed",
+    "sent to the translator",
+    "being notarised",
+    "ready_for_pickup",
+    "completed",
+)
 
 
 def sql_values(statuses: frozenset[str]) -> tuple[str, ...]:
@@ -107,6 +120,10 @@ def get_tone(status: str | None) -> StatusTone:
 
 def is_known(status: str | None) -> bool:
     return normalise(status) in STATUS_DEFINITIONS
+
+
+def is_selectable(status: str | None) -> bool:
+    return normalise(status) in SELECTABLE_STATUSES
 
 
 def is_closed(status: str | None) -> bool:

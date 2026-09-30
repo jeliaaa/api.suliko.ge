@@ -56,7 +56,13 @@ from suliko.models.portal import (
 )
 from suliko.models.reference import DocumentType
 from suliko.models.tenant import Tenant, TenantStatus
-from suliko.models.user import PasswordResetToken, Role, User, UserPermissionOverride
+from suliko.models.user import (
+    Account,
+    PasswordResetToken,
+    Role,
+    User,
+    UserPermissionOverride,
+)
 from suliko.security.permissions import permissions_for_role
 from suliko.security.portal_tokens import sign_token
 from suliko.security.sessions import AuthenticatedSession
@@ -89,6 +95,8 @@ MODELS = [
     DriveSettings,
     OrderDriveFolder,
     OrderDocumentDriveFolder,
+    # Before User: a membership points at the person's account.
+    Account,
     User,
     UserPermissionOverride,
     # An invite is a set-password link now: the reset-token row it spends.
@@ -1483,28 +1491,68 @@ async def test_staff_invite_with_no_match_is_pending_and_emails_the_registration
     # A single-use, expiring set-password link — and no password. The old
     # one-time password stayed valid in the inbox until someone changed it.
     assert "/reset-password?token=" in body
-    assert "&invite=1&org=acme" in body
+    assert "&invite=1" in body
+    assert result.existing_account is False
     assert "Password:" not in body
     assert result.invite_link in body
     assert "one_time_password" not in users_api.InviteOut.model_fields
 
 
-async def test_created_user_has_no_suliko_account(
-    maker: async_sessionmaker[AsyncSession],
+async def test_inviting_an_existing_account_waits_for_acceptance(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
 ) -> None:
-    """`POST /users` never asks suliko.ge anything — the admin chose the
-    password directly, which is the whole difference from an invite."""
+    """One password per person: an invitation never touches it. The
+    membership is pending — invisible to sign-in — until they accept from the
+    email (decided 2026-09-30)."""
     from suliko.api.v1 import users as users_api
 
-    payload = users_api.UserCreate(
-        username="direct",
-        email="direct@example.com",
-        full_name="Direct Hire",
-        password="a-very-long-password-1",
+    async with maker() as db:
+        account = Account(
+            email="nino@example.com", full_name="Nino Beridze", password_hash="$their-own$"
+        )
+        db.add(account)
+        await db.commit()
+        account_id = account.id
+
+    payload = users_api.UserInvite(
+        full_name="Nino Beridze", email="Nino@Example.com", role=Role.STAFF
     )
     with tenant_scope(ACME):
         async with maker() as db:
             session = _admin_session(ACME)
-            result = await users_api.create_user(payload, db, session, session)
+            result = await users_api.invite_user(payload, db, session, session, RateLimiter(None))
+            await db.commit()
 
-    assert result.suliko_account is None
+    assert result.existing_account is True
+    assert result.user.invitation_pending is True
+    body = sent_mail[-1]["body"]
+    assert "/accept-invite?token=" in body
+    assert "/reset-password" not in body
+
+    async with maker() as db:
+        account = await db.get(Account, account_id)
+        assert account is not None
+        assert account.password_hash == "$their-own$"
+        with tenant_scope(ACME):
+            row = (
+                await db.execute(select(User).where(User.account_id == account_id))
+            ).scalar_one()
+        assert row.invitation_pending is True
+
+
+async def test_the_same_person_cannot_be_invited_twice(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
+) -> None:
+    from suliko.api.v1 import users as users_api
+    from suliko.core.errors import ConflictError
+
+    payload = users_api.UserInvite(full_name="Twice", email="twice@example.com", role=Role.STAFF)
+    with tenant_scope(ACME):
+        async with maker() as db:
+            session = _admin_session(ACME)
+            await users_api.invite_user(payload, db, session, session, RateLimiter(None))
+            await db.commit()
+        async with maker() as db:
+            session = _admin_session(ACME)
+            with pytest.raises(ConflictError, match="already been invited"):
+                await users_api.invite_user(payload, db, session, session, RateLimiter(None))

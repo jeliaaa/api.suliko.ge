@@ -175,11 +175,21 @@ def test_an_invite_never_logs_the_password() -> None:
     assert "one_time_password" not in after
 
 
-def test_an_invited_account_must_change_its_password() -> None:
+def test_an_invitation_sets_no_password_anyone_knows() -> None:
     """Otherwise the inviter keeps a working credential for someone else's
-    account indefinitely."""
-    assert "must_change_password=True" in _source("invite_user")
+    account. A new person's account gets a random hash nobody holds; the
+    membership row gets none at all, and waits to be accepted."""
+    source = _source("invite_user")
+    assert "password_hash=await hash_password_async(generate_token())" in source
+    assert "password_hash=UNUSABLE_PASSWORD_HASH" in source
+    assert "invitation_pending=True" in source
 
 
-def test_an_admin_reset_also_forces_a_change() -> None:
-    assert "must_change_password = True" in _source("reset_password")
+def test_an_organisation_cannot_set_anyones_password() -> None:
+    """The password belongs to the person's account, shared by every
+    organisation they are in; a bureau able to set it could reach the others."""
+    from suliko.api.v1 import users
+
+    assert not hasattr(users, "reset_password")
+    assert not hasattr(users, "create_user")
+    assert not any("password" in route.path for route in users.router.routes)

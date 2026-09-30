@@ -67,16 +67,22 @@ def test_session_resolution_rejects_a_suspended_tenant() -> None:
 
 
 def test_session_resolution_reports_whether_the_email_is_verified() -> None:
-    """`AuthenticatedSession.email_verified` has to come from the user row
-    resolve_session already loaded, not be left at its dataclass default —
-    every session would otherwise report "not verified" regardless of
-    `users.email_verified_at`, and the banner would never go away."""
+    """`AuthenticatedSession.email_verified` has to come from the person's
+    account (their address, not the organisation's row) rather than be left at
+    its dataclass default — every session would otherwise report "not
+    verified" and the banner would never go away."""
     from suliko.security.sessions import resolve_session
 
     source = inspect.getsource(resolve_session)
-    assert "email_verified=user.email_verified_at is not None" in source, (
-        "resolve_session no longer derives email_verified from the user row."
-    )
+    assert "account.email_verified_at if account else user.email_verified_at" in source
+    assert "email_verified=email_verified" in source
+    assert "account_id=user.account_id" in source
+
+
+def test_a_pending_invitation_cannot_hold_a_session() -> None:
+    from suliko.security.sessions import resolve_session
+
+    assert "user.invitation_pending" in inspect.getsource(resolve_session)
 
 
 def test_login_binds_the_tenant_guc_before_writing() -> None:
@@ -90,11 +96,14 @@ def test_login_binds_the_tenant_guc_before_writing() -> None:
     """
     source = (SRC / "api" / "v1" / "auth.py").read_text(encoding="utf-8")
 
-    login = source.split("async def login(")[1].split("\n@router")[0]
-    assert "bind_tenant_guc" in login, (
-        "login() no longer binds the tenant GUC. Its tenant-scoped inserts "
-        "will fail under row-level security."
+    # The session row is written once an organisation is picked — sign-in's
+    # second step and the switcher both go through `_start_session`.
+    start = source.split("async def _start_session(")[1].split("\n@router")[0]
+    assert "bind_tenant_guc" in start, (
+        "_start_session() no longer binds the tenant GUC. Its tenant-scoped "
+        "inserts will fail under row-level security."
     )
+    assert start.index("bind_tenant_guc") < start.index("create_session(")
 
 
 def test_issuing_a_reset_token_binds_the_tenant_guc() -> None:

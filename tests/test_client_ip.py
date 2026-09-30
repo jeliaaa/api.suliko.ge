@@ -86,13 +86,14 @@ def test_garbage_everywhere_falls_back_to_the_peer(gateway_secret: str) -> None:
     assert deps.get_client_ip(request) == "10.0.0.9"
 
 
-def test_sign_in_ignores_the_case_of_the_organisation_and_username() -> None:
-    """Slugs are stored lower-case and usernames are email addresses."""
-    source = inspect.getsource(auth.login)
-    assert "payload.tenant_slug.strip().lower()" in source
-    assert "func.lower(User.username) == username.lower()" in source
-    forgot = inspect.getsource(auth.forgot_password)
-    assert "payload.tenant_slug.strip().lower()" in forgot
+def test_sign_in_ignores_the_case_of_the_email() -> None:
+    """Sign-in and "forgot password" take an email, which means nothing in
+    upper case; both compare it normalised."""
+    assert "normalise_email(payload.email)" in inspect.getsource(auth.login)
+    assert "normalise_email(payload.email)" in inspect.getsource(auth.forgot_password)
+    from suliko.domain.accounts import normalise_email
+
+    assert normalise_email("  Nino@Mail.GE ") == "nino@mail.ge"
 
 
 def test_the_reset_email_is_sent_after_the_response() -> None:

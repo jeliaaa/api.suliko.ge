@@ -106,15 +106,18 @@ def test_router_protects_the_last_owner() -> None:
         )
 
 
-def test_role_change_and_password_reset_revoke_sessions() -> None:
+def test_role_change_and_password_changes_revoke_sessions() -> None:
     """A demotion that only takes effect at next login is not a demotion —
-    the user keeps their old permissions for up to the session lifetime."""
+    the user keeps their old permissions for up to the session lifetime. And
+    a password is the account's, so changing or resetting it signs the person
+    out of every organisation, not just the one it was done from."""
     import inspect
 
-    from suliko.api.v1 import users
+    from suliko.api.v1 import auth, users
 
     assert "revoke_all_for_user" in inspect.getsource(users.update_user)
-    assert "revoke_all_for_user" in inspect.getsource(users.reset_password)
+    assert "revoke_account_sessions" in inspect.getsource(auth.reset_password)
+    assert "revoke_account_sessions" in inspect.getsource(auth.change_password)
 
 
 def test_password_hash_is_never_returned() -> None:

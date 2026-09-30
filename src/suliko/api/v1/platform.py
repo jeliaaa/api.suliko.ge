@@ -68,12 +68,13 @@ from suliko.core.errors import (
 )
 from suliko.db.session import bind_tenant_guc
 from suliko.db.tenancy import bypass_tenant_scope, tenant_scope
+from suliko.domain.accounts import UNUSABLE_PASSWORD_HASH, find_account
 from suliko.domain.plans import TenantPlan, effective_plan
 from suliko.models.drive import DriveSettings
 from suliko.models.order import Order, OrderDocument
 from suliko.models.reference import Language, LanguagePairPrice
 from suliko.models.tenant import Tenant, TenantStatus
-from suliko.models.user import Role, User
+from suliko.models.user import Account, Role, User
 from suliko.security.passwords import (
     generate_one_time_password,
     hash_password_async,
@@ -189,7 +190,10 @@ class PlatformUserCreated(BaseModel):
     #: operator creating an account for a bureau hands the credentials over
     #: directly, and mailing them to an address the operator typed would be
     #: sending a working password to whoever that turns out to be.
-    one_time_password: str
+    #:
+    #: None when the address already had an account: the membership is added
+    #: to it and they sign in with the password they already have.
+    one_time_password: str | None
 
 
 class StatusChange(BaseModel):
@@ -530,7 +534,23 @@ async def create_tenant_user(
     if clash:
         raise ConflictError("That email already has an account in this organisation.")
 
-    one_time_password = generate_one_time_password()
+    # One password per person: an existing account keeps its own and simply
+    # gains this membership; only a brand-new one gets a one-time password.
+    account = await find_account(db, email)
+    one_time_password: str | None = None
+    if account is None:
+        one_time_password = generate_one_time_password()
+        account = Account(
+            email=email,
+            password_hash=await hash_password_async(one_time_password),
+            full_name=payload.full_name.strip(),
+            must_change_password=True,
+            # Created directly by a platform operator — the most trusted path
+            # there is; no email loop to prove.
+            email_verified_at=datetime.now(UTC),
+        )
+        db.add(account)
+        await db.flush()
 
     # The GUC and the ORM stamp both point at the TARGET tenant, not the
     # operator's own. Binding them together is what stops a row landing in the
@@ -539,16 +559,14 @@ async def create_tenant_user(
     with tenant_scope(tenant_id):
         row = User(
             tenant_id=tenant_id,
+            account_id=account.id,
             username=username,
             email=email,
             full_name=payload.full_name.strip(),
             position=(payload.position or "").strip() or None,
-            password_hash=await hash_password_async(one_time_password),
+            password_hash=UNUSABLE_PASSWORD_HASH,
             role=payload.role,
             is_active=True,
-            must_change_password=True,
-            # Created directly by a platform operator — the most trusted path
-            # there is. See the same reasoning on `create_user`.
             email_verified_at=datetime.now(UTC),
         )
         db.add(row)

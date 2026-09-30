@@ -9,7 +9,7 @@ from __future__ import annotations
 import enum
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, String
+from sqlalchemy import Boolean, DateTime, Enum, String, false
 from sqlalchemy.orm import Mapped, mapped_column
 
 from suliko.db.base import Base, IdMixin, TimestampMixin, enum_values
@@ -62,6 +62,12 @@ class Tenant(Base, IdMixin, TimestampMixin):
         nullable=False,
     )
     suspended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    #: A person's own freelancer workspace — the "Personal account" in the
+    #: sign-in chooser. Created on first pick (`domain.accounts`), owned by
+    #: exactly that person, never a bureau somebody else can be invited to.
+    is_personal: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
 
     @property
     def is_usable(self) -> bool:

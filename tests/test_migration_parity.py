@@ -34,6 +34,9 @@ LATER_REVISIONS = (
     "0008_tenant_timezone_and_money_guards.py",
     # Columns only — see test_migration_0009.py.
     "0009_email_verification.py",
+    "0010_custom_options.py",
+    # `accounts` is built by 0001 on a fresh database — see test_migration_0011.py.
+    "0011_accounts.py",
 )
 
 

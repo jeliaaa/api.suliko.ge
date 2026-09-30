@@ -59,8 +59,9 @@ def test_resend_is_rate_limited_per_account_before_it_sends() -> None:
 
 
 def test_resend_does_nothing_once_already_verified() -> None:
+    """Verified is the account's state, which the session already carries."""
     source = inspect.getsource(auth.resend_verification_email)
-    assert "email_verified_at is not None" in source
+    assert "if session.email_verified:" in source
 
 
 def test_reset_password_also_marks_the_email_verified() -> None:
@@ -68,8 +69,8 @@ def test_reset_password_also_marks_the_email_verified() -> None:
     verification email of their own — see the comment in `reset_password`
     for why this has to be here and not only in `verify_email`."""
     source = inspect.getsource(auth.reset_password)
-    assert "user.email_verified_at is None" in source
-    assert "user.email_verified_at = datetime.now(UTC)" in source
+    assert "account.email_verified_at is None" in source
+    assert "account.email_verified_at = now" in source
 
 
 def test_the_invite_flow_does_not_pre_mark_verified() -> None:
@@ -82,12 +83,10 @@ def test_the_invite_flow_does_not_pre_mark_verified() -> None:
     assert "email_verified_at" not in construction
 
 
-def test_admin_created_accounts_start_verified() -> None:
-    """No email loop happens for these three — an admin, a platform operator,
-    or whoever has shell access on the box typed the address directly — so
-    there is nothing to nag them to confirm."""
-    for source in (
-        inspect.getsource(users.create_user),
-        inspect.getsource(platform.create_tenant_user),
-    ):
-        assert "email_verified_at=datetime.now(UTC)" in source
+def test_operator_created_accounts_start_verified() -> None:
+    """No email loop happens when a platform operator creates an account —
+    they typed the address directly — so there is nothing to confirm. A
+    bureau can no longer create accounts at all; it invites."""
+    source = inspect.getsource(platform.create_tenant_user)
+    assert "email_verified_at=datetime.now(UTC)" in source
+    assert not hasattr(users, "create_user")

@@ -10,10 +10,14 @@ several rules are enforced that are not obvious from the data model:
   tenant is left with nobody who can administer it.
 - `superuser` cannot be granted here at all — it is platform-level and is
   created out-of-band by the CLI.
-- A role change or a password reset revokes that user's sessions, so a
-  demotion takes effect immediately rather than at their next login.
+- A role change revokes that user's sessions, so a demotion takes effect
+  immediately rather than at their next login.
 
-Password hashes are never returned, and never accepted from the client.
+A row here is a person's MEMBERSHIP of this organisation. Their password,
+sign-in address and verified email belong to their account
+(`models.user.Account`), which an organisation can neither set nor change —
+people are added by invitation (`POST /users/invite`) and look after their
+own password.
 """
 
 from __future__ import annotations
@@ -41,6 +45,12 @@ from suliko.core.errors import (
     ValidationError,
 )
 from suliko.core.ratelimit import RateLimiter, get_rate_limiter
+from suliko.domain.accounts import (
+    UNUSABLE_PASSWORD_HASH,
+    find_account,
+    normalise_email,
+    username_for,
+)
 from suliko.domain.plans import (
     NON_OVERRIDABLE,
     TenantPlan,
@@ -50,12 +60,11 @@ from suliko.domain.plans import (
 )
 from suliko.domain.portal import account_matches, normalize_email, normalize_phone, registration_url
 from suliko.models.portal import InviteKind, InviteStatus, PortalAccountInvite, PortalTranslator
-from suliko.models.user import Role, User, UserPermissionOverride
+from suliko.models.user import Account, Role, User, UserPermissionOverride
 from suliko.security import reset_tokens
 from suliko.security.passwords import (
     generate_token,
     hash_password_async,
-    validate_password_strength,
 )
 from suliko.security.permissions import Permission, permissions_for_role
 from suliko.security.sessions import revoke_all_for_user
@@ -76,20 +85,12 @@ RANK: dict[Role, int] = {
 }
 
 
-class UserCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    username: str = Field(min_length=3, max_length=100, pattern=r"^[a-zA-Z0-9._-]+$")
-    email: EmailStr
-    full_name: str = Field(min_length=1, max_length=255)
-    password: str = Field(min_length=12, max_length=1024)
-    role: Role = Role.STAFF
-
-
 class UserUpdate(BaseModel):
+    """What this organisation decides about a member. Not their email — that
+    is their account's sign-in address, which only they change."""
+
     model_config = ConfigDict(extra="forbid")
 
-    email: EmailStr | None = None
     full_name: str | None = Field(default=None, min_length=1, max_length=255)
     position: str | None = Field(default=None, max_length=100)
     phone: str | None = Field(default=None, max_length=50)
@@ -137,25 +138,18 @@ class SulikoAccountOut(BaseModel):
 
 class InviteOut(BaseModel):
     user: UserOut
-    #: The set-your-own-password link, shown to the inviter ONCE.
-    #:
-    #: Returned so a bounced or delayed email is not a dead end: the inviter
-    #: can pass the link on themselves. It grants them nothing new (they can
-    #: already set this person's password through `POST /users/{id}/password`)
-    #: and, unlike the one-time password it replaces, it works once and
-    #: expires — a password in an inbox stayed valid until someone changed it.
+    #: The link the email carries, shown to the inviter ONCE so a bounced email
+    #: is not a dead end: "accept" for someone who already has an account,
+    #: "choose your password" for someone who does not. Single-use, expiring.
     invite_link: str
+    #: The address already had an account: the membership waits for them to
+    #: accept, and their existing password is unchanged.
+    existing_account: bool
     invite_expires_at: datetime
     #: Whether the email actually left. False is not an error: the account
     #: exists either way, and the link above is the fallback.
     email_sent: bool
     suliko_account: SulikoAccountOut
-
-
-class PasswordReset(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    password: str = Field(min_length=12, max_length=1024)
 
 
 class UserOut(BaseModel):
@@ -167,18 +161,18 @@ class UserOut(BaseModel):
     phone: str | None
     role: Role
     is_active: bool
-    #: Still on the password they were handed. Shown on the Users screen as
-    #: "invited" — an account in this state has never been used.
+    #: Invited and not yet accepted (or, for a new person, no password set
+    #: yet). Shown on the Users screen as "invited".
     must_change_password: bool
+    invitation_pending: bool
     #: What this person may ACTUALLY do: role, then their overrides, then the
     #: tenant's plan. Not the role's bundle — that would show the owner a list
     #: the API does not agree with.
     permissions: list[str]
     last_login_at: datetime | None
     created_at: datetime
-    #: Null for anyone created through `POST /users` — nobody ever asked
-    #: suliko.ge about them. Everyone invited through `POST /users/invite` has
-    #: one, `linked` or `pending`.
+    #: Null for anyone added before invitations asked suliko.ge about them.
+    #: Everyone invited through `POST /users/invite` has one.
     suliko_account: SulikoAccountOut | None
 
 
@@ -202,7 +196,8 @@ def _out(
         phone=row.phone,
         role=row.role,
         is_active=row.is_active,
-        must_change_password=row.must_change_password,
+        must_change_password=row.invitation_pending or row.must_change_password,
+        invitation_pending=row.invitation_pending,
         permissions=sorted(p.value for p in effective_permissions(row.role, plan, overrides)),
         last_login_at=row.last_login_at,
         created_at=row.created_at,
@@ -441,26 +436,50 @@ async def list_users(
     )
 
 
-@router.get("/{user_id}", response_model=UserOut)
-async def get_user(
-    user_id: int,
+class AccountLookup(BaseModel):
+    """What the invite form's search box learns about an address."""
+
+    #: A Suliko account uses this address.
+    exists: bool
+    #: Their name, so the inviter can tell they found the right person.
+    full_name: str | None
+    #: Already a member here — or invited and not yet accepted.
+    member: bool
+    pending: bool
+
+
+@router.get("/lookup", response_model=AccountLookup)
+async def lookup_account(
     db: Db,
     session: CurrentSession,
     _: Annotated[object, Depends(require(Permission.USERS_MANAGE))],
-) -> UserOut:
-    row = await db.get(User, user_id)
-    if row is None:
-        raise NotFoundError("User not found.")
-    overrides = (await _overrides_for(db, [row.id])).get(row.id, {})
-    suliko_account = (await _invite_status_for(db, [row.id])).get(row.id)
-    return _out(row, session.plan, overrides, suliko_account)
+    email: Annotated[EmailStr, Query()],
+) -> AccountLookup:
+    """Search for a person to invite, by email.
+
+    Behind `users.manage`, like the invite it leads to: it tells an
+    organisation's administrator whether someone has an account, which is the
+    whole point of searching before inviting.
+    """
+    account = await find_account(db, str(email))
+    if account is None:
+        return AccountLookup(exists=False, full_name=None, member=False, pending=False)
+    row = (
+        await db.execute(select(User).where(User.account_id == account.id).limit(1))
+    ).scalar_one_or_none()
+    return AccountLookup(
+        exists=True,
+        full_name=account.full_name,
+        member=row is not None and not row.invitation_pending,
+        pending=row is not None and row.invitation_pending,
+    )
 
 
 def _suliko_account_paragraph(*, linked: bool, matched_display_name: str | None) -> str:
-    """The one paragraph `_invite_email` gains for this feature.
+    """The one paragraph the invitation email gains for suliko.ge.
 
-    Placed right after the sign-in credentials: how to get into THIS account,
-    then what suliko.ge account this address is also expected to have.
+    What suliko.ge account this address is also expected to have, after the
+    part about getting into THIS organisation.
     """
     if linked:
         matched = f" ({matched_display_name})" if matched_display_name else ""
@@ -477,11 +496,11 @@ def _suliko_account_paragraph(*, linked: bool, matched_display_name: str | None)
 def _invite_email(
     user: User,
     tenant_name: str,
-    tenant_slug: str,
     invite_link: str,
     inviter: str,
     valid_days: int,
     *,
+    existing_account: bool,
     suliko_account: SulikoAccountOut,
 ) -> tuple[str, str]:
     """Subject and plain-text body. Everything they need in one message."""
@@ -489,19 +508,28 @@ def _invite_email(
         linked=suliko_account.status == "linked",
         matched_display_name=suliko_account.matched_display_name,
     )
+    if existing_account:
+        how = (
+            f"Accept the invitation here:\n\n{invite_link}\n\n"
+            f"The link works once and expires in {valid_days} days. Then sign in "
+            f"as usual with {user.email} and your own password, and choose "
+            f"{tenant_name}.\n\n"
+        )
+    else:
+        how = (
+            f"Choose your password here:\n\n{invite_link}\n\n"
+            f"The link works once and expires in {valid_days} days. After that, "
+            f"sign in with {user.email} and that password, and choose {tenant_name}.\n\n"
+        )
     body = (
         f"Hello {user.full_name},\n\n"
-        f"{inviter} has added you to {tenant_name} on Suliko.\n\n"
-        f"Choose your password here:\n\n{invite_link}\n\n"
-        f"The link works once and expires in {valid_days} days. After that, "
-        "sign in with:\n\n"
-        f"  Organisation: {tenant_slug}\n"
-        f"  Username:     {user.username}\n\n"
+        f"{inviter} has invited you to {tenant_name} on Suliko.\n\n"
+        f"{how}"
         f"{account_paragraph}\n"
         f"If you were not expecting this, tell {tenant_name} and ignore the "
-        "message; nobody can use the account without the link above.\n"
+        "message; nothing happens without the link above.\n"
     )
-    return f"You have been added to {tenant_name} on Suliko", body
+    return f"You have been invited to {tenant_name} on Suliko", body
 
 
 @router.post("/invite", response_model=InviteOut, status_code=http_status.HTTP_201_CREATED)
@@ -512,17 +540,14 @@ async def invite_user(
     _: Annotated[object, Depends(require(Permission.USERS_MANAGE))],
     limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
 ) -> InviteOut:
-    """Add someone to the bureau and email them a way in.
+    """Invite someone into the organisation.
 
-    The difference from `POST /users` is who chooses the password. Here the
-    invitee does: the account is created with a password nobody knows, and the
-    email carries a single-use, expiring set-password link (the reset-token
-    machinery, with a longer life). Nothing that works as a credential sits in
-    an inbox indefinitely, and nobody else ever knows the password.
-
-    The username is the email address, matching sign-up. Both are unique per
-    tenant, so the clash below is a genuine "already invited", not a
-    collision with another bureau.
+    Someone who already has an account gets a pending membership and an
+    accept link; their password stays theirs. Someone who does not gets an
+    account with no usable password and a single-use set-password link — using
+    it both sets the password and accepts. Either way the membership is
+    invisible to sign-in until they act on the email, and nobody but them
+    ever knows their password.
     """
     _guard_assignable(session.role, payload.role)
 
@@ -533,19 +558,34 @@ async def invite_user(
             retry_after=retry,
         )
 
-    email = str(payload.email).strip().lower()
-    username = email if len(email) <= 100 else email.split("@")[0][:100]
+    email = normalise_email(str(payload.email))
+    username = username_for(email)
+    account = await find_account(db, email)
 
     clash = (
-        (await db.execute(select(User).where(or_(User.username == username, User.email == email))))
+        (
+            await db.execute(
+                select(User).where(
+                    or_(
+                        func.lower(User.username) == username,
+                        func.lower(User.email) == email,
+                        *([User.account_id == account.id] if account else []),
+                    )
+                )
+            )
+        )
         .scalars()
         .first()
     )
     if clash:
-        raise ConflictError("Somebody with that email is already in this organisation.")
+        raise ConflictError(
+            "This person has already been invited."
+            if clash.invitation_pending
+            else "This person is already in this organisation."
+        )
 
-    # Validated before the row is written, so a rejected permission does not
-    # leave a half-created account behind.
+    # Validated before anything is written, so a rejected permission does not
+    # leave a half-created membership behind.
     requested = (
         _requested_permissions(payload.permissions, session.plan)
         if payload.permissions is not None
@@ -553,20 +593,29 @@ async def invite_user(
     )
     _guard_grantable(session, requested)
 
-    # A password nobody knows, so the account is unusable until the link is.
-    unusable_password = generate_token()
+    existing_account = account is not None
+    if account is None:
+        # Nobody knows this password — the set-password link replaces it.
+        account = Account(
+            email=email,
+            password_hash=await hash_password_async(generate_token()),
+            full_name=payload.full_name.strip(),
+        )
+        db.add(account)
+        await db.flush()
 
     phone = (payload.phone or "").strip() or None
     row = User(
+        account_id=account.id,
         username=username,
         email=email,
         full_name=payload.full_name.strip(),
         position=(payload.position or "").strip() or None,
         phone=phone,
-        password_hash=await hash_password_async(unusable_password),
+        password_hash=UNUSABLE_PASSWORD_HASH,
         role=payload.role,
         is_active=True,
-        must_change_password=True,
+        invitation_pending=True,
     )
     db.add(row)
     await db.flush()
@@ -575,9 +624,9 @@ async def invite_user(
 
     # Whether this address (or phone) belongs to a suliko.ge account — see
     # `domain.portal.account_matches`. A CRM login is not the suliko.ge
-    # portal, so a match is recorded, not acted on: no directory row, no
-    # `PortalTranslatorLink`. `db` doubles as the platform session here for
-    # the same reason `api/v1/translators.py` documents at its invite route.
+    # portal, so a match is recorded, not acted on. `db` doubles as the
+    # platform session here for the same reason `api/v1/translators.py`
+    # documents at its invite route.
     matches = await account_matches(db, phone=phone, email=email)
     matched_display_name: str | None = None
     invite = PortalAccountInvite(
@@ -592,9 +641,9 @@ async def invite_user(
         invited_by_user_id=session.user_id,
     )
     if len(matches) == 1:
-        account, _reason = matches[0]
-        matched_display_name = account.display_name
-        invite.portal_translator_id = account.id
+        portal_account, _reason = matches[0]
+        matched_display_name = portal_account.display_name
+        invite.portal_translator_id = portal_account.id
         invite.status = InviteStatus.LINKED
         invite.resolved_at = datetime.now(UTC)
     else:
@@ -615,31 +664,34 @@ async def invite_user(
         action="user.invited",
         entity_type="user",
         entity_id=row.id,
-        # The password is not passed in. `redact` would strip it, but the
-        # safest way to keep a secret out of a log is not to hand it over.
         after={
             "username": username,
             "role": payload.role.value,
             "position": row.position,
             "permissions": sorted(p.value for p in requested),
+            "existing_account": existing_account,
             "suliko_account_status": suliko_account.status,
         },
     )
 
     settings = get_settings()
     ttl_seconds = settings.invite_link_ttl_hours * 3600
-    token = await reset_tokens.issue(db, row, ttl_seconds=ttl_seconds)
-    invite_link = (
-        f"{settings.app_url.rstrip('/')}/{session.tenant_locale}/reset-password"
-        f"?token={quote(token, safe='')}&invite=1&org={quote(session.tenant_slug, safe='')}"
-    )
+    base = f"{settings.app_url.rstrip('/')}/{session.tenant_locale}"
+    if existing_account:
+        token = await reset_tokens.issue(
+            db, row, ttl_seconds=ttl_seconds, purpose=reset_tokens.INVITATION
+        )
+        invite_link = f"{base}/accept-invite?token={quote(token, safe='')}"
+    else:
+        token = await reset_tokens.issue(db, row, ttl_seconds=ttl_seconds)
+        invite_link = f"{base}/reset-password?token={quote(token, safe='')}&invite=1"
     subject, body = _invite_email(
         row,
         session.tenant_name,
-        session.tenant_slug,
         invite_link,
         session.full_name,
         max(1, settings.invite_link_ttl_hours // 24),
+        existing_account=existing_account,
         suliko_account=suliko_account,
     )
     await limiter.record_invite(tenant_key)
@@ -649,80 +701,26 @@ async def invite_user(
     return InviteOut(
         user=_out(row, session.plan, overrides, suliko_account),
         invite_link=invite_link,
+        existing_account=existing_account,
         invite_expires_at=datetime.now(UTC) + timedelta(seconds=ttl_seconds),
         email_sent=result.delivered,
         suliko_account=suliko_account,
     )
 
 
-@router.post("", response_model=UserOut, status_code=http_status.HTTP_201_CREATED)
-async def create_user(
-    payload: UserCreate,
+@router.get("/{user_id}", response_model=UserOut)
+async def get_user(
+    user_id: int,
     db: Db,
     session: CurrentSession,
     _: Annotated[object, Depends(require(Permission.USERS_MANAGE))],
 ) -> UserOut:
-    _guard_assignable(session.role, payload.role)
-    # The new account starts with the role's whole bundle. Without this, an
-    # admin whose owner revoked, say, `finance.refund` could mint a fresh
-    # admin with a password of their own choosing and have it back.
-    _guard_grantable(
-        session, permissions_for_role(payload.role) & permissions_for_plan(session.plan)
-    )
-
-    problems = validate_password_strength(payload.password)
-    if problems:
-        raise ValidationError(" ".join(problems))
-
-    username = payload.username.lower()
-    email = str(payload.email).strip().lower()
-    clash = (
-        (
-            await db.execute(
-                select(User).where(
-                    or_(func.lower(User.username) == username, func.lower(User.email) == email)
-                )
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if clash:
-        # Not an enumeration risk: only users.manage reaches this, and they can
-        # already list everyone.
-        raise ConflictError("That username or email is already in use.")
-
-    row = User(
-        username=username,
-        email=email,
-        full_name=payload.full_name,
-        password_hash=await hash_password_async(payload.password),
-        role=payload.role,
-        is_active=True,
-        # Somebody other than the account holder chose this password, exactly
-        # as with an invite — so it is theirs to replace on first sign-in.
-        must_change_password=True,
-        # No email loop happened to prove this address — an admin typed it —
-        # but that admin is already trusted with `users.manage` inside a
-        # tenant that is not a stranger's self-signup. Verification exists to
-        # slow down anonymous signup abuse, not to gatekeep a colleague an
-        # admin vouches for.
-        email_verified_at=datetime.now(UTC),
-    )
-    db.add(row)
-    await db.flush()
-
-    from suliko.core.audit import record
-
-    await record(
-        db,
-        session,
-        action="user.created",
-        entity_type="user",
-        entity_id=row.id,
-        after={"username": payload.username, "role": payload.role.value},
-    )
-    return _out(row, session.plan, {})
+    row = await db.get(User, user_id)
+    if row is None:
+        raise NotFoundError("User not found.")
+    overrides = (await _overrides_for(db, [row.id])).get(row.id, {})
+    suliko_account = (await _invite_status_for(db, [row.id])).get(row.id)
+    return _out(row, session.plan, overrides, suliko_account)
 
 
 @router.patch("/{user_id}", response_model=UserOut)
@@ -741,25 +739,13 @@ async def update_user(
     changes = payload.model_dump(exclude_unset=True)
     # `permissions` is not a column; it is handled separately below.
     permissions = changes.pop("permissions", None)
-    if changes.get("email") is not None:
-        changes["email"] = str(changes["email"]).strip().lower()
     before = {k: getattr(row, k) for k in changes}
 
     role_changed = "role" in changes and changes["role"] != row.role
     deactivating = changes.get("is_active") is False and row.is_active
-    email_changed = "email" in changes and changes["email"] != row.email
 
     if deactivating and row.id == session.user_id:
         raise ValidationError("You cannot deactivate your own account. Ask another administrator.")
-
-    if email_changed:
-        clash = await db.scalar(
-            select(func.count())
-            .select_from(User)
-            .where(func.lower(User.email) == changes["email"], User.id != row.id)
-        )
-        if clash:
-            raise ConflictError("Somebody in this organisation already uses that email.")
 
     # What they can do today, before anything below changes it — the baseline
     # for "what is this edit granting?" and "what may the editor not touch?".
@@ -811,11 +797,11 @@ async def update_user(
         requested = (requested & held) | (set(current_effective) - held)
         await _write_overrides(db, row, requested, plan=session.plan)
 
-    # A demotion, a deactivation, an access change or a new sign-in address
-    # must bite immediately, not at next login — the session carries a
-    # permission set built at resolve time, and leaving it alone would let the
-    # old one stand for up to the idle timeout.
-    if role_changed or deactivating or email_changed or permissions is not None:
+    # A demotion, a deactivation or an access change must bite immediately, not
+    # at next login — the session carries a permission set built at resolve
+    # time, and leaving it alone would let the old one stand for up to the
+    # idle timeout.
+    if role_changed or deactivating or permissions is not None:
         await revoke_all_for_user(db, row.id)
 
     from suliko.core.audit import record
@@ -832,45 +818,6 @@ async def update_user(
     overrides = (await _overrides_for(db, [row.id])).get(row.id, {})
     suliko_account = (await _invite_status_for(db, [row.id])).get(row.id)
     return _out(row, session.plan, overrides, suliko_account)
-
-
-@router.post("/{user_id}/password", status_code=http_status.HTTP_204_NO_CONTENT)
-async def reset_password(
-    user_id: int,
-    payload: PasswordReset,
-    db: Db,
-    session: CurrentSession,
-    _: Annotated[object, Depends(require(Permission.USERS_MANAGE))],
-) -> None:
-    """Set another user's password.
-
-    Every session of theirs is revoked: if this is being used because an
-    account was compromised, leaving the attacker's session alive would defeat
-    the point.
-    """
-    row = await db.get(User, user_id)
-    if row is None:
-        raise NotFoundError("User not found.")
-    # Setting someone's password IS signing in as them, so this is the
-    # takeover path the rank guard exists for.
-    _guard_target(session, row)
-
-    problems = validate_password_strength(payload.password)
-    if problems:
-        raise ValidationError(" ".join(problems))
-
-    row.password_hash = await hash_password_async(payload.password)
-    # Somebody else chose it, so somebody else knows it. Same flag the invite
-    # sets: they can sign in, and the only thing they can do is replace it.
-    row.must_change_password = True
-    await db.flush()
-    await revoke_all_for_user(db, row.id)
-
-    from suliko.core.audit import record
-
-    # The password itself is never logged — core.crypto.redact would strip it,
-    # but it is simply not passed in the first place.
-    await record(db, session, action="user.password_reset", entity_type="user", entity_id=row.id)
 
 
 @router.delete("/{user_id}/mfa", status_code=http_status.HTTP_204_NO_CONTENT)

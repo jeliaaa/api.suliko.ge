@@ -78,6 +78,16 @@ def _tenant_key(tenant_id: int) -> bytes:
     ).digest()
 
 
+def purpose_key(purpose: str) -> bytes:
+    """A key for one platform-level purpose (signing login tickets), derived
+    from the master key the same way `_tenant_key` derives a tenant's."""
+    return hashlib.blake2b(
+        f"purpose:{purpose}".encode(),
+        key=_master_key(),
+        digest_size=KEY_BYTES,
+    ).digest()
+
+
 def encrypt_for_tenant(tenant_id: int, plaintext: str) -> bytes:
     """Encrypt a secret. Output is ``nonce || ciphertext || tag``."""
     aes = AESGCM(_tenant_key(tenant_id))

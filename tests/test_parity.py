@@ -83,7 +83,9 @@ def test_status_labels_and_tones_match() -> None:
 
 
 @requires_frontend
-@pytest.mark.parametrize("name", ["EXCLUDED_FROM_AGGREGATES", "CLOSED_STATUSES"])
+@pytest.mark.parametrize(
+    "name", ["EXCLUDED_FROM_AGGREGATES", "CLOSED_STATUSES", "SELECTABLE_STATUSES"]
+)
 def test_status_sets_match(name: str) -> None:
     """Which statuses count as money and which as open. A mismatch shows one
     number on the dashboard board and another in the figures above it."""

@@ -35,11 +35,12 @@ from suliko.config import get_settings
 from suliko.core.crypto import encrypt_for_tenant
 from suliko.db.session import bind_tenant_guc, dispose_engine, get_engine, get_sessionmaker
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
+from suliko.domain.accounts import UNUSABLE_PASSWORD_HASH, find_account, normalise_email
 from suliko.domain.reference_seed import seed_reference_data
 from suliko.models.directory import Client, ClientType  # noqa: F401 — registry
 from suliko.models.reference import TenantSettings
 from suliko.models.tenant import Tenant, TenantStatus
-from suliko.models.user import MfaMethod, MfaRecoveryCode, Role, User
+from suliko.models.user import Account, MfaMethod, MfaRecoveryCode, Role, User
 from suliko.security import totp as totp_service
 from suliko.security.passwords import hash_password, hash_token, validate_password_strength
 
@@ -218,17 +219,29 @@ async def create_superuser(
             if clash:
                 raise SystemExit(f"User {username!r} already exists in tenant {tenant_slug!r}.")
 
-            if password is None:
-                password = _prompt_password()
+            # One password per person: an existing account keeps its own.
+            account = await find_account(db, email)
+            if account is None:
+                if password is None:
+                    password = _prompt_password()
+                account = Account(
+                    email=normalise_email(email),
+                    password_hash=hash_password(password),
+                    full_name=full_name,
+                    # Created from a shell on the server itself.
+                    email_verified_at=datetime.now(UTC),
+                )
+                db.add(account)
+                await db.flush()
 
             user = User(
+                account_id=account.id,
                 username=username,
-                email=email,
+                email=normalise_email(email),
                 full_name=full_name,
-                password_hash=hash_password(password),
+                password_hash=UNUSABLE_PASSWORD_HASH,
                 role=Role.SUPERUSER,
                 is_active=True,
-                # Created from a shell on the server itself.
                 email_verified_at=datetime.now(UTC),
             )
             db.add(user)

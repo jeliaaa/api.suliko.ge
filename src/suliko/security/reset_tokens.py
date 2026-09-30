@@ -65,6 +65,8 @@ def _aware(value: datetime) -> datetime:
 #: own string to keep in sync.
 PASSWORD_RESET = "password_reset"  # noqa: S105 -- a token *purpose* label, not a secret
 EMAIL_VERIFICATION = "email_verification"
+#: An organisation's invitation to someone who already has an account.
+INVITATION = "invitation"
 
 
 async def issue(
@@ -158,4 +160,4 @@ async def consume(db: AsyncSession, token: str, *, purpose: str = PASSWORD_RESET
     return user
 
 
-__all__ = ["EMAIL_VERIFICATION", "PASSWORD_RESET", "consume", "issue"]
+__all__ = ["EMAIL_VERIFICATION", "INVITATION", "PASSWORD_RESET", "consume", "issue"]

@@ -19,14 +19,21 @@ from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from suliko.api.deps import Db, require
 from suliko.domain.clock import today_in
 from suliko.domain.pricing_context import due_days_from_settings
 from suliko.models.order import CopyType, HandoverMethod, Urgency
-from suliko.models.reference import DocumentType, Language, LanguagePairPrice, TenantSettings
+from suliko.models.reference import (
+    CustomOption,
+    DocumentType,
+    Language,
+    LanguagePairPrice,
+    OptionList,
+    TenantSettings,
+)
 from suliko.security.permissions import Permission
 from suliko.security.sessions import AuthenticatedSession
 
@@ -77,6 +84,10 @@ class ReferenceData(BaseModel):
     #: The bureau's calendar date now, for date defaults on forms. The
     #: browser's own clock is in whatever zone the laptop is set to.
     today: date | None = None
+    #: The bureau's own additions to these dropdowns. The built-in values are
+    #: the frontend's, so they can be translated; these are shown as typed.
+    acquisition_sources: list[str] = Field(default_factory=list)
+    custom_statuses: list[str] = Field(default_factory=list)
 
 
 @router.get("", response_model=ReferenceData)
@@ -127,7 +138,14 @@ async def get_reference(
     delivery_fee = Decimal(str(settings.delivery_fee)) if settings else Decimal("10")
     due_days = due_days_from_settings(settings)
 
+    custom: dict[str, list[str]] = {OptionList.ACQUISITION_SOURCE: [], OptionList.ORDER_STATUS: []}
+    options = select(CustomOption.list_key, CustomOption.value).order_by(CustomOption.id)
+    for list_key, value in (await db.execute(options)).all():
+        custom.setdefault(list_key, []).append(value)
+
     return ReferenceData(
+        acquisition_sources=custom[OptionList.ACQUISITION_SOURCE],
+        custom_statuses=custom[OptionList.ORDER_STATUS],
         languages=languages,
         document_types=document_types,
         language_pairs=language_pairs,
@@ -173,16 +191,14 @@ async def get_reference(
             ),
         ],
         copy_types=[
+            EnumOption(value=CopyType.PLAIN.value, label="Plain copy", notarized=False),
             EnumOption(value=CopyType.ORIGINAL.value, label="Original document", notarized=False),
-            EnumOption(value=CopyType.PLAIN.value, label="Photocopy", notarized=False),
+            EnumOption(value=CopyType.NOTARY_COPY.value, label="Plain copy", notarized=True),
             EnumOption(
                 value=CopyType.NOTARY_ORIGINAL.value, label="Notary on original", notarized=True
             ),
-            EnumOption(value=CopyType.NOTARY_COPY.value, label="Notary on copy", notarized=True),
             EnumOption(
-                value=CopyType.NOTARY_CERTIFIED.value,
-                label="Certified copy (notarised)",
-                notarized=True,
+                value=CopyType.NOTARY_CERTIFIED.value, label="Certified copy", notarized=True
             ),
         ],
     )

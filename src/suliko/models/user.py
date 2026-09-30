@@ -36,6 +36,35 @@ class Role(enum.StrEnum):
     STAFF = "staff"
 
 
+class Account(Base, IdMixin, TimestampMixin):
+    """A person: one email, one password, any number of organisations.
+
+    Platform-level on purpose — no ``tenant_id``, no row-level security —
+    because sign-in has to find it before any organisation is known, exactly
+    like ``tenants`` itself. Each organisation the person belongs to is a
+    ``users`` row pointing here, carrying that organisation's role and
+    permissions; the password lives only here, so an organisation can never
+    set or know it.
+    """
+
+    __tablename__ = "accounts"
+    __table_args__ = (UniqueConstraint("email", name="uq_accounts_email"),)
+
+    #: Stored lower-case: the address a person types is compared as such.
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    full_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    #: The password came from somebody else — an invite's set-password step
+    #: not yet taken. Every membership is gated on it (`get_authenticated_session`).
+    must_change_password: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
+    email_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
 class User(Base, IdMixin, TenantScoped, TimestampMixin):
     __tablename__ = "users"
     __table_args__ = (
@@ -101,6 +130,19 @@ class User(Base, IdMixin, TenantScoped, TimestampMixin):
     # revokes them without a delete sweep.
     sessions_invalid_before: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
+    )
+
+    #: The person this membership belongs to. Their password, name and
+    #: verified address are the account's; this row is what they are in THIS
+    #: organisation. Null only for a row the accounts migration could not
+    #: pair (no email) — such a row cannot sign in.
+    account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("accounts.id", ondelete="RESTRICT"), default=None, index=True
+    )
+    #: Invited, not yet accepted. A pending membership does not appear in the
+    #: sign-in chooser or the switcher and cannot hold a session.
+    invitation_pending: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
     )
 
     def __repr__(self) -> str:

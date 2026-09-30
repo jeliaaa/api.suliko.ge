@@ -95,6 +95,8 @@ LATER_REVISION_TABLES = frozenset(
         "user_permission_overrides",
         # 0007
         "portal_account_invites",
+        # 0010
+        "custom_options",
     }
 )
 

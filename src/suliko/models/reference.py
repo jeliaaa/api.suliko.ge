@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import enum
 from decimal import Decimal
 
 from sqlalchemy import Boolean, Index, Integer, Numeric, String, UniqueConstraint
@@ -148,3 +149,33 @@ class TenantSettings(Base, IdMixin, TenantScoped, TimestampMixin):
     due_days_urgent: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0", nullable=False
     )
+
+
+class OptionList(enum.StrEnum):
+    """Dropdowns a bureau can extend with values of its own."""
+
+    ACQUISITION_SOURCE = "acquisition_source"
+    ORDER_STATUS = "order_status"
+
+
+class CustomOption(Base, IdMixin, TenantScoped, TimestampMixin):
+    """A value a bureau added to one of its dropdowns.
+
+    The built-in values of each list live in code (and are translated there);
+    these rows are the bureau's own additions on top. A value is stored on the
+    record that uses it (``clients.acquisition_source``,
+    ``order_status_events.status``) as typed, so deleting an option never
+    rewrites anything already saved with it.
+    """
+
+    __tablename__ = "custom_options"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "list_key", "value", name="uq_custom_options_tenant_list_value"
+        ),
+        Index("ix_custom_options_tenant_list", "tenant_id", "list_key"),
+    )
+
+    list_key: Mapped[str] = mapped_column(String(40), nullable=False)
+    #: 60 because a custom status lands in `order_status_events.status`, String(60).
+    value: Mapped[str] = mapped_column(String(60), nullable=False)

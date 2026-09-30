@@ -56,7 +56,8 @@ from suliko.domain.statuses import (
     EXCLUDED_FROM_AGGREGATES,
     INITIAL_STATUS,
     get_label,
-    is_known,
+    is_selectable,
+    normalise,
     sql_values,
 )
 from suliko.models.collaboration import NotificationKind
@@ -75,6 +76,7 @@ from suliko.models.order import (
     OrderStatusEvent,
     Urgency,
 )
+from suliko.models.reference import CustomOption, OptionList
 from suliko.models.user import User
 from suliko.security.permissions import Permission
 from suliko.security.sessions import AuthenticatedSession
@@ -170,6 +172,27 @@ class OrderDocumentUpdate(BaseModel):
     notary_cost: Money | None = None
 
 
+class OrderDocumentChange(OrderDocumentUpdate):
+    """One existing document's changes, inside `OrderSave`."""
+
+    id: int
+
+
+class OrderSave(BaseModel):
+    """Everything the edit screen changed, applied together or not at all.
+
+    Adds run before removals, so replacing an order's only document never
+    trips the "at least one document" rule on the way.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    header: OrderUpdate | None = None
+    add: list[OrderDocumentIn] = Field(default_factory=list, max_length=MAX_DOCUMENTS)
+    update: list[OrderDocumentChange] = Field(default_factory=list, max_length=MAX_DOCUMENTS)
+    remove: list[int] = Field(default_factory=list, max_length=MAX_DOCUMENTS)
+
+
 class StatusChange(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -249,6 +272,13 @@ class OrderDetail(OrderSummary):
     expenses_total: Decimal | None
     documents: list[OrderDocumentOut]
     status_history: list[StatusEventOut]
+
+
+class OrderSaved(BaseModel):
+    order: OrderDetail
+    #: The documents `add` created, in the order they were sent — so the
+    #: caller can attach files to them.
+    added_document_ids: list[int]
 
 
 class OrderPage(BaseModel):
@@ -447,9 +477,7 @@ async def list_orders(
 
     def has_document(*conditions: ColumnElement[bool]) -> ColumnElement[bool]:
         return (
-            select(OrderDocument.id)
-            .where(OrderDocument.order_id == Order.id, *conditions)
-            .exists()
+            select(OrderDocument.id).where(OrderDocument.order_id == Order.id, *conditions).exists()
         )
 
     if search and search.strip():
@@ -484,7 +512,8 @@ async def list_orders(
     if document_type_id is not None:
         stmt = stmt.where(has_document(OrderDocument.document_type_id == document_type_id))
     if order_status:
-        stmt = stmt.where(status_sq.c.status == order_status.strip().lower())
+        # Lower-cased on both sides: a bureau's own status keeps its spelling.
+        stmt = stmt.where(func.lower(status_sq.c.status) == order_status.strip().lower())
     if language:
         # Any document in the order using this language, either direction.
         code = language.lower()
@@ -829,9 +858,7 @@ async def update_order(
             .scalars()
             .all()
         )
-        ctx = await load_pricing_context(
-            db, session.plan, {d.document_type_id for d in documents}
-        )
+        ctx = await load_pricing_context(db, session.plan, {d.document_type_id for d in documents})
 
         # The courier fee follows the handover, unless the caller set it.
         if handover_changed and "delivery_cost" not in changes:
@@ -1067,32 +1094,93 @@ async def delete_order_document(
     return await _load_detail(order_id, db, session)
 
 
-@router.post("/{order_id}/status", response_model=OrderDetail)
-async def change_status(
-    order_id: int,
-    payload: StatusChange,
-    db: Db,
-    session: Annotated[
-        AuthenticatedSession, Depends(require(Permission.ORDERS_CHANGE_STATUS))
-    ],
-) -> OrderDetail:
-    """Append a status event. Never updates in place.
+@router.post("/{order_id}/save", response_model=OrderSaved)
+async def save_order(
+    order_id: int, payload: OrderSave, db: Db, session: OrdersWriter
+) -> OrderSaved:
+    """Apply an edited order in one transaction.
 
-    Unknown values are rejected: the vocabulary is closed
-    (`domain/statuses.py`), and a typo would otherwise create a status that
-    renders as a grey "Unknown" pill forever.
+    Each step is the same handler the single-document endpoints use, so the
+    pricing, assignment and audit rules cannot differ between the two ways of
+    editing. Any refusal rolls back everything before it.
     """
     order = await db.get(Order, order_id)
     if order is None:
         raise NotFoundError("Order not found.")
 
-    if not is_known(payload.status):
-        raise ValidationError(f"Unknown status: {payload.status!r}")
+    kept = {change.id for change in payload.update}
+    if kept & set(payload.remove):
+        raise ValidationError("A document cannot be both changed and removed.")
+
+    if payload.header is not None:
+        await update_order(order_id, payload.header, db, session)
+
+    added: list[int] = []
+    for document in payload.add:
+        before = set(
+            (await db.execute(select(OrderDocument.id).where(OrderDocument.order_id == order_id)))
+            .scalars()
+            .all()
+        )
+        detail = await add_order_document(order_id, document, db, session)
+        added.extend(sorted({d.id for d in detail.documents} - before))
+
+    for change in payload.update:
+        fields = change.model_dump(exclude_unset=True, exclude={"id"})
+        if fields:
+            await update_order_document(
+                order_id, change.id, OrderDocumentUpdate(**fields), db, session
+            )
+
+    for document_id in payload.remove:
+        await delete_order_document(order_id, document_id, db, session)
+
+    return OrderSaved(order=await _load_detail(order_id, db, session), added_document_ids=added)
+
+
+async def _resolve_status(db: AsyncSession, raw: str) -> str:
+    """The value to store for a picked status, or a 422.
+
+    A built-in is stored normalised, as the PHP wrote it. A bureau's own status
+    is stored as the bureau spelled it, so it reads back the same.
+    """
+    if is_selectable(raw):
+        return normalise(raw)
+    custom = await db.scalar(
+        select(CustomOption.value).where(
+            CustomOption.list_key == OptionList.ORDER_STATUS,
+            func.lower(CustomOption.value) == raw.strip().lower(),
+        )
+    )
+    if custom is None:
+        raise ValidationError(f"Unknown status: {raw!r}")
+    return custom
+
+
+@router.post("/{order_id}/status", response_model=OrderDetail)
+async def change_status(
+    order_id: int,
+    payload: StatusChange,
+    db: Db,
+    session: Annotated[AuthenticatedSession, Depends(require(Permission.ORDERS_CHANGE_STATUS))],
+) -> OrderDetail:
+    """Append a status event. Never updates in place.
+
+    Only a selectable built-in or one of the bureau's own statuses is
+    accepted — a typo would otherwise create a status that renders as a grey
+    pill forever, and a retired one would put an order back in a state the
+    office no longer uses.
+    """
+    order = await db.get(Order, order_id)
+    if order is None:
+        raise NotFoundError("Order not found.")
+
+    status_value = await _resolve_status(db, payload.status)
 
     db.add(
         OrderStatusEvent(
             order_id=order_id,
-            status=payload.status.strip().lower(),
+            status=status_value,
             changed_at=datetime.now(UTC),
             changed_by_user_id=session.user_id,
             note=payload.note,
@@ -1108,7 +1196,7 @@ async def change_status(
         action="order.status_changed",
         entity_type="order",
         entity_id=order_id,
-        after={"status": payload.status, "note": payload.note},
+        after={"status": status_value, "note": payload.note},
     )
 
     # Only the people already involved with this order, not the whole office:
@@ -1136,7 +1224,7 @@ async def change_status(
         db,
         user_ids=[user_id for user_id in involved if user_id is not None],
         kind=NotificationKind.STATUS_CHANGE,
-        body=f"Status changed to {get_label(payload.status)}.",
+        body=f"Status changed to {get_label(status_value)}.",
         actor_user_id=session.user_id,
         actor_name=session.full_name or session.username,
         order_id=order_id,

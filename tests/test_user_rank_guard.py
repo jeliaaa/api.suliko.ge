@@ -20,16 +20,17 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from suliko.api.v1 import users
 from suliko.core.errors import PermissionDeniedError, ValidationError
+from suliko.core.ratelimit import RateLimiter
 from suliko.db.base import Base
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
 from suliko.domain.plans import TenantPlan, effective_permissions
 from suliko.models.tenant import Tenant, TenantStatus
-from suliko.models.user import Role, User, UserPermissionOverride
+from suliko.models.user import Account, Role, User, UserPermissionOverride
 from suliko.security.passwords import hash_password
 from suliko.security.permissions import Permission
 from suliko.security.sessions import AuthenticatedSession
@@ -38,7 +39,12 @@ P = Permission
 TENANT = 1
 OWNER, CO_OWNER, ADMIN, OTHER_ADMIN, MANAGER, STAFF, SUPERUSER = 1, 2, 3, 4, 5, 6, 7
 
-PORTABLE_TABLES = [Tenant.__table__, User.__table__, UserPermissionOverride.__table__]
+PORTABLE_TABLES = [
+    Tenant.__table__,
+    Account.__table__,
+    User.__table__,
+    UserPermissionOverride.__table__,
+]
 
 
 # ── The guard itself ────────────────────────────────────────────────────────
@@ -92,7 +98,7 @@ def test_acting_on_yourself_is_left_to_the_handlers() -> None:
     users._guard_target(_actor(Role.ADMIN, 5), _row(Role.ADMIN, 5))
 
 
-@pytest.mark.parametrize("handler", ["update_user", "reset_password", "delete_user"])
+@pytest.mark.parametrize("handler", ["update_user", "reset_user_mfa", "delete_user"])
 def test_every_handler_that_acts_on_a_user_runs_the_guard(handler: str) -> None:
     import inspect
 
@@ -177,30 +183,19 @@ def _session(user_id: int, role: Role, **overrides: Any) -> AuthenticatedSession
     return replace(session, **overrides) if overrides else session
 
 
-async def test_an_admin_cannot_set_the_owners_password(db: AsyncSession) -> None:
-    """The takeover itself: set it, sign in as the owner, own the tenant."""
-    with pytest.raises(PermissionDeniedError):
-        await users.reset_password(
-            OWNER,
-            users.PasswordReset(password="a-brand-new-password"),
-            db,
-            _session(ADMIN, Role.ADMIN),
-            None,
-        )
+def test_nobody_in_an_organisation_can_set_a_password() -> None:
+    """The takeover itself — set it, sign in as the owner, own the tenant —
+    has no endpoint any more: the password is the person's account's, and no
+    organisation can set it (decided 2026-09-30)."""
+    assert not hasattr(users, "reset_password")
+    assert not any("password" in route.path for route in users.router.routes)
 
 
-async def test_an_admin_cannot_redirect_the_owners_email(db: AsyncSession) -> None:
-    """The quieter version: change the address, then use "forgot password"."""
-    with pytest.raises(PermissionDeniedError):
-        await users.update_user(
-            OWNER,
-            users.UserUpdate(email="attacker@example.com"),
-            db,
-            _session(ADMIN, Role.ADMIN),
-            None,
-        )
-    owner = (await db.execute(select(User).where(User.id == OWNER))).scalar_one()
-    assert owner.email == f"u{OWNER}@acme.ge"
+def test_nobody_in_an_organisation_can_redirect_an_email() -> None:
+    """The quieter version — change the address, then "forgot password" — is
+    refused at the door: the address is the account's, not editable here."""
+    with pytest.raises(PydanticValidationError):
+        users.UserUpdate.model_validate({"email": "attacker@example.com"})
 
 
 async def test_an_admin_cannot_deactivate_or_delete_another_admin(db: AsyncSession) -> None:
@@ -213,12 +208,8 @@ async def test_an_admin_cannot_deactivate_or_delete_another_admin(db: AsyncSessi
 
 async def test_nobody_in_the_tenant_can_touch_the_superuser(db: AsyncSession) -> None:
     with pytest.raises(PermissionDeniedError):
-        await users.reset_password(
-            SUPERUSER,
-            users.PasswordReset(password="a-brand-new-password"),
-            db,
-            _session(OWNER, Role.OWNER),
-            None,
+        await users.update_user(
+            SUPERUSER, users.UserUpdate(is_active=False), db, _session(OWNER, Role.OWNER), None
         )
 
 
@@ -229,26 +220,21 @@ async def test_you_cannot_deactivate_yourself(db: AsyncSession) -> None:
         )
 
 
-async def test_create_user_cannot_restore_a_revoked_permission(db: AsyncSession) -> None:
-    """An admin the owner stripped of `finance.refund` must not be able to mint
-    a fresh admin — with a password of their own choosing — to get it back."""
+async def test_an_invite_cannot_restore_a_revoked_permission(db: AsyncSession) -> None:
+    """An admin the owner stripped of `finance.refund` must not be able to
+    invite a fresh admin — a sockpuppet of their own — to get it back."""
     stripped = _session(
         ADMIN,
         Role.ADMIN,
         permissions=effective_permissions(Role.ADMIN, TenantPlan.BUREAU, {"finance.refund": False}),
     )
     with pytest.raises(ValidationError, match=r"finance\.refund"):
-        await users.create_user(
-            users.UserCreate(
-                username="sockpuppet",
-                email="sock@acme.ge",
-                full_name="Sock Puppet",
-                password="a-long-enough-password",
-                role=Role.ADMIN,
-            ),
+        await users.invite_user(
+            users.UserInvite(full_name="Sock Puppet", email="sock@acme.ge", role=Role.ADMIN),
             db,
             stripped,
             None,
+            RateLimiter(None),
         )
 
 

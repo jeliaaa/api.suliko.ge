@@ -22,7 +22,14 @@ from suliko.config import get_settings
 from suliko.db.tenancy import bypass_tenant_scope
 from suliko.domain.plans import TenantPlan, effective_permissions, effective_plan, parse
 from suliko.models.tenant import DEFAULT_TIMEZONE, Tenant
-from suliko.models.user import MfaMethod, Role, User, UserPermissionOverride, UserSession
+from suliko.models.user import (
+    Account,
+    MfaMethod,
+    Role,
+    User,
+    UserPermissionOverride,
+    UserSession,
+)
 from suliko.security.passwords import generate_token, hash_token
 from suliko.security.permissions import Permission
 
@@ -81,6 +88,10 @@ class AuthenticatedSession:
     #: safe default for an unknown session is "not verified", not the
     #: reverse. See `api/v1/auth.py`'s `POST /auth/verify-email`.
     email_verified: bool = False
+    #: The person behind this membership (`models.user.Account`) — what the
+    #: organisation switcher and a password change act on. None only for a
+    #: membership the accounts migration could not pair.
+    account_id: int | None = None
 
     @property
     def is_impersonated(self) -> bool:
@@ -180,7 +191,7 @@ async def resolve_session(db: AsyncSession, token: str) -> AuthenticatedSession 
 
         if not user_session.is_valid_at(now):
             return None
-        if not user.is_active:
+        if not user.is_active or user.invitation_pending:
             return None
 
         # Suspending a tenant has to take effect now, not whenever their
@@ -203,6 +214,16 @@ async def resolve_session(db: AsyncSession, token: str) -> AuthenticatedSession 
             return None
 
         plan = effective_plan(tenant.plan)
+
+        # Password and verified address belong to the person, not to this
+        # organisation's row; a row without an account keeps its own flags.
+        account = await db.get(Account, user.account_id) if user.account_id else None
+        must_change_password = (
+            account.must_change_password if account else user.must_change_password
+        )
+        email_verified = (
+            account.email_verified_at if account else user.email_verified_at
+        ) is not None
 
         has_mfa = bool(
             await db.scalar(
@@ -247,7 +268,7 @@ async def resolve_session(db: AsyncSession, token: str) -> AuthenticatedSession 
             tenant_name=tenant.display_name,
             plan=plan,
             onboarding_required=parse(tenant.plan) is None,
-            must_change_password=user.must_change_password,
+            must_change_password=must_change_password,
             has_mfa=has_mfa,
             # The single place a plan turns into a refusal. Every `require()`
             # in the API and every nav item in the sidebar reads the result,
@@ -257,7 +278,8 @@ async def resolve_session(db: AsyncSession, token: str) -> AuthenticatedSession 
             impersonated_by_user_id=user_session.impersonated_by_user_id,
             timezone=tenant.timezone or DEFAULT_TIMEZONE,
             tenant_locale=tenant.locale or "ka",
-            email_verified=user.email_verified_at is not None,
+            email_verified=email_verified,
+            account_id=user.account_id,
         )
 
 

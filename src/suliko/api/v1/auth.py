@@ -1,26 +1,27 @@
-"""Authentication: login, the 2FA challenge, step-up, logout.
+"""Authentication: sign-in, the organisation chooser, 2FA, logout.
 
-The login flow is two-legged by design:
+A person has ONE account (email and password, `models.user.Account`) and a
+membership row in each organisation they belong to. Sign-in follows that:
 
-    POST /auth/login      password -> a session, possibly with MFA pending
-    POST /auth/mfa/verify TOTP code -> that same session, MFA satisfied
+    POST /auth/login          email + password -> a ticket and the choices
+    POST /auth/login/select   ticket + a choice -> a session for that membership
+    POST /auth/mfa/verify     TOTP code -> that same session, MFA satisfied
+    POST /auth/switch         signed in -> a session in another of their organisations
 
-A session with MFA pending can reach nothing except the second call. That is
+A session with MFA pending can reach nothing except the challenge. That is
 enforced by ``get_authenticated_session``, which every other route depends on.
 """
 
 from __future__ import annotations
 
-import re
-import unicodedata
 from datetime import UTC, datetime
 from typing import Annotated
 from urllib.parse import quote
 
 import structlog
-from fastapi import APIRouter, BackgroundTasks, Depends, Request, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Request, status
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from suliko.api.deps import (
@@ -36,17 +37,31 @@ from suliko.core.crypto import decrypt_for_tenant
 from suliko.core.errors import (
     AuthenticationError,
     ConflictError,
+    NotFoundError,
     RateLimitedError,
     ValidationError,
 )
 from suliko.core.ratelimit import RateLimiter, get_rate_limiter
 from suliko.db.session import bind_tenant_guc, get_sessionmaker, session_scope
 from suliko.db.tenancy import bypass_tenant_scope, tenant_scope
+from suliko.domain.accounts import (
+    UNUSABLE_PASSWORD_HASH,
+    Membership,
+    create_personal_workspace,
+    find_account,
+    memberships,
+    normalise_email,
+    personal,
+    revoke_account_sessions,
+    unique_slug,
+    username_for,
+)
 from suliko.domain.plans import TenantPlan, effective_permissions, effective_plan
 from suliko.domain.reference_seed import seed_reference_data
 from suliko.models.reference import TenantSettings
 from suliko.models.tenant import Tenant, TenantStatus
 from suliko.models.user import (
+    Account,
     LoginAttempt,
     MfaMethod,
     MfaRecoveryCode,
@@ -54,7 +69,7 @@ from suliko.models.user import (
     User,
     UserPermissionOverride,
 )
-from suliko.security import reset_tokens
+from suliko.security import login_tickets, reset_tokens
 from suliko.security import totp as totp_service
 from suliko.security.passwords import (
     hash_password_async,
@@ -69,7 +84,6 @@ from suliko.security.sessions import (
     create_session,
     mark_mfa_satisfied,
     resolve_session,
-    revoke_all_for_user,
     revoke_session,
 )
 
@@ -78,12 +92,49 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 class LoginRequest(BaseModel):
-    username: str = Field(min_length=1, max_length=100)
+    email: str = Field(min_length=3, max_length=255)
     password: str = Field(min_length=1, max_length=1024)
-    #: Which bureau to sign in to. A username is unique per tenant, not
-    #: globally, so this disambiguates. It selects a candidate — it does not
-    #: grant anything; the tenant is re-derived from the user row.
-    tenant_slug: str = Field(min_length=1, max_length=63)
+
+
+class OrgChoice(BaseModel):
+    """One place the person can sign in to."""
+
+    tenant_slug: str
+    tenant_name: str
+    role: str
+    is_personal: bool = False
+
+
+class LoginOptions(BaseModel):
+    """Step one's answer: the password was right — now, which organisation?
+
+    `ticket` proves it for ten minutes (see `security/login_tickets.py`).
+    `personal` is the person's own freelancer workspace; `personal_exists`
+    false means picking it creates one.
+    """
+
+    ticket: str
+    email: str
+    full_name: str
+    organizations: list[OrgChoice]
+    personal: OrgChoice | None
+    personal_exists: bool
+
+
+class TicketRequest(BaseModel):
+    ticket: str = Field(min_length=1, max_length=300)
+
+
+class SelectRequest(BaseModel):
+    ticket: str = Field(min_length=1, max_length=300)
+    #: An organisation's slug, or omitted with `personal` set.
+    tenant_slug: str | None = Field(default=None, max_length=63)
+    personal: bool = False
+
+
+class SwitchRequest(BaseModel):
+    tenant_slug: str | None = Field(default=None, max_length=63)
+    personal: bool = False
 
 
 class LoginResponse(BaseModel):
@@ -96,6 +147,7 @@ class LoginResponse(BaseModel):
     must_change_password: bool = False
     user_id: int
     tenant_id: int
+    tenant_slug: str
     role: str
     permissions: list[str]
 
@@ -129,188 +181,336 @@ async def _record_attempt(
         )
 
 
-@router.post("/login", response_model=LoginResponse)
+def _choice(membership: Membership) -> OrgChoice:
+    return OrgChoice(
+        tenant_slug=membership.tenant.slug,
+        tenant_name=membership.tenant.display_name,
+        role=membership.user.role.value,
+        is_personal=membership.tenant.is_personal,
+    )
+
+
+async def _choices(
+    db: AsyncSession, account_id: int
+) -> tuple[list[OrgChoice], OrgChoice | None]:
+    """Organisations first, the personal workspace apart — the chooser shows
+    it separately, and offers to create it when it does not exist."""
+    options = await memberships(db, account_id)
+    own = personal(options)
+    organizations = [_choice(m) for m in options if m is not own]
+    return organizations, _choice(own) if own else None
+
+
+async def _login_options(db: AsyncSession, account: Account, ticket: str) -> LoginOptions:
+    organizations, own = await _choices(db, account.id)
+    return LoginOptions(
+        ticket=ticket,
+        email=account.email,
+        full_name=account.full_name,
+        organizations=organizations,
+        personal=own,
+        personal_exists=own is not None,
+    )
+
+
+@router.post("/login", response_model=LoginOptions)
 async def login(
     payload: LoginRequest,
     request: Request,
-    response: Response,
     limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
-) -> LoginResponse:
-    """Authenticate with a password.
+) -> LoginOptions:
+    """Step one: email and password — for the person, not an organisation.
 
     Failure is uniform: the same message, the same status, and — via
     ``waste_time_verifying`` — approximately the same latency whether the
-    tenant, the user, or the password was wrong. Anything else enumerates
-    accounts.
+    address or the password was wrong. Anything else enumerates accounts.
+
+    Success is not a session yet. It is a ticket and the list of places the
+    person can enter; `POST /auth/login/select` turns one into a session.
     """
     ip = get_client_ip(request)
     user_agent = get_client_user_agent(request)
-    # Slugs are stored lower-case and usernames are email addresses, so the
-    # case someone types them in means nothing. "Suliko" / "Nino@Mail.ge"
-    # failing as "invalid username or password" was a support call each.
-    tenant_slug = payload.tenant_slug.strip().lower()
-    username = payload.username.strip()
+    email = normalise_email(payload.email)
 
     # Per-account and per-IP, so one attacker cannot lock a real user out
-    # platform-wide by hammering their username from everywhere.
-    account_key = f"login:acct:{tenant_slug}:{username.lower()}"
+    # platform-wide by hammering their address from everywhere.
+    account_key = f"login:acct:{email}"
     ip_key = f"login:ip:{ip or 'unknown'}"
-
     if retry := await limiter.check_login(account_key, ip_key):
         raise RateLimitedError("Too many attempts. Try again later.", retry_after=retry)
 
     async with get_sessionmaker()() as db:
-        with bypass_tenant_scope():
-            tenant = (
-                await db.execute(select(Tenant).where(Tenant.slug == tenant_slug))
-            ).scalar_one_or_none()
+        account = await find_account(db, email)
 
-            user: User | None = None
-            if tenant is not None and tenant.is_usable:
-                candidates = (
-                    (
-                        await db.execute(
-                            select(User).where(
-                                User.tenant_id == tenant.id,
-                                func.lower(User.username) == username.lower(),
-                            )
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-                # Usernames are unique per tenant as stored, not per case. An
-                # imported tenant can hold "Nino" and "nino"; then only the
-                # exact spelling signs in, rather than guessing between two.
-                exact = [c for c in candidates if c.username == username]
-                if exact:
-                    user = exact[0]
-                elif len(candidates) == 1:
-                    user = candidates[0]
-
-        if user is None or not user.is_active:
+        if account is None:
             await waste_time_verifying_async()
             await limiter.record_login_failure(account_key, ip_key)
-            await _record_attempt(db, username, ip, user_agent, False, "no_such_user")
+            await _record_attempt(db, email, ip, user_agent, False, "no_such_account")
             await db.commit()
-            raise AuthenticationError("Invalid username or password.")
+            raise AuthenticationError("Invalid email or password.")
 
-        ok, new_hash = await verify_and_maybe_rehash_async(payload.password, user.password_hash)
+        ok, new_hash = await verify_and_maybe_rehash_async(payload.password, account.password_hash)
         if not ok:
             await limiter.record_login_failure(account_key, ip_key)
-            await _record_attempt(db, username, ip, user_agent, False, "bad_password")
+            await _record_attempt(db, email, ip, user_agent, False, "bad_password")
             await db.commit()
-            raise AuthenticationError("Invalid username or password.")
+            raise AuthenticationError("Invalid email or password.")
 
-        # Transparent bcrypt -> Argon2id upgrade, on the user's own login.
+        # Transparent bcrypt -> Argon2id upgrade, on the person's own login.
         if new_hash is not None:
-            with bypass_tenant_scope():
-                user.password_hash = new_hash
-            log.info("password_rehashed", user_id=user.id, tenant_id=user.tenant_id)
+            account.password_hash = new_hash
+            log.info("password_rehashed", account_id=account.id)
 
-        # This session was opened before we knew which tenant we were acting
-        # for, so it carries no RLS GUC. Everything below writes tenant-scoped
-        # rows — set it now, or the `tenant_isolation` policy rejects them the
-        # moment the app stops connecting as a PostgreSQL superuser.
-        await bind_tenant_guc(db, user.tenant_id)
-
-        with tenant_scope(user.tenant_id):
-            mfa = (
-                (
-                    await db.execute(
-                        select(MfaMethod).where(
-                            MfaMethod.user_id == user.id,
-                            MfaMethod.confirmed_at.is_not(None),
-                        )
-                    )
-                )
-                .scalars()
-                .first()
-            )
-
-            settings = get_settings()
-            enforced = settings.mfa_enforced
-            require_enrolment = settings.mfa_require_enrolment
-            has_mfa = mfa is not None
-            must_have_mfa = enforced and requires_mfa(user.role)
-
-            # A challenge is owed when a factor exists and MFA is switched on.
-            # Note this covers VOLUNTARY enrolment: a staff user who added
-            # TOTP is challenged even though their role does not demand it.
-            challenge_owed = enforced and has_mfa
-
-            # The role demands a factor and none is enrolled.
-            #
-            # Failing closed here is the stronger policy, and it is gated
-            # behind MFA_REQUIRE_ENROLMENT because it is only honest once a
-            # user can enrol for themselves. Until then it does not prompt
-            # anyone to add a factor — enrolment is a command on the server —
-            # it just locks the owner and every admin of every tenant out of
-            # their own product. See Settings.mfa_require_enrolment.
-            enrolment_required = require_enrolment and must_have_mfa and not has_mfa
-
-            if must_have_mfa and not has_mfa and not require_enrolment:
-                # Logged per login, not per boot: this is the record of WHICH
-                # privileged accounts are running without a second factor, and
-                # it is the list to work through when enrolment ships.
-                log.warning(
-                    "privileged_login_without_mfa",
-                    user_id=user.id,
-                    tenant_id=user.tenant_id,
-                    tenant_slug=tenant.slug if tenant else None,
-                    role=user.role.value,
-                )
-
-            issued = await create_session(
-                db,
-                user,
-                ip=ip,
-                user_agent=user_agent,
-                mfa_satisfied=not (challenge_owed or enrolment_required),
-            )
-
-            user.last_login_at = datetime.now(UTC)
-            await _record_attempt(db, username, ip, user_agent, True)
-            overrides = {
-                row.permission: row.granted
-                for row in (
-                    await db.execute(
-                        select(UserPermissionOverride).where(
-                            UserPermissionOverride.user_id == user.id
-                        )
-                    )
-                ).scalars()
-            }
-
+        await _record_attempt(db, email, ip, user_agent, True)
         await limiter.clear_login_failures(account_key)
-        await db.commit()
-
-        # A user is only ever loaded from a usable tenant (above), so this
-        # cannot fire; it is here so the type checker knows it too.
-        assert tenant is not None
-        response.status_code = status.HTTP_200_OK
-        return LoginResponse(
-            session_token=issued.token,
-            # "Go to the challenge screen now" — NOT "a factor exists". With
-            # MFA switched off this is false even for a user who has TOTP
-            # enrolled, so the frontend sends them straight to the dashboard.
-            mfa_required=challenge_owed,
-            mfa_enrolment_required=enrolment_required,
-            must_change_password=user.must_change_password,
-            user_id=user.id,
-            tenant_id=user.tenant_id,
-            role=user.role.value,
-            # Masked by the plan, exactly as resolve_session does. Reporting
-            # the raw role bundle here would have the frontend paint tabs
-            # that every request behind them then refuses.
-            # With the user's own overrides, as resolve_session computes it —
-            # otherwise the first page after login paints a different sidebar
-            # from every page after it.
-            permissions=sorted(
-                p.value
-                for p in effective_permissions(user.role, effective_plan(tenant.plan), overrides)
-            ),
+        options = await _login_options(
+            db, account, login_tickets.issue(account.id, account.password_hash)
         )
+        await db.commit()
+    return options
+
+
+async def _account_from_ticket(db: AsyncSession, ticket: str) -> Account:
+    """The account a ticket vouches for, or a 401 that sends them back to sign in."""
+    try:
+        account_id = login_tickets.read(ticket)
+    except login_tickets.TicketError:
+        raise AuthenticationError("Your sign-in has expired. Sign in again.") from None
+    account = await db.get(Account, account_id)
+    if account is None or not login_tickets.matches(ticket, account.password_hash):
+        raise AuthenticationError("Your sign-in has expired. Sign in again.")
+    return account
+
+
+@router.post("/login/options", response_model=LoginOptions)
+async def login_options(payload: TicketRequest) -> LoginOptions:
+    """The chooser's list again, for a page reload between the two steps."""
+    async with get_sessionmaker()() as db:
+        account = await _account_from_ticket(db, payload.ticket)
+        return await _login_options(db, account, payload.ticket)
+
+
+def _personal_enabled_email(account: Account, link: str) -> tuple[str, str]:
+    """Subject and plain-text body. No HTML — see core/mail.py."""
+    body = (
+        f"Hello {account.full_name or account.email},\n\n"
+        "Your personal Suliko account is now enabled, on the Freelancer plan. "
+        "It is yours alone: your own clients, orders and prices, separate from "
+        "any bureau you work with.\n\n"
+        f"Open it any time from the organisation switcher, or sign in here:\n\n{link}\n\n"
+        "If you did not do this, sign in and change your password.\n"
+    )
+    return "Your personal Suliko account is enabled", body
+
+
+async def _resolve_choice(
+    db: AsyncSession,
+    account: Account,
+    *,
+    tenant_slug: str | None,
+    want_personal: bool,
+    background: BackgroundTasks,
+) -> Membership:
+    """The membership a pick refers to — creating the personal workspace on
+    its first pick. Only ever one of the account's own: a slug it does not
+    belong to is refused exactly like one that does not exist."""
+    options = await memberships(db, account.id)
+    if want_personal:
+        own = personal(options)
+        if own is not None:
+            return own
+        own = await create_personal_workspace(db, account)
+
+        from suliko.core.audit import record
+
+        await record(
+            db,
+            None,
+            action="tenant.personal_created",
+            entity_type="tenant",
+            entity_id=own.tenant.id,
+            tenant_id=own.tenant.id,
+            after={"slug": own.tenant.slug, "account_id": account.id},
+        )
+        settings = get_settings()
+        link = f"{settings.app_url.rstrip('/')}/{own.tenant.locale}/login"
+        subject, body = _personal_enabled_email(account, link)
+        # After the response, which is after the commit: the email must not
+        # announce a workspace a rolled-back transaction never created.
+        background.add_task(mail.send, account.email, subject, body)
+        log.info("personal_workspace_created", account_id=account.id, tenant_id=own.tenant.id)
+        return own
+
+    slug = (tenant_slug or "").strip().lower()
+    for membership in options:
+        if membership.tenant.slug == slug:
+            return membership
+    raise NotFoundError("You do not have access to that organisation.")
+
+
+async def _start_session(
+    db: AsyncSession,
+    membership: Membership,
+    account: Account,
+    *,
+    ip: str | None,
+    user_agent: str | None,
+) -> LoginResponse:
+    """A session for one membership — the second factor and permissions exactly
+    as that organisation's row has them."""
+    user, tenant = membership.user, membership.tenant
+
+    # This session may have been opened before we knew which tenant we were
+    # acting for, so it carries no RLS GUC. Everything below writes
+    # tenant-scoped rows — set it now, or the `tenant_isolation` policy rejects
+    # them the moment the app stops connecting as a PostgreSQL superuser.
+    await bind_tenant_guc(db, user.tenant_id)
+
+    with tenant_scope(user.tenant_id):
+        mfa = (
+            (
+                await db.execute(
+                    select(MfaMethod).where(
+                        MfaMethod.user_id == user.id,
+                        MfaMethod.confirmed_at.is_not(None),
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+        settings = get_settings()
+        enforced = settings.mfa_enforced
+        require_enrolment = settings.mfa_require_enrolment
+        has_mfa = mfa is not None
+        must_have_mfa = enforced and requires_mfa(user.role)
+
+        # A challenge is owed when a factor exists and MFA is switched on.
+        # Note this covers VOLUNTARY enrolment: a staff user who added TOTP is
+        # challenged even though their role does not demand it.
+        challenge_owed = enforced and has_mfa
+
+        # The role demands a factor and none is enrolled. Failing closed is the
+        # stronger policy, gated behind MFA_REQUIRE_ENROLMENT because it is
+        # only honest once a user can enrol for themselves.
+        enrolment_required = require_enrolment and must_have_mfa and not has_mfa
+
+        if must_have_mfa and not has_mfa and not require_enrolment:
+            # Logged per login: the list of privileged accounts running without
+            # a second factor, to work through when enrolment ships.
+            log.warning(
+                "privileged_login_without_mfa",
+                user_id=user.id,
+                tenant_id=user.tenant_id,
+                tenant_slug=tenant.slug,
+                role=user.role.value,
+            )
+
+        issued = await create_session(
+            db,
+            user,
+            ip=ip,
+            user_agent=user_agent,
+            mfa_satisfied=not (challenge_owed or enrolment_required),
+        )
+
+        now = datetime.now(UTC)
+        user.last_login_at = now
+        overrides = {
+            row.permission: row.granted
+            for row in (
+                await db.execute(
+                    select(UserPermissionOverride).where(
+                        UserPermissionOverride.user_id == user.id
+                    )
+                )
+            ).scalars()
+        }
+    account.last_login_at = now
+
+    return LoginResponse(
+        session_token=issued.token,
+        # "Go to the challenge screen now" — NOT "a factor exists". With MFA
+        # switched off this is false even for a user who has TOTP enrolled.
+        mfa_required=challenge_owed,
+        mfa_enrolment_required=enrolment_required,
+        must_change_password=account.must_change_password,
+        user_id=user.id,
+        tenant_id=user.tenant_id,
+        tenant_slug=tenant.slug,
+        role=user.role.value,
+        # Masked by the plan and the user's own overrides, exactly as
+        # resolve_session computes it — otherwise the first page after login
+        # paints a different sidebar from every page after it.
+        permissions=sorted(
+            p.value
+            for p in effective_permissions(user.role, effective_plan(tenant.plan), overrides)
+        ),
+    )
+
+
+@router.post("/login/select", response_model=LoginResponse)
+async def login_select(
+    payload: SelectRequest, request: Request, background: BackgroundTasks
+) -> LoginResponse:
+    """Step two: turn the ticket and a pick into a session."""
+    async with get_sessionmaker()() as db:
+        account = await _account_from_ticket(db, payload.ticket)
+        membership = await _resolve_choice(
+            db,
+            account,
+            tenant_slug=payload.tenant_slug,
+            want_personal=payload.personal,
+            background=background,
+        )
+        response = await _start_session(
+            db,
+            membership,
+            account,
+            ip=get_client_ip(request),
+            user_agent=get_client_user_agent(request),
+        )
+        await db.commit()
+    return response
+
+
+@router.post("/switch", response_model=LoginResponse)
+async def switch_organisation(
+    payload: SwitchRequest,
+    request: Request,
+    background: BackgroundTasks,
+    session: Annotated[AuthenticatedSession, Depends(get_current_session)],
+) -> LoginResponse:
+    """Move to another of the signed-in person's organisations, or their
+    personal account, without typing the password again.
+
+    The new session belongs to the target organisation's own row; the old one
+    is revoked, so one browser holds one live session.
+    """
+    if session.account_id is None:
+        raise ValidationError("This sign-in is not linked to an account.")
+    async with get_sessionmaker()() as db:
+        account = await db.get(Account, session.account_id)
+        if account is None:
+            raise AuthenticationError("Your account is no longer available.")
+        membership = await _resolve_choice(
+            db,
+            account,
+            tenant_slug=payload.tenant_slug,
+            want_personal=payload.personal,
+            background=background,
+        )
+        response = await _start_session(
+            db,
+            membership,
+            account,
+            ip=get_client_ip(request),
+            user_agent=get_client_user_agent(request),
+        )
+        await revoke_session(db, session.session_id)
+        await db.commit()
+    return response
 
 
 @router.post("/mfa/verify", response_model=MfaVerifyResponse)
@@ -439,49 +639,6 @@ class SignupResponse(BaseModel):
     onboarding_required: bool = True
 
 
-def _slug_candidate(name: str) -> str:
-    """A URL-safe slug from an organisation name.
-
-    Georgian is transliterated to nothing useful by any cheap scheme, so a
-    name with no ASCII letters falls back to a generic stem plus the uniqueness
-    suffix below — `bureau-4` is a worse handle than `tbilisi-translations`,
-    but it is one the owner can read back over the phone, which a percent-
-    encoded Mkhedruli slug is not.
-    """
-    ascii_only = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
-    slug = re.sub(r"[^a-z0-9]+", "-", ascii_only.lower()).strip("-")
-    slug = re.sub(r"-{2,}", "-", slug)[:40].strip("-")
-    # The slug column demands 2-63 chars starting alphanumeric.
-    return slug if len(slug) >= 2 else "bureau"
-
-
-async def _unique_slug(db: AsyncSession, name: str) -> str:
-    """The candidate, or the first free `-N` suffix after it."""
-    base = _slug_candidate(name)
-
-    with bypass_tenant_scope():
-        taken = set(
-            (
-                await db.execute(
-                    select(Tenant.slug).where(
-                        or_(Tenant.slug == base, Tenant.slug.like(f"{base}-%"))
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-
-    if base not in taken:
-        return base
-    # Bounded: a name colliding 999 times is abuse, not a naming coincidence.
-    for suffix in range(2, 1000):
-        candidate = f"{base}-{suffix}"
-        if candidate not in taken:
-            return candidate
-    raise ConflictError("Could not allocate an organisation handle. Try a different name.")
-
-
 class EmailTakenError(ConflictError):
     error_code = "email_taken"
 
@@ -535,6 +692,11 @@ async def signup(
     ip = get_client_ip(request)
     settings = get_settings()
 
+    # Closed for now (2026-09-30): people join by invitation. The page is
+    # hidden too; this makes the endpoint agree rather than rely on that.
+    if not settings.signup_enabled:
+        raise NotFoundError("Sign-up is closed.")
+
     ip_key = f"signup:ip:{ip or 'unknown'}"
     if retry := await limiter.check_signup(ip_key):
         raise RateLimitedError("Too many sign-ups from this address.", retry_after=retry)
@@ -543,10 +705,8 @@ async def signup(
     if problems:
         raise ValidationError(" ".join(problems))
 
-    email = str(payload.email).strip().lower()
-    # `users.username` is String(100); an address longer than that keeps its
-    # local part, which is still unique inside a tenant of one.
-    username = email if len(email) <= 100 else email.split("@")[0][:100]
+    email = normalise_email(str(payload.email))
+    username = username_for(email)
 
     await limiter.record_signup(ip_key)
 
@@ -562,19 +722,27 @@ async def signup(
                     .order_by(Tenant.id)
                 )
             ).all()
-        if holders:
+        if holders or await find_account(db, email) is not None:
             accounts: list[dict[str, str]] = []
             for plan, name in holders:
-                account = _existing_account(plan, name)
-                if account not in accounts:
-                    accounts.append(account)
+                holder = _existing_account(plan, name)
+                if holder not in accounts:
+                    accounts.append(holder)
             labels = ", ".join(a.get("name", "Freelancer") for a in accounts)
             raise EmailTakenError(
                 f"An account with this email already exists: {labels}.",
                 accounts=accounts,
             )
 
-        slug = await _unique_slug(db, payload.organisation_name)
+        slug = await unique_slug(db, payload.organisation_name)
+
+        account = Account(
+            email=email,
+            password_hash=await hash_password_async(payload.password),
+            full_name=payload.full_name.strip(),
+        )
+        db.add(account)
+        await db.flush()
 
         with bypass_tenant_scope():
             tenant = Tenant(
@@ -602,10 +770,11 @@ async def signup(
             await seed_reference_data(db)
             user = User(
                 tenant_id=tenant_id,
+                account_id=account.id,
                 username=username,
                 email=email,
                 full_name=payload.full_name.strip(),
-                password_hash=await hash_password_async(payload.password),
+                password_hash=UNUSABLE_PASSWORD_HASH,
                 role=Role.OWNER,
                 is_active=True,
             )
@@ -630,7 +799,7 @@ async def signup(
                     and requires_mfa(Role.OWNER)
                 ),
             )
-            user.last_login_at = datetime.now(UTC)
+            user.last_login_at = account.last_login_at = datetime.now(UTC)
 
             # Minted now so it commits atomically with the user it belongs to;
             # sent below, after the commit — see the note on the same pattern
@@ -721,11 +890,16 @@ async def verify_email(payload: VerifyEmailRequest) -> VerifyEmailResponse:
                 "for a new one from your account page."
             )
 
+        now = datetime.now(UTC)
         with bypass_tenant_scope():
             if user.email_verified_at is None:
-                user.email_verified_at = datetime.now(UTC)
+                user.email_verified_at = now
             tenant = await db.get(Tenant, user.tenant_id)
         assert tenant is not None
+        # The address is the person's, not the organisation's.
+        account = await db.get(Account, user.account_id) if user.account_id else None
+        if account is not None and account.email_verified_at is None:
+            account.email_verified_at = now
         await db.flush()
 
         from suliko.core.audit import record
@@ -763,7 +937,7 @@ async def resend_verification_email(
     user = await db.get(User, session.user_id)
     if user is None:
         raise AuthenticationError("Your account is no longer available.")
-    if user.email_verified_at is not None:
+    if session.email_verified:
         return
 
     account_key = f"emailverify:user:{user.id}"
@@ -806,10 +980,7 @@ async def resend_verification_email(
 
 
 class ForgotPasswordRequest(BaseModel):
-    tenant_slug: str = Field(min_length=1, max_length=63)
-    #: Username or email. People remember one or the other, rarely both, and
-    #: accepting either costs nothing because the answer is the same regardless.
-    identifier: str = Field(min_length=1, max_length=255)
+    email: str = Field(min_length=3, max_length=255)
 
 
 class ResetPasswordRequest(BaseModel):
@@ -822,16 +993,18 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(min_length=1, max_length=1024)
 
 
-def _reset_email(user: User, tenant: Tenant, link: str, ttl_minutes: int) -> tuple[str, str]:
+def _reset_email(account: Account, link: str, ttl_minutes: int) -> tuple[str, str]:
     """Subject and plain-text body. No HTML — see core/mail.py."""
     hours = ttl_minutes // 60
     validity = f"{hours} hour{'s' if hours != 1 else ''}" if hours else f"{ttl_minutes} minutes"
     body = (
-        f"Hello {user.full_name or user.username},\n\n"
+        f"Hello {account.full_name or account.email},\n\n"
         f"Someone asked to reset the password for your Suliko account "
-        f"({user.username}) at {tenant.display_name}.\n\n"
+        f"({account.email}).\n\n"
         f"Open this link to choose a new one:\n\n{link}\n\n"
-        f"The link works once and expires in {validity}.\n\n"
+        f"The link works once and expires in {validity}. The new password "
+        f"is the one you sign in with everywhere — every organisation you "
+        f"belong to.\n\n"
         f"If this wasn't you, you can ignore this email — your password has "
         f"not changed. Nobody can use this link without opening it.\n"
     )
@@ -850,16 +1023,15 @@ async def forgot_password(
     Answers 204 whether or not the account exists, and does the same amount of
     work either way. Anything else — a different status, a different message,
     a visibly different latency — turns this into a free tool for discovering
-    which addresses are registered with which bureau.
+    which addresses are registered.
 
     The 429 is the one exception, and it leaks nothing: it is keyed on the
-    identifier the caller just typed, which they already know.
+    address the caller just typed, which they already know.
     """
     ip = get_client_ip(request)
-    identifier = payload.identifier.strip()
-    tenant_slug = payload.tenant_slug.strip().lower()
+    email = normalise_email(payload.email)
 
-    account_key = f"pwreset:acct:{tenant_slug}:{identifier.lower()}"
+    account_key = f"pwreset:acct:{email}"
     ip_key = f"pwreset:ip:{ip or 'unknown'}"
 
     if retry := await limiter.check_password_reset(account_key, ip_key):
@@ -869,37 +1041,30 @@ async def forgot_password(
     settings = get_settings()
 
     async with get_sessionmaker()() as db:
-        with bypass_tenant_scope():
-            tenant = (
-                await db.execute(select(Tenant).where(Tenant.slug == tenant_slug))
-            ).scalar_one_or_none()
-
-            user: User | None = None
-            if tenant is not None and tenant.is_usable:
-                user = (
-                    (
-                        await db.execute(
-                            select(User).where(
-                                User.tenant_id == tenant.id,
-                                or_(
-                                    func.lower(User.username) == identifier.lower(),
-                                    func.lower(User.email) == identifier.lower(),
-                                ),
-                            )
-                        )
+        account = await find_account(db, email)
+        # The token is the reset-token machinery's, which is per membership
+        # row; the one used most recently carries it. Which row it is changes
+        # nothing — the password it sets is the account's.
+        user: User | None = None
+        tenant: Tenant | None = None
+        if account is not None:
+            with bypass_tenant_scope():
+                row = (
+                    await db.execute(
+                        select(User, Tenant)
+                        .join(Tenant, Tenant.id == User.tenant_id)
+                        .where(User.account_id == account.id, User.is_active.is_(True))
+                        .order_by(User.last_login_at.desc().nulls_last(), User.id.desc())
+                        .limit(1)
                     )
-                    .scalars()
-                    .first()
-                )
+                ).first()
+            if row is not None:
+                user, tenant = row
 
-        if user is None or not user.is_active or tenant is None:
+        if account is None or user is None or tenant is None:
             # Deliberately silent. Logged so an operator can see that someone
             # is trying, without the caller learning anything.
-            log.info(
-                "password_reset_requested_for_unknown_account",
-                tenant_slug=tenant_slug,
-                ip=ip,
-            )
+            log.info("password_reset_requested_for_unknown_account", ip=ip)
             return
 
         token = await reset_tokens.issue(
@@ -925,17 +1090,16 @@ async def forgot_password(
         f"{settings.app_url.rstrip('/')}/{tenant.locale}/reset-password"
         f"?token={quote(token, safe='')}"
     )
-    subject, body = _reset_email(user, tenant, link, settings.password_reset_ttl_minutes)
+    subject, body = _reset_email(account, link, settings.password_reset_ttl_minutes)
     # After the response, not before it. Sending inline made a known account
     # take seconds (SMTP handshake, TLS, login) and an unknown one return at
-    # once — the response time alone told anyone which addresses were
-    # registered with which bureau.
-    background.add_task(mail.send, user.email, subject, body)
+    # once — the response time alone told anyone which addresses exist.
+    background.add_task(mail.send, account.email, subject, body)
 
 
 @router.post("/password/reset", status_code=status.HTTP_204_NO_CONTENT)
 async def reset_password(payload: ResetPasswordRequest, request: Request) -> None:
-    """Spend a reset link and set the new password.
+    """Spend a reset (or invitation) link and set the account's password.
 
     Strength is checked BEFORE the token is spent. Rejecting a too-short
     password and burning the link in the same breath would send the user back
@@ -948,28 +1112,28 @@ async def reset_password(payload: ResetPasswordRequest, request: Request) -> Non
 
     async with get_sessionmaker()() as db:
         user = await reset_tokens.consume(db, payload.token)
-        if user is None:
+        account = await db.get(Account, user.account_id) if user and user.account_id else None
+        if user is None or account is None:
             # One message for expired, spent, forged and unknown alike.
             raise ValidationError(
                 "This reset link is no longer valid. Request a new one and "
                 "use the most recent email."
             )
 
+        now = datetime.now(UTC)
+        account.password_hash = await hash_password_async(payload.password)
+        # They chose this one themselves, proving they hold the mailbox.
+        account.must_change_password = False
+        if account.email_verified_at is None:
+            account.email_verified_at = now
         with bypass_tenant_scope():
-            user.password_hash = await hash_password_async(payload.password)
-            # They chose this one themselves, proving they hold the mailbox.
-            # Leaving the flag set sent an invited user who reset instead of
-            # using their one-time password straight into a second change.
-            user.must_change_password = False
-            # Same proof an email-confirmation link is for: this link only
-            # ever reached them by arriving in this address's inbox. Covers
-            # an invited user (who never gets a separate verification email)
-            # and anyone who forgot their password before clicking the one
-            # from signup.
             if user.email_verified_at is None:
-                user.email_verified_at = datetime.now(UTC)
+                user.email_verified_at = now
+            # An invitation's set-password link arrives this way: using it is
+            # accepting the invitation it was sent with.
+            user.invitation_pending = False
         await db.flush()
-        await revoke_all_for_user(db, user.id)
+        await revoke_account_sessions(db, account.id)
 
         from suliko.core.audit import record
 
@@ -984,7 +1148,7 @@ async def reset_password(payload: ResetPasswordRequest, request: Request) -> Non
         )
         await db.commit()
 
-    log.info("password_reset_completed", user_id=user.id, tenant_id=user.tenant_id)
+    log.info("password_reset_completed", account_id=account.id, user_id=user.id)
 
 
 @router.post("/password/change", status_code=status.HTTP_204_NO_CONTENT)
@@ -997,23 +1161,17 @@ async def change_password(
 
     Deliberately NOT behind `get_authenticated_session`. Someone holding a
     one-time password from an invite is refused by that gate everywhere else,
-    and this is the screen they are being sent to — gating it the same way
-    would leave them with a session that can do nothing at all.
+    and this is the screen they are being sent to.
 
-    No step-up 2FA: the current password IS the proof, and demanding a TOTP
-    code as well would stop exactly the people who most need to rotate a
-    password they think has leaked.
-
-    Every session is revoked, including the one making this call — so the
-    caller is signed out and has to sign in again. That is the honest
-    behaviour: "changed everywhere" is what a user believes has happened, and
-    quietly keeping one session alive makes that belief wrong.
+    It is the account's password, so every session in every organisation is
+    revoked, the caller's included — "changed everywhere" is what a person
+    believes has happened, and keeping one session alive would make that wrong.
     """
-    user = await db.get(User, session.user_id)
-    if user is None:
+    account = await db.get(Account, session.account_id) if session.account_id else None
+    if account is None:
         raise AuthenticationError("Your account is no longer available.")
 
-    ok, _ = await verify_and_maybe_rehash_async(payload.current_password, user.password_hash)
+    ok, _ = await verify_and_maybe_rehash_async(payload.current_password, account.password_hash)
     if not ok:
         # 422 rather than 401: the session is perfectly valid, one field is
         # wrong. A 401 here would log the user out of the UI mid-form.
@@ -1026,13 +1184,11 @@ async def change_password(
     if problems:
         raise ValidationError(" ".join(problems))
 
-    user.password_hash = await hash_password_async(payload.new_password)
-    # Whatever they were handed, they have now replaced. This is the only
-    # place the flag is cleared — an admin resetting someone's password sets
-    # it again, which is the point.
-    user.must_change_password = False
+    account.password_hash = await hash_password_async(payload.new_password)
+    # Whatever they were handed, they have now replaced.
+    account.must_change_password = False
     await db.flush()
-    await revoke_all_for_user(db, user.id)
+    await revoke_account_sessions(db, account.id)
 
     from suliko.core.audit import record
 
@@ -1041,8 +1197,56 @@ async def change_password(
         session,
         action="user.password_changed",
         entity_type="user",
-        entity_id=user.id,
+        entity_id=session.user_id,
     )
+
+
+# ── Invitations ─────────────────────────────────────────────────────────────
+#
+# An organisation adds a person who already has an account by inviting them;
+# the membership stays pending — invisible to sign-in — until they accept from
+# the email. Someone without an account gets a set-password link instead, and
+# using it both creates their password and accepts (see `reset_password`).
+
+
+class AcceptInvitationRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=200)
+
+
+class AcceptInvitationResponse(BaseModel):
+    tenant_slug: str
+    tenant_name: str
+
+
+@router.post("/invitations/accept", response_model=AcceptInvitationResponse)
+async def accept_invitation(payload: AcceptInvitationRequest) -> AcceptInvitationResponse:
+    """Spend an invitation link. Anonymous, like the reset link: the token
+    alone proves the mailbox, and the person signs in afterwards."""
+    async with get_sessionmaker()() as db:
+        user = await reset_tokens.consume(db, payload.token, purpose=reset_tokens.INVITATION)
+        if user is None:
+            raise ValidationError(
+                "This invitation link is no longer valid. Ask the organisation to "
+                "invite you again."
+            )
+        with bypass_tenant_scope():
+            user.invitation_pending = False
+            tenant = await db.get(Tenant, user.tenant_id)
+        assert tenant is not None
+        await db.flush()
+
+        from suliko.core.audit import record
+
+        await record(
+            db,
+            None,
+            action="user.invitation_accepted",
+            entity_type="user",
+            entity_id=user.id,
+            tenant_id=user.tenant_id,
+        )
+        await db.commit()
+    return AcceptInvitationResponse(tenant_slug=tenant.slug, tenant_name=tenant.display_name)
 
 
 class SessionInfo(BaseModel):
@@ -1072,6 +1276,11 @@ class SessionInfo(BaseModel):
     #: Whether this address has been confirmed — drives the banner. Not
     #: enforced anywhere yet; see the note above `POST /auth/verify-email`.
     email_verified: bool
+    #: For the organisation switcher: every other place this person can
+    #: enter, and their personal workspace if it exists (None offers to
+    #: create it). The current organisation is among them.
+    organizations: list[OrgChoice] = Field(default_factory=list)
+    personal: OrgChoice | None = None
 
 
 @router.get("/session", response_model=SessionInfo)
@@ -1079,7 +1288,14 @@ async def current_session(
     session: Annotated[AuthenticatedSession, Depends(get_current_session)],
 ) -> SessionInfo:
     """What the BFF calls on every page load to hydrate the shell."""
+    organizations: list[OrgChoice] = []
+    own: OrgChoice | None = None
+    if session.account_id is not None:
+        async with get_sessionmaker()() as db:
+            organizations, own = await _choices(db, session.account_id)
     return SessionInfo(
+        organizations=organizations,
+        personal=own,
         user_id=session.user_id,
         username=session.username,
         full_name=session.full_name,
