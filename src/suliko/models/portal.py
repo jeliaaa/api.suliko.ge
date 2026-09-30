@@ -133,7 +133,7 @@ class PortalTranslatorLink(Base, IdMixin, TimestampMixin):
     tenant_id: Mapped[int] = mapped_column(
         ForeignKey("tenants.id", ondelete="RESTRICT"), nullable=False
     )
-    # CASCADE: deleting the directory row in the CRM removes this bureau from
+    # CASCADE: deleting the directory row in Suliko Office removes this bureau from
     # the translator's portal rather than leaving a link to nothing.
     translator_id: Mapped[int] = mapped_column(
         ForeignKey("translators.id", ondelete="CASCADE"), nullable=False

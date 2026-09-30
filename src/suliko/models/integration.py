@@ -1,4 +1,4 @@
-"""Per-tenant credentials for the external services the CRM talks to.
+"""Per-tenant credentials for the external services Suliko Office talks to.
 
 Ports the Integrations tab of the PHP app's `settings.php`, which stored each
 provider's keys in its own table and several of them — notably

@@ -176,7 +176,7 @@ PROVIDERS: dict[IntegrationProvider, ProviderSpec] = {
         provider=IntegrationProvider.SMTP,
         name="Email (SMTP)",
         summary="Outbound email: confirmations, documents, invoices.",
-        enables="Every email the CRM sends. Without it, order confirmations go nowhere.",
+        enables="Every email Suliko Office sends. Without it, order confirmations go nowhere.",
         fields=(
             FieldSpec(key="host", label="Server", placeholder="smtp.example.ge"),
             FieldSpec(key="port", label="Port", placeholder="587"),

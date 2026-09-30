@@ -94,10 +94,10 @@ async def test_a_sent_message_is_reported_as_delivered(monkeypatch: pytest.Monke
 def test_the_from_address_comes_from_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     """Never from user input — a display name taken from a user record would
     let someone register as "Suliko Security" and send plausible mail."""
-    _configure(monkeypatch, smtp_from_name="Suliko CRM")
+    _configure(monkeypatch, smtp_from_name="Suliko Office")
 
     message = mail._build("nino@acme.ge", "Subject", "Body")
-    assert message["From"] == "Suliko CRM <noreply@suliko.ge>"
+    assert message["From"] == "Suliko Office <noreply@suliko.ge>"
 
 
 def test_the_body_is_plain_text(monkeypatch: pytest.MonkeyPatch) -> None:

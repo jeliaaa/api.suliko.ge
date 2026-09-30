@@ -1,6 +1,6 @@
-# Suliko CRM — API
+# Suliko Office — API
 
-FastAPI backend for `app.suliko.ge`. Multi-tenant translation-bureau CRM.
+FastAPI backend for `app.suliko.ge`. Multi-tenant translation-bureau app.
 
 Specs are one level up in [`../docs/`](../docs/); the build plan is
 [`../docs/BUILD-WITH-FASTAPI.md`](../docs/BUILD-WITH-FASTAPI.md). This README is how to run it.

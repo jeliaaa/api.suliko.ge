@@ -1,6 +1,6 @@
 """suliko.ge admin: who is a translator, and which bureaus they work for.
 
-The suliko.ge admin panel manages this rather than a bureau's CRM admins,
+The suliko.ge admin panel manages this rather than a bureau's Suliko Office admins,
 because a translator can work for several bureaus and no single bureau owns the
 relationship. The admin is recognised by the ``adm`` flag in the signed
 assertion, which the suliko.ge server sets only for the user ids on its own

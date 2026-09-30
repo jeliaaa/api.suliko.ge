@@ -276,7 +276,7 @@ async def create_superuser(
 
             await db.commit()
 
-        uri = totp_service.provisioning_uri(secret, f"{username}@{tenant_slug}", "Suliko CRM")
+        uri = totp_service.provisioning_uri(secret, f"{username}@{tenant_slug}", "Suliko Office")
 
         heading("Superuser created")
         say(f"  username : {username}")

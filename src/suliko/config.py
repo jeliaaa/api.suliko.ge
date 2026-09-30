@@ -214,7 +214,7 @@ class Settings(BaseSettings):
     app_url: str = "http://localhost:3000"
 
     #: suliko.ge's own base URL — a DIFFERENT site from `app_url` (this
-    #: bureau's CRM). An invite that matches no suliko.ge account links here so
+    #: bureau's Suliko Office). An invite that matches no suliko.ge account links here so
     #: the invitee can register; see `PortalAccountInvite` and
     #: `domain/portal.py`'s registration-link helpers.
     suliko_site_url: str = "https://suliko.ge"
@@ -226,7 +226,7 @@ class Settings(BaseSettings):
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
 
     # ── App ─────────────────────────────────────────────────────────────────
-    app_name: str = "Suliko CRM API"
+    app_name: str = "Suliko Office API"
 
     #: Interface language a self-signed-up bureau starts in. Georgian, because
     #: that is who this is sold to; they can change it in Settings.

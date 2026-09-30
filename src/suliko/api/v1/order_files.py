@@ -1,11 +1,11 @@
-"""Order files for bureau staff: the CRM side of the Shared Drive folders.
+"""Order files for bureau staff: the Suliko Office side of the Shared Drive folders.
 
 Staff can also work in Drive directly — drop a scan into a document's ``Source``
 folder and the assigned translator sees it. These routes are for doing the same
-from the CRM, and for creating a document's folders ahead of time so there is
+from Suliko Office, and for creating a document's folders ahead of time so there is
 somewhere to drop files before the translator first opens the order.
 
-Tenant-scoped through the normal staff session, like every other CRM route.
+Tenant-scoped through the normal staff session, like every other Suliko Office route.
 """
 
 from __future__ import annotations

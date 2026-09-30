@@ -63,7 +63,7 @@ api_router.include_router(platform.router)
 api_router.include_router(portal.router)
 api_router.include_router(portal_admin.router)
 
-# Every screen in the CRM now has a router. What is deliberately still absent:
+# Every screen in Suliko Office now has a router. What is deliberately still absent:
 #
 #   - impersonation. `Permission.PLATFORM_IMPERSONATE` is in
 #     STEP_UP_PERMISSIONS, so it needs a freshly verified second factor — and

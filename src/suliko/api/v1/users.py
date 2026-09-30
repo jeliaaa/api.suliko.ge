@@ -127,7 +127,7 @@ class SulikoAccountOut(BaseModel):
     'linked' means exactly one account matched at invite time; 'pending'
     means none did (or more than one), and stays that way until
     `domain.portal.resolve_pending_invites` finds a match — see that
-    function's docstring for the two moments that can happen. A CRM login is
+    function's docstring for the two moments that can happen. A Suliko Office login is
     not the suliko.ge portal, so 'linked' here is a record of identity, not a
     functional connection the way it is for a translator invite.
     """
@@ -623,7 +623,7 @@ async def invite_user(
     await _write_overrides(db, row, requested, plan=session.plan)
 
     # Whether this address (or phone) belongs to a suliko.ge account — see
-    # `domain.portal.account_matches`. A CRM login is not the suliko.ge
+    # `domain.portal.account_matches`. A Suliko Office login is not the suliko.ge
     # portal, so a match is recorded, not acted on. `db` doubles as the
     # platform session here for the same reason `api/v1/translators.py`
     # documents at its invite route.

@@ -1,6 +1,6 @@
 """Dependencies for the translator portal and the suliko.ge admin endpoints.
 
-Portal requests carry no CRM session, so the chain in ``api/deps.py`` does not
+Portal requests carry no Suliko Office session, so the chain in ``api/deps.py`` does not
 apply: no tenant is bound from a session and ``get_db`` is never used. Instead:
 
     get_portal_identity        verify the signed assertion (or a file ticket)

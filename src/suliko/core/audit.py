@@ -91,7 +91,7 @@ async def record(
     before storage — the audit log is read by more people than the database is,
     so a secret leaked into it is worse than one in a table.
 
-    ``actor_type`` is for actors without a CRM session (the suliko.ge portal);
+    ``actor_type`` is for actors without a Suliko Office session (the suliko.ge portal);
     when omitted it is derived from ``session`` as before.
     """
     try:

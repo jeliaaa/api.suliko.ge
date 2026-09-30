@@ -195,9 +195,9 @@ def test_drift_window_is_not_wider_than_one_step() -> None:
 
 def test_provisioning_uri_contains_issuer_and_account() -> None:
     secret = totp_service.generate_secret()
-    uri = totp_service.provisioning_uri(secret, "tako@suliko.ge", "Suliko CRM")
+    uri = totp_service.provisioning_uri(secret, "tako@suliko.ge", "Suliko Office")
     assert uri.startswith("otpauth://totp/")
-    assert "Suliko%20CRM" in uri
+    assert "Suliko%20Office" in uri
     assert secret in uri
 
 
@@ -303,7 +303,7 @@ def test_production_accepts_a_correct_configuration() -> None:
         ({"debug": True}, "DEBUG"),
         ({"db_echo": True}, "DB_ECHO"),
         ({"redis_url": None}, "REDIS_URL"),
-        ({"cors_origins": ["http://crm.example.com"]}, "https"),
+        ({"cors_origins": ["http://office.example.com"]}, "https"),
         # Password reset answers 204 whether or not the account exists, so a
         # production box with no mailer tells every locked-out user that their
         # link is on its way and then drops it.

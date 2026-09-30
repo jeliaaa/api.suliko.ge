@@ -145,7 +145,7 @@ async def get_drive_settings(db: AsyncSession) -> DriveSettings | None:
 # Every bureau adds the SAME Suliko service account to its drive, so that
 # account can open every linked drive on the platform, and a drive id is all
 # it takes to point a tenant at one. Without a proof, bureau A could paste
-# bureau B's drive id and read B's documents through the CRM.
+# bureau B's drive id and read B's documents through Suliko Office.
 #
 # The proof is the same shape as domain verification. Each tenant has a fixed
 # folder name nobody else can predict (`drive_verification_name`), and the

@@ -571,7 +571,7 @@ async def delete_order_file(
     """Move a translation the caller uploaded to the drive's bin.
 
     Anything else — source files, or files the bureau added — belongs to the
-    bureau and is removed in Drive or the CRM, not from the portal.
+    bureau and is removed in Drive or Suliko Office, not from the portal.
     """
     organization = await _organization(db, identity, slug)
 

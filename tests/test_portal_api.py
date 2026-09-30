@@ -1428,7 +1428,7 @@ async def test_cancelling_a_translator_invite_stops_it_resolving(
 # ── A bureau invites a staff member, matched against suliko.ge ──────────────
 #
 # `POST /users/invite` gains the same matching, but nothing to link into: a
-# CRM login is not the suliko.ge portal, so a match is a record, not a
+# Suliko Office login is not the suliko.ge portal, so a match is a record, not a
 # connection. See `SulikoAccountOut` and `_invite_status_for` in
 # `api/v1/users.py`.
 

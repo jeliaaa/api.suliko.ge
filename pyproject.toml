@@ -1,7 +1,7 @@
 [project]
 name = "suliko-api"
 version = "0.1.0"
-description = "Suliko CRM backend — multi-tenant translation bureau management."
+description = "Suliko Office backend — multi-tenant translation bureau management."
 requires-python = ">=3.12"
 
 dependencies = [

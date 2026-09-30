@@ -60,7 +60,7 @@ from suliko.security.sessions import AuthenticatedSession, mark_mfa_satisfied
 log = structlog.get_logger()
 router = APIRouter(prefix="/auth/mfa", tags=["auth"])
 
-ISSUER = "Suliko CRM"
+ISSUER = "Suliko Office"
 
 
 class EnrolmentOut(BaseModel):
