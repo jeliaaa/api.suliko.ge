@@ -16,10 +16,12 @@ import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from suliko.core.errors import ValidationError
 from suliko.db.base import Base
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter
 from suliko.domain.accounts import (
     UNUSABLE_PASSWORD_HASH,
+    create_bureau,
     create_personal_workspace,
     find_account,
     memberships,
@@ -213,6 +215,66 @@ async def test_a_bureau_is_never_mistaken_for_the_personal_account(db: AsyncSess
         tenant.plan = "freelancer"
         await db.flush()
     assert personal(await memberships(db, NINO)) is None
+
+
+# ── Founding a bureau ───────────────────────────────────────────────────────
+
+
+async def _nobody(db: AsyncSession) -> Account:
+    """An account with no organisation at all — the case the chooser's
+    "Create a bureau" exists for."""
+    with bypass_tenant_scope():
+        account = Account(id=3, email="lika@acme.ge", full_name="Lika", password_hash="x")
+        db.add(account)
+        await db.flush()
+    return account
+
+
+async def test_someone_with_no_organisation_can_found_a_bureau(db: AsyncSession) -> None:
+    account = await _nobody(db)
+    assert await memberships(db, account.id) == []
+
+    created = await create_bureau(db, account, "  Tbilisi   Translations ")
+
+    assert created.tenant.display_name == "Tbilisi Translations"
+    assert created.tenant.slug == "tbilisi-translations"
+    # A bureau from the start: no plan choice, and no way to Freelancer.
+    assert created.tenant.plan == "bureau"
+    assert not created.tenant.is_personal
+    assert created.user.role is Role.OWNER
+    assert created.user.full_name == "Lika"
+    assert not verify_password("anything", created.user.password_hash)
+    assert [m.tenant.id for m in await memberships(db, account.id)] == [created.tenant.id]
+
+
+async def test_a_founded_bureau_is_not_the_personal_account(db: AsyncSession) -> None:
+    account = await _nobody(db)
+    await create_bureau(db, account, "Lika's Bureau")
+    assert personal(await memberships(db, account.id)) is None
+
+
+async def test_a_founded_bureau_starts_with_document_types(db: AsyncSession) -> None:
+    account = await _nobody(db)
+    created = await create_bureau(db, account, "Lika's Bureau")
+    with bypass_tenant_scope():
+        rows = (
+            await db.execute(
+                select(DocumentType).where(DocumentType.tenant_id == created.tenant.id)
+            )
+        ).all()
+    assert rows
+
+
+async def test_sign_up_leaves_the_plan_to_onboarding(db: AsyncSession) -> None:
+    account = await _nobody(db)
+    created = await create_bureau(db, account, "Lika's Bureau", plan=None)
+    assert created.tenant.plan is None
+
+
+async def test_a_bureau_needs_a_name(db: AsyncSession) -> None:
+    account = await _nobody(db)
+    with pytest.raises(ValidationError):
+        await create_bureau(db, account, "   x  ")
 
 
 # ── Signing out everywhere ──────────────────────────────────────────────────

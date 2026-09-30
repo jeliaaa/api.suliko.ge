@@ -19,7 +19,7 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from suliko.config import get_settings
-from suliko.core.errors import ConflictError
+from suliko.core.errors import ConflictError, ValidationError
 from suliko.db.session import bind_tenant_guc
 from suliko.db.tenancy import bypass_tenant_scope, tenant_scope
 from suliko.domain.plans import TenantPlan
@@ -134,15 +134,22 @@ async def unique_slug(db: AsyncSession, name: str) -> str:
     raise ConflictError("Could not allocate an organisation handle. Try a different name.")
 
 
-async def create_personal_workspace(db: AsyncSession, account: Account) -> Membership:
-    """The person's own organisation, on the Freelancer plan, owned by them.
+async def _found_workspace(
+    db: AsyncSession,
+    account: Account,
+    *,
+    name: str,
+    plan: TenantPlan | None,
+    is_personal: bool,
+) -> Membership:
+    """A new organisation owned by `account` — the one way one is made, for
+    sign-up, the chooser, the switcher and the personal account alike.
 
-    Created the first time they pick "Personal account". Seeded with the
-    same starter catalogues as a sign-up, so the first order has document
-    types to choose from.
+    The starter catalogues are the same ones `suliko seed-reference` adds,
+    minus prices (see domain/reference_seed.py): without them the very first
+    order has no document type to choose.
     """
     settings = get_settings()
-    name = account.full_name.strip() or account.email.split("@")[0]
     slug = await unique_slug(db, name)
 
     with bypass_tenant_scope():
@@ -150,9 +157,9 @@ async def create_personal_workspace(db: AsyncSession, account: Account) -> Membe
             slug=slug,
             display_name=name,
             status=TenantStatus.TRIAL,
-            plan=TenantPlan.FREELANCER.value,
+            plan=plan.value if plan else None,
             locale=settings.default_signup_locale,
-            is_personal=True,
+            is_personal=is_personal,
         )
         db.add(tenant)
         await db.flush()
@@ -169,7 +176,7 @@ async def create_personal_workspace(db: AsyncSession, account: Account) -> Membe
             account_id=account.id,
             username=username_for(account.email),
             email=account.email,
-            full_name=name,
+            full_name=account.full_name.strip() or name,
             password_hash=UNUSABLE_PASSWORD_HASH,
             role=Role.OWNER,
             is_active=True,
@@ -178,6 +185,37 @@ async def create_personal_workspace(db: AsyncSession, account: Account) -> Membe
         db.add(user)
         await db.flush()
     return Membership(user=user, tenant=tenant)
+
+
+async def create_personal_workspace(db: AsyncSession, account: Account) -> Membership:
+    """The person's own organisation, on the Freelancer plan, owned by them.
+
+    Created the first time they pick "Personal account".
+    """
+    name = account.full_name.strip() or account.email.split("@")[0]
+    return await _found_workspace(
+        db, account, name=name, plan=TenantPlan.FREELANCER, is_personal=True
+    )
+
+
+async def create_bureau(
+    db: AsyncSession,
+    account: Account,
+    name: str,
+    *,
+    plan: TenantPlan | None = TenantPlan.BUREAU,
+) -> Membership:
+    """A new bureau owned by this account.
+
+    From the chooser and the switcher it is a bureau from the start and stays
+    one (see `api/v1/tenant.py`): freelance work belongs in the personal
+    account. Sign-up passes `plan=None`, "has not chosen yet", and its owner
+    picks on the onboarding screen.
+    """
+    name = " ".join(name.split())
+    if len(name) < 2:
+        raise ValidationError("Enter the bureau's name.")
+    return await _found_workspace(db, account, name=name, plan=plan, is_personal=False)
 
 
 async def revoke_account_sessions(db: AsyncSession, account_id: int) -> None:
@@ -198,6 +236,7 @@ async def revoke_account_sessions(db: AsyncSession, account_id: int) -> None:
 __all__ = [
     "UNUSABLE_PASSWORD_HASH",
     "Membership",
+    "create_bureau",
     "create_personal_workspace",
     "find_account",
     "memberships",

@@ -46,10 +46,9 @@ def test_signup_looks_across_every_organisation_case_insensitively() -> None:
 def test_signup_checks_the_address_before_creating_anything() -> None:
     source = inspect.getsource(auth.signup)
     check = source.index("raise EmailTakenError")
-    assert check < source.index("unique_slug(")
     assert check < source.index("Account(")
-    assert check < source.index("Tenant(")
-    assert check < source.index("User(")
+    # The tenant, its slug and the owner row are all made in here.
+    assert check < source.index("create_bureau(")
 
 
 def test_each_probe_spends_a_signup_attempt() -> None:

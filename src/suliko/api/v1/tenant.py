@@ -13,10 +13,10 @@ until they choose. There is no separate "has seen the tour" flag, because a
 plan that has been chosen is exactly the thing onboarding exists to produce.
 
 Changing plan later is allowed and is how a freelancer becomes a bureau. The
-downgrade direction is allowed too, and is deliberately lossy in one specific
-way worth knowing: a bureau that becomes a freelancer keeps its employees as
-rows, but nobody can reach the Users screen to manage them, and their sessions
-lose `users.manage` on the next request. Nothing is deleted.
+other direction is closed to owners (2026-09-30): an organisation on the
+Bureau plan stays a bureau, and freelance work belongs in the person's own
+personal account (`tenants.is_personal`), which may still move either way.
+The platform admin can still change any tenant's plan.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict
 
 from suliko.api.deps import CurrentSession, Db, require
-from suliko.core.errors import NotFoundError
+from suliko.core.errors import ConflictError, NotFoundError
 from suliko.domain.plans import (
     PLAN_FEATURES,
     PLAN_PROVIDERS,
@@ -64,6 +64,21 @@ class TenantOut(BaseModel):
     onboarding_required: bool
     plans: dict[str, PlanOut]
     current: PlanOut
+
+
+class BureauPlanLockedError(ConflictError):
+    error_code = "bureau_plan_locked"
+
+
+def bureau_stays_bureau(tenant: Tenant, wanted: TenantPlan) -> bool:
+    """True when this change is refused: an organisation on the Bureau plan
+    moving to Freelancer. The personal account is exempt — it is the
+    freelancer's own place, and may try the Bureau plan and come back."""
+    return (
+        not tenant.is_personal
+        and parse(tenant.plan) is TenantPlan.BUREAU
+        and wanted is TenantPlan.FREELANCER
+    )
 
 
 class PlanChoice(BaseModel):
@@ -125,6 +140,11 @@ async def choose_plan(
         raise NotFoundError("Tenant not found.")
 
     before = current.plan
+    if bureau_stays_bureau(current, payload.plan):
+        raise BureauPlanLockedError(
+            "A bureau cannot switch to the Freelancer plan. "
+            "Use your personal account for freelance work."
+        )
     current.plan = payload.plan.value
     await db.flush()
 

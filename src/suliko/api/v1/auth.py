@@ -45,21 +45,18 @@ from suliko.core.ratelimit import RateLimiter, get_rate_limiter
 from suliko.db.session import bind_tenant_guc, get_sessionmaker, session_scope
 from suliko.db.tenancy import bypass_tenant_scope, tenant_scope
 from suliko.domain.accounts import (
-    UNUSABLE_PASSWORD_HASH,
     Membership,
+    create_bureau,
     create_personal_workspace,
     find_account,
     memberships,
     normalise_email,
     personal,
     revoke_account_sessions,
-    unique_slug,
     username_for,
 )
 from suliko.domain.plans import TenantPlan, effective_permissions, effective_plan
-from suliko.domain.reference_seed import seed_reference_data
-from suliko.models.reference import TenantSettings
-from suliko.models.tenant import Tenant, TenantStatus
+from suliko.models.tenant import Tenant
 from suliko.models.user import (
     Account,
     LoginAttempt,
@@ -130,6 +127,15 @@ class SelectRequest(BaseModel):
     #: An organisation's slug, or omitted with `personal` set.
     tenant_slug: str | None = Field(default=None, max_length=63)
     personal: bool = False
+
+
+class CreateBureauRequest(BaseModel):
+    ticket: str = Field(min_length=1, max_length=300)
+    organisation_name: str = Field(min_length=2, max_length=255)
+
+
+class NewBureauRequest(BaseModel):
+    organisation_name: str = Field(min_length=2, max_length=255)
 
 
 class SwitchRequest(BaseModel):
@@ -475,6 +481,75 @@ async def login_select(
     return response
 
 
+async def _found_bureau(db: AsyncSession, account: Account, name: str) -> Membership:
+    """`create_bureau` plus its audit entry — shared by the chooser and the
+    switcher, so both leave the same trail."""
+    created = await create_bureau(db, account, name)
+
+    from suliko.core.audit import record
+
+    await record(
+        db,
+        None,
+        action="tenant.bureau_created",
+        entity_type="tenant",
+        entity_id=created.tenant.id,
+        tenant_id=created.tenant.id,
+        after={"slug": created.tenant.slug, "account_id": account.id},
+    )
+    log.info("bureau_created", account_id=account.id, tenant_id=created.tenant.id)
+    return created
+
+
+@router.post("/login/create-bureau", response_model=LoginResponse)
+async def login_create_bureau(payload: CreateBureauRequest, request: Request) -> LoginResponse:
+    """Step two, the other way: found a new bureau and enter it as its owner.
+
+    Open to anyone holding a sign-in ticket — in particular someone who
+    belongs to no organisation yet, for whom this is the way in. Sign-up
+    being closed does not close this: it creates no account.
+    """
+    async with get_sessionmaker()() as db:
+        account = await _account_from_ticket(db, payload.ticket)
+        membership = await _found_bureau(db, account, payload.organisation_name)
+        response = await _start_session(
+            db,
+            membership,
+            account,
+            ip=get_client_ip(request),
+            user_agent=get_client_user_agent(request),
+        )
+        await db.commit()
+    return response
+
+
+@router.post("/organisations", response_model=LoginResponse)
+async def create_organisation(
+    payload: NewBureauRequest,
+    request: Request,
+    session: Annotated[AuthenticatedSession, Depends(get_current_session)],
+) -> LoginResponse:
+    """Found a new bureau from inside the app and switch to it, like
+    `POST /auth/switch` does for an existing one."""
+    if session.account_id is None:
+        raise ValidationError("This sign-in is not linked to an account.")
+    async with get_sessionmaker()() as db:
+        account = await db.get(Account, session.account_id)
+        if account is None:
+            raise AuthenticationError("Your account is no longer available.")
+        membership = await _found_bureau(db, account, payload.organisation_name)
+        response = await _start_session(
+            db,
+            membership,
+            account,
+            ip=get_client_ip(request),
+            user_agent=get_client_user_agent(request),
+        )
+        await revoke_session(db, session.session_id)
+        await db.commit()
+    return response
+
+
 @router.post("/switch", response_model=LoginResponse)
 async def switch_organisation(
     payload: SwitchRequest,
@@ -734,8 +809,6 @@ async def signup(
                 accounts=accounts,
             )
 
-        slug = await unique_slug(db, payload.organisation_name)
-
         account = Account(
             email=email,
             password_hash=await hash_password_async(payload.password),
@@ -744,43 +817,14 @@ async def signup(
         db.add(account)
         await db.flush()
 
-        with bypass_tenant_scope():
-            tenant = Tenant(
-                slug=slug,
-                display_name=payload.organisation_name.strip(),
-                status=TenantStatus.TRIAL,
-                # NULL: "signed up, has not chosen a plan". Onboarding sets it.
-                plan=None,
-                locale=settings.default_signup_locale,
-            )
-            db.add(tenant)
-            await db.flush()
-
-        tenant_id = int(tenant.id)
-
-        # Every row below is tenant-scoped, and this session was opened before
-        # the tenant existed at all — so nothing has set the RLS GUC.
-        await bind_tenant_guc(db, tenant_id)
+        # The same routine the chooser's "Create a bureau" uses — starter
+        # catalogues, this account as OWNER — except that the plan is left
+        # NULL ("has not chosen yet"): onboarding sets it.
+        created = await create_bureau(db, account, payload.organisation_name, plan=None)
+        tenant, user = created.tenant, created.user
+        tenant_id, slug = int(tenant.id), tenant.slug
 
         with tenant_scope(tenant_id):
-            db.add(TenantSettings(tenant_id=tenant_id, default_language=tenant.locale))
-            # The same starter catalogues `suliko seed-reference` adds, minus
-            # prices — see domain/reference_seed.py for why. Without these the
-            # very first "New translation" has no document type to choose.
-            await seed_reference_data(db)
-            user = User(
-                tenant_id=tenant_id,
-                account_id=account.id,
-                username=username,
-                email=email,
-                full_name=payload.full_name.strip(),
-                password_hash=UNUSABLE_PASSWORD_HASH,
-                role=Role.OWNER,
-                is_active=True,
-            )
-            db.add(user)
-            await db.flush()
-
             # Signed straight in. Sending someone who just chose a password
             # back to a login form to retype it is friction with no security
             # benefit — they proved possession of the password by setting it.

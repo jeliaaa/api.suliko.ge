@@ -116,8 +116,11 @@ async def test_seeding_one_organisation_leaves_the_other_empty(db: AsyncSession)
 
 
 def test_signup_seeds_catalogues_but_not_prices() -> None:
+    """Sign-up and the chooser's "Create a bureau" share one routine."""
     from suliko.api.v1 import auth
+    from suliko.domain import accounts
 
-    source = inspect.getsource(auth.signup)
+    assert "create_bureau(db, account" in inspect.getsource(auth.signup)
+    source = inspect.getsource(accounts._found_workspace)
     assert "seed_reference_data(db)" in source
     assert "with_rates=True" not in source
