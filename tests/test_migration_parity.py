@@ -37,6 +37,8 @@ LATER_REVISIONS = (
     "0010_custom_options.py",
     # `accounts` is built by 0001 on a fresh database — see test_migration_0011.py.
     "0011_accounts.py",
+    # Columns, constraints and nullability only — see test_migration_0012.py.
+    "0012_suliko_accounts.py",
 )
 
 

@@ -49,6 +49,7 @@ from suliko.domain.accounts import (
     UNUSABLE_PASSWORD_HASH,
     find_account,
     normalise_email,
+    upsert_from_suliko,
     username_for,
 )
 from suliko.domain.plans import (
@@ -59,6 +60,7 @@ from suliko.domain.plans import (
     permissions_for_plan,
 )
 from suliko.domain.portal import account_matches, normalize_email, normalize_phone, registration_url
+from suliko.integrations.suliko_backend import SulikoBackend, get_suliko_backend
 from suliko.models.portal import InviteKind, InviteStatus, PortalAccountInvite, PortalTranslator
 from suliko.models.user import Account, Role, User, UserPermissionOverride
 from suliko.security import reset_tokens
@@ -145,6 +147,9 @@ class InviteOut(BaseModel):
     #: The address already had an account: the membership waits for them to
     #: accept, and their existing password is unchanged.
     existing_account: bool
+    #: Nobody anywhere, and suliko.ge is connected: the email asks them to
+    #: register there with this address first, and the link above only accepts.
+    needs_suliko_registration: bool = False
     invite_expires_at: datetime
     #: Whether the email actually left. False is not an error: the account
     #: exists either way, and the link above is the fallback.
@@ -155,7 +160,8 @@ class InviteOut(BaseModel):
 class UserOut(BaseModel):
     id: int
     username: str
-    email: str
+    #: Null for someone who signs in with a phone number.
+    email: str | None
     full_name: str
     position: str | None
     phone: str | None
@@ -446,6 +452,9 @@ class AccountLookup(BaseModel):
     #: Already a member here — or invited and not yet accepted.
     member: bool
     pending: bool
+    #: Nobody was found, and Suliko Office is connected to suliko.ge: an
+    #: invitation will ask them to register there first, with this address.
+    registration_required: bool = False
 
 
 @router.get("/lookup", response_model=AccountLookup)
@@ -454,16 +463,38 @@ async def lookup_account(
     session: CurrentSession,
     _: Annotated[object, Depends(require(Permission.USERS_MANAGE))],
     email: Annotated[EmailStr, Query()],
+    backend: Annotated[SulikoBackend, Depends(get_suliko_backend)],
 ) -> AccountLookup:
     """Search for a person to invite, by email.
 
     Behind `users.manage`, like the invite it leads to: it tells an
     organisation's administrator whether someone has an account, which is the
     whole point of searching before inviting.
+
+    Someone registered on suliko.ge who has never opened Suliko Office has no
+    account here yet, but is still found: suliko.ge is asked, and nothing is
+    written by a search. If suliko.ge cannot be asked this is a 503 rather
+    than "no account" — an administrator who is told nobody exists would
+    invite them to register again.
     """
     account = await find_account(db, str(email))
     if account is None:
-        return AccountLookup(exists=False, full_name=None, member=False, pending=False)
+        if backend.enabled:
+            person = await backend.find_user(str(email))
+            if person is not None:
+                return AccountLookup(
+                    exists=True,
+                    full_name=person.full_name or None,
+                    member=False,
+                    pending=False,
+                )
+        return AccountLookup(
+            exists=False,
+            full_name=None,
+            member=False,
+            pending=False,
+            registration_required=backend.enabled,
+        )
     row = (
         await db.execute(select(User).where(User.account_id == account.id).limit(1))
     ).scalar_one_or_none()
@@ -502,13 +533,29 @@ def _invite_email(
     *,
     existing_account: bool,
     suliko_account: SulikoAccountOut,
+    needs_registration: bool = False,
 ) -> tuple[str, str]:
     """Subject and plain-text body. Everything they need in one message."""
     account_paragraph = _suliko_account_paragraph(
         linked=suliko_account.status == "linked",
         matched_display_name=suliko_account.matched_display_name,
     )
-    if existing_account:
+    if needs_registration:
+        # No account anywhere. Passwords live on suliko.ge, so they register
+        # there first, with exactly this address, and only then accept — which
+        # is what lets the address they sign in with be the one invited.
+        how = (
+            "To join, do two things:\n\n"
+            f"1. Register on suliko.ge with exactly this email address "
+            f"({user.email}):\n   {registration_url()}\n\n"
+            f"2. Then accept the invitation here:\n   {invite_link}\n\n"
+            f"The link works once and expires in {valid_days} days. After that, "
+            f"sign in to Suliko Office with {user.email} and your suliko.ge "
+            f"password, and choose {tenant_name}.\n\n"
+        )
+        # The registration step above is the whole of what suliko.ge needs.
+        account_paragraph = ""
+    elif existing_account:
         how = (
             f"Accept the invitation here:\n\n{invite_link}\n\n"
             f"The link works once and expires in {valid_days} days. Then sign in "
@@ -539,15 +586,22 @@ async def invite_user(
     session: CurrentSession,
     _: Annotated[object, Depends(require(Permission.USERS_MANAGE))],
     limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
+    backend: Annotated[SulikoBackend, Depends(get_suliko_backend)],
 ) -> InviteOut:
     """Invite someone into the organisation.
 
     Someone who already has an account gets a pending membership and an
-    accept link; their password stays theirs. Someone who does not gets an
-    account with no usable password and a single-use set-password link — using
-    it both sets the password and accepts. Either way the membership is
-    invisible to sign-in until they act on the email, and nobody but them
-    ever knows their password.
+    accept link; their password stays theirs. That includes someone registered
+    on suliko.ge who has never opened Suliko Office: suliko.ge is asked, and
+    their account is made on the spot.
+
+    Someone who is nowhere gets a pending membership under a placeholder
+    account. With suliko.ge connected, the email tells them to register there
+    with exactly this address and then accept; the placeholder becomes their
+    account the first time they sign in. Without it, they get a single-use
+    set-password link instead — using it both sets the password and accepts.
+    Either way the membership is invisible to sign-in until they act on the
+    email, and nobody but them ever knows their password.
     """
     _guard_assignable(session.role, payload.role)
 
@@ -561,6 +615,14 @@ async def invite_user(
     email = normalise_email(str(payload.email))
     username = username_for(email)
     account = await find_account(db, email)
+    if account is None and backend.enabled:
+        # Registered on suliko.ge, never seen here: make their account now, so
+        # the invitation is to a real person with a password of their own. A
+        # suliko.ge that cannot be asked is a 503 (SulikoUnavailableError), not
+        # a reason to invite them to register a second time.
+        person = await backend.find_user(email)
+        if person is not None:
+            account = (await upsert_from_suliko(db, person)).account
 
     clash = (
         (
@@ -594,11 +656,20 @@ async def invite_user(
     _guard_grantable(session, requested)
 
     existing_account = account is not None
+    # Nobody anywhere, and passwords live on suliko.ge: they register there.
+    needs_registration = account is None and backend.enabled
     if account is None:
-        # Nobody knows this password — the set-password link replaces it.
+        # A placeholder. Nobody knows its password; with suliko.ge connected it
+        # has none at all and becomes the person's own at their first sign-in
+        # (`upsert_from_suliko` finds it by this address). Otherwise the
+        # set-password link below replaces it.
         account = Account(
             email=email,
-            password_hash=await hash_password_async(generate_token()),
+            password_hash=(
+                UNUSABLE_PASSWORD_HASH
+                if needs_registration
+                else await hash_password_async(generate_token())
+            ),
             full_name=payload.full_name.strip(),
         )
         db.add(account)
@@ -677,7 +748,7 @@ async def invite_user(
     settings = get_settings()
     ttl_seconds = settings.invite_link_ttl_hours * 3600
     base = f"{settings.app_url.rstrip('/')}/{session.tenant_locale}"
-    if existing_account:
+    if existing_account or needs_registration:
         token = await reset_tokens.issue(
             db, row, ttl_seconds=ttl_seconds, purpose=reset_tokens.INVITATION
         )
@@ -693,6 +764,7 @@ async def invite_user(
         max(1, settings.invite_link_ttl_hours // 24),
         existing_account=existing_account,
         suliko_account=suliko_account,
+        needs_registration=needs_registration,
     )
     await limiter.record_invite(tenant_key)
     result = await mail.send(email, subject, body)
@@ -702,6 +774,7 @@ async def invite_user(
         user=_out(row, session.plan, overrides, suliko_account),
         invite_link=invite_link,
         existing_account=existing_account,
+        needs_suliko_registration=needs_registration,
         invite_expires_at=datetime.now(UTC) + timedelta(seconds=ttl_seconds),
         email_sent=result.delivered,
         suliko_account=suliko_account,

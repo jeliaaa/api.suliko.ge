@@ -118,7 +118,8 @@ class TenantPage(BaseModel):
 class PlatformUser(BaseModel):
     id: int
     username: str
-    email: str
+    #: Null for someone who signs in with a phone number.
+    email: str | None
     full_name: str
     position: str | None
     role: Role

@@ -177,10 +177,12 @@ def test_an_invite_never_logs_the_password() -> None:
 
 def test_an_invitation_sets_no_password_anyone_knows() -> None:
     """Otherwise the inviter keeps a working credential for someone else's
-    account. A new person's account gets a random hash nobody holds; the
-    membership row gets none at all, and waits to be accepted."""
+    account. A new person's account gets a random hash nobody holds (or, with
+    suliko.ge connected, none at all: they register there); the membership
+    row gets none at all, and waits to be accepted."""
     source = _source("invite_user")
-    assert "password_hash=await hash_password_async(generate_token())" in source
+    assert "await hash_password_async(generate_token())" in source
+    assert "UNUSABLE_PASSWORD_HASH" in source
     assert "password_hash=UNUSABLE_PASSWORD_HASH" in source
     assert "invitation_pending=True" in source
 

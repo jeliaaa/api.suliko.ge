@@ -48,10 +48,23 @@ class Account(Base, IdMixin, TimestampMixin):
     """
 
     __tablename__ = "accounts"
-    __table_args__ = (UniqueConstraint("email", name="uq_accounts_email"),)
+    __table_args__ = (
+        UniqueConstraint("email", name="uq_accounts_email"),
+        UniqueConstraint("phone", name="uq_accounts_phone"),
+        UniqueConstraint("suliko_user_id", name="uq_accounts_suliko_user_id"),
+    )
 
-    #: Stored lower-case: the address a person types is compared as such.
-    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    #: Stored lower-case: the address a person types is compared as such. Null
+    #: for someone who signed up to suliko.ge with a phone number: they have no
+    #: address, and `phone` is how they sign in.
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    #: The phone number a suliko.ge account signs in with, exactly as that
+    #: account holds it. Null for everyone who signs in with an address.
+    phone: Mapped[str | None] = mapped_column(String(50), default=None)
+    #: The person's id on suliko.ge (an ASP.NET Identity GUID). Set means the
+    #: password is THEIRS on suliko.ge and `password_hash` is not used; null
+    #: means an Office-only account with a password of its own.
+    suliko_user_id: Mapped[str | None] = mapped_column(String(450), default=None)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     full_name: Mapped[str] = mapped_column(String(255), nullable=False)
     #: The password came from somebody else — an invite's set-password step
@@ -77,7 +90,8 @@ class User(Base, IdMixin, TenantScoped, TimestampMixin):
     )
 
     username: Mapped[str] = mapped_column(String(100), nullable=False)
-    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    #: Null for a membership of someone who signs in with a phone number.
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     full_name: Mapped[str] = mapped_column(String(255), nullable=False)
 
     #: Job title, free text — "Project manager", "Notary liaison". Shown on

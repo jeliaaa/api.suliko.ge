@@ -59,9 +59,10 @@ def test_resend_is_rate_limited_per_account_before_it_sends() -> None:
 
 
 def test_resend_does_nothing_once_already_verified() -> None:
-    """Verified is the account's state, which the session already carries."""
+    """Verified is the account's state, which the session already carries. So
+    is having no address at all (a phone sign-in): nothing to confirm."""
     source = inspect.getsource(auth.resend_verification_email)
-    assert "if session.email_verified:" in source
+    assert "if session.email_verified or not user.email:" in source
 
 
 def test_reset_password_also_marks_the_email_verified() -> None:

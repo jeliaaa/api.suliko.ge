@@ -20,8 +20,9 @@ from urllib.parse import quote
 
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Depends, Request, status
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from suliko.api.deps import (
@@ -45,17 +46,29 @@ from suliko.core.ratelimit import RateLimiter, get_rate_limiter
 from suliko.db.session import bind_tenant_guc, get_sessionmaker, session_scope
 from suliko.db.tenancy import bypass_tenant_scope, tenant_scope
 from suliko.domain.accounts import (
+    UNUSABLE_PASSWORD_HASH,
     Membership,
     create_bureau,
     create_personal_workspace,
     find_account,
+    find_account_by_login,
+    find_account_by_suliko_id,
+    login_name,
     memberships,
     normalise_email,
     personal,
     revoke_account_sessions,
+    upsert_from_suliko,
     username_for,
 )
 from suliko.domain.plans import TenantPlan, effective_permissions, effective_plan
+from suliko.domain.portal import registration_url
+from suliko.integrations.suliko_backend import (
+    PasswordOutcome,
+    SulikoBackend,
+    SulikoUnavailableError,
+    get_suliko_backend,
+)
 from suliko.models.tenant import Tenant
 from suliko.models.user import (
     Account,
@@ -88,9 +101,30 @@ log = structlog.get_logger()
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+class PasswordManagedExternallyError(ConflictError):
+    """The password of a suliko.ge account is changed on suliko.ge, not here."""
+
+    error_code = "password_managed_by_suliko"
+
+
 class LoginRequest(BaseModel):
-    email: str = Field(min_length=3, max_length=255)
+    #: What the person signs in with: an email address or a phone number —
+    #: whatever they use on suliko.ge.
+    identifier: str | None = Field(default=None, min_length=1, max_length=255)
+    #: The old name for `identifier`. Still accepted, so this API can be
+    #: deployed before the frontend that sends the new one.
+    email: str | None = Field(default=None, min_length=1, max_length=255)
     password: str = Field(min_length=1, max_length=1024)
+
+    @model_validator(mode="after")
+    def _has_a_login(self) -> LoginRequest:
+        if not self.login:
+            raise ValueError("identifier is required")
+        return self
+
+    @property
+    def login(self) -> str:
+        return (self.identifier or self.email or "").strip()
 
 
 class OrgChoice(BaseModel):
@@ -111,7 +145,10 @@ class LoginOptions(BaseModel):
     """
 
     ticket: str
-    email: str
+    #: Their address, if they have one — a phone-only person has none.
+    email: str | None
+    #: What they sign in with: the address, else the phone. Always set.
+    login: str
     full_name: str
     organizations: list[OrgChoice]
     personal: OrgChoice | None
@@ -212,6 +249,7 @@ async def _login_options(db: AsyncSession, account: Account, ticket: str) -> Log
     return LoginOptions(
         ticket=ticket,
         email=account.email,
+        login=login_name(account),
         full_name=account.full_name,
         organizations=organizations,
         personal=own,
@@ -219,55 +257,122 @@ async def _login_options(db: AsyncSession, account: Account, ticket: str) -> Log
     )
 
 
+async def _account_for_suliko_user(
+    db: AsyncSession, backend: SulikoBackend, suliko_user_id: str
+) -> Account:
+    """The account of a person suliko.ge has just vouched for, made on first sight.
+
+    Found by suliko.ge id; failing that, asked about (the directory says who
+    they are) and put through the one rule in `upsert_from_suliko`. Raises
+    SulikoUnavailableError if suliko.ge cannot say who they are — never a
+    guess.
+    """
+    account = await find_account_by_suliko_id(db, suliko_user_id)
+    if account is not None:
+        return account
+
+    person = await backend.get_user(suliko_user_id)
+    if person is None:
+        # It accepted the password a moment ago and now does not know them:
+        # not something to turn into a login or a refusal.
+        log.error("suliko_user_vanished")
+        raise SulikoUnavailableError("Sign-in is unavailable right now. Try again in a minute.")
+    try:
+        return (await upsert_from_suliko(db, person)).account
+    except IntegrityError:
+        # The same person's first two sign-ins raced; the other one won.
+        await db.rollback()
+        account = await find_account_by_suliko_id(db, suliko_user_id)
+        if account is None:
+            raise
+        return account
+
+
+async def _authenticate(
+    db: AsyncSession, backend: SulikoBackend, login: str, password: str
+) -> tuple[Account | None, bool]:
+    """Who a login and password belong to: `(account, False)`, `(None, False)`
+    for a wrong one, or `(None, True)` when suliko.ge could not be asked.
+
+    suliko.ge's password wins wherever there is one: a right answer there is a
+    sign-in whatever Office holds. Failing that, only an account with no link
+    to suliko.ge (a platform operator, anyone invited before this existed) may
+    still use a password of its own.
+    """
+    check = await backend.check_password(login, password) if backend.enabled else None
+    if check is not None and check.accepted and check.user_id:
+        return await _account_for_suliko_user(db, backend, check.user_id), False
+
+    account = await find_account_by_login(db, login)
+    if account is not None and account.suliko_user_id is None:
+        ok, new_hash = await verify_and_maybe_rehash_async(password, account.password_hash)
+        if ok:
+            # Transparent bcrypt -> Argon2id upgrade, on the person's own login.
+            if new_hash is not None:
+                account.password_hash = new_hash
+                log.info("password_rehashed", account_id=account.id)
+            return account, False
+    else:
+        # Nothing to verify locally; spend the time anyway so a login that
+        # does not exist costs what one that does.
+        await waste_time_verifying_async()
+
+    if check is not None and check.outcome is PasswordOutcome.UNAVAILABLE:
+        # The password may well have been right, only unprovable just now.
+        return None, True
+    return None, False
+
+
 @router.post("/login", response_model=LoginOptions)
 async def login(
     payload: LoginRequest,
     request: Request,
     limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
+    backend: Annotated[SulikoBackend, Depends(get_suliko_backend)],
 ) -> LoginOptions:
-    """Step one: email and password — for the person, not an organisation.
+    """Step one: email or phone, and password — for the person, not an organisation.
 
-    Failure is uniform: the same message, the same status, and — via
-    ``waste_time_verifying`` — approximately the same latency whether the
-    address or the password was wrong. Anything else enumerates accounts.
+    The password is checked by suliko.ge for everyone registered there (see
+    `integrations/suliko_backend.py`), and by Office itself only for accounts
+    with no suliko.ge link.
+
+    Failure is uniform: the same message, the same status, and approximately
+    the same latency whether the login or the password was wrong. Anything
+    else enumerates accounts. suliko.ge being unreachable is the one honest
+    exception — a 503, not counted against the person's attempts.
 
     Success is not a session yet. It is a ticket and the list of places the
     person can enter; `POST /auth/login/select` turns one into a session.
     """
     ip = get_client_ip(request)
     user_agent = get_client_user_agent(request)
-    email = normalise_email(payload.email)
+    login_text = payload.login
+    login_key = login_text.lower()
 
     # Per-account and per-IP, so one attacker cannot lock a real user out
     # platform-wide by hammering their address from everywhere.
-    account_key = f"login:acct:{email}"
+    account_key = f"login:acct:{login_key}"
     ip_key = f"login:ip:{ip or 'unknown'}"
     if retry := await limiter.check_login(account_key, ip_key):
         raise RateLimitedError("Too many attempts. Try again later.", retry_after=retry)
 
     async with get_sessionmaker()() as db:
-        account = await find_account(db, email)
+        account, unavailable = await _authenticate(db, backend, login_text, payload.password)
+
+        if unavailable:
+            await _record_attempt(db, login_key, ip, user_agent, False, "upstream_unavailable")
+            await db.commit()
+            raise SulikoUnavailableError(
+                "Sign-in is temporarily unavailable. Try again in a minute."
+            )
 
         if account is None:
-            await waste_time_verifying_async()
             await limiter.record_login_failure(account_key, ip_key)
-            await _record_attempt(db, email, ip, user_agent, False, "no_such_account")
+            await _record_attempt(db, login_key, ip, user_agent, False, "bad_credentials")
             await db.commit()
-            raise AuthenticationError("Invalid email or password.")
+            raise AuthenticationError("Invalid email, phone or password.")
 
-        ok, new_hash = await verify_and_maybe_rehash_async(payload.password, account.password_hash)
-        if not ok:
-            await limiter.record_login_failure(account_key, ip_key)
-            await _record_attempt(db, email, ip, user_agent, False, "bad_password")
-            await db.commit()
-            raise AuthenticationError("Invalid email or password.")
-
-        # Transparent bcrypt -> Argon2id upgrade, on the person's own login.
-        if new_hash is not None:
-            account.password_hash = new_hash
-            log.info("password_rehashed", account_id=account.id)
-
-        await _record_attempt(db, email, ip, user_agent, True)
+        await _record_attempt(db, login_key, ip, user_agent, True)
         await limiter.clear_login_failures(account_key)
         options = await _login_options(
             db, account, login_tickets.issue(account.id, account.password_hash)
@@ -299,7 +404,7 @@ async def login_options(payload: TicketRequest) -> LoginOptions:
 def _personal_enabled_email(account: Account, link: str) -> tuple[str, str]:
     """Subject and plain-text body. No HTML — see core/mail.py."""
     body = (
-        f"Hello {account.full_name or account.email},\n\n"
+        f"Hello {account.full_name or login_name(account)},\n\n"
         "Your personal Suliko account is now enabled, on the Freelancer plan. "
         "It is yours alone: your own clients, orders and prices, separate from "
         "any bureau you work with.\n\n"
@@ -342,8 +447,10 @@ async def _resolve_choice(
         link = f"{settings.app_url.rstrip('/')}/{own.tenant.locale}/login"
         subject, body = _personal_enabled_email(account, link)
         # After the response, which is after the commit: the email must not
-        # announce a workspace a rolled-back transaction never created.
-        background.add_task(mail.send, account.email, subject, body)
+        # announce a workspace a rolled-back transaction never created. Someone
+        # who signs in with a phone number has no address to tell.
+        if account.email:
+            background.add_task(mail.send, account.email, subject, body)
         log.info("personal_workspace_created", account_id=account.id, tenant_id=own.tenant.id)
         return own
 
@@ -886,7 +993,7 @@ async def signup(
         f"?token={quote(verification_token, safe='')}"
     )
     subject, body = _verification_email(user, tenant, link, settings.email_verification_ttl_hours)
-    background.add_task(mail.send, user.email, subject, body)
+    background.add_task(mail.send, email, subject, body)
 
     return SignupResponse(
         session_token=issued.token,
@@ -986,7 +1093,8 @@ async def resend_verification_email(
     user = await db.get(User, session.user_id)
     if user is None:
         raise AuthenticationError("Your account is no longer available.")
-    if session.email_verified:
+    # Nothing to confirm for someone who signs in with a phone number.
+    if session.email_verified or not user.email:
         return
 
     account_key = f"emailverify:user:{user.id}"
@@ -1060,6 +1168,23 @@ def _reset_email(account: Account, link: str, ttl_minutes: int) -> tuple[str, st
     return "Reset your Suliko password", body
 
 
+def _suliko_password_email(account: Account, reset_url: str) -> tuple[str, str]:
+    """For someone whose password lives on suliko.ge: where to reset it."""
+    body = (
+        f"Hello {account.full_name or login_name(account)},\n\n"
+        "Someone asked to reset the password for your Suliko Office account "
+        f"({login_name(account)}).\n\n"
+        "Your password is kept on suliko.ge, and Suliko Office signs you in with it, "
+        "so it is changed there. Reset it here:\n\n"
+        f"{reset_url}\n\n"
+        "Then sign in to Suliko Office with the new password.\n\n"
+        "No suliko.ge account yet? Register with exactly this email address, "
+        f"then sign in here:\n\n{registration_url()}\n\n"
+        "If this wasn't you, you can ignore this email — nothing has changed.\n"
+    )
+    return "Reset your Suliko password", body
+
+
 @router.post("/password/forgot", status_code=status.HTTP_204_NO_CONTENT)
 async def forgot_password(
     payload: ForgotPasswordRequest,
@@ -1091,6 +1216,17 @@ async def forgot_password(
 
     async with get_sessionmaker()() as db:
         account = await find_account(db, email)
+        if account is not None and (
+            account.suliko_user_id is not None or account.password_hash == UNUSABLE_PASSWORD_HASH
+        ):
+            # Their password is on suliko.ge, so no link of ours could change
+            # it — or they are an invitee who has not registered there yet, and
+            # a link of ours would hand them a password that exists only here.
+            # They are told where to go instead — after the response, like the
+            # mail below, so this costs the same as the path that issues a token.
+            subject, body = _suliko_password_email(account, settings.suliko_password_reset_url)
+            background.add_task(mail.send, email, subject, body)
+            return
         # The token is the reset-token machinery's, which is per membership
         # row; the one used most recently carries it. Which row it is changes
         # nothing — the password it sets is the account's.
@@ -1143,7 +1279,7 @@ async def forgot_password(
     # After the response, not before it. Sending inline made a known account
     # take seconds (SMTP handshake, TLS, login) and an unknown one return at
     # once — the response time alone told anyone which addresses exist.
-    background.add_task(mail.send, account.email, subject, body)
+    background.add_task(mail.send, email, subject, body)
 
 
 @router.post("/password/reset", status_code=status.HTTP_204_NO_CONTENT)
@@ -1167,6 +1303,13 @@ async def reset_password(payload: ResetPasswordRequest, request: Request) -> Non
             raise ValidationError(
                 "This reset link is no longer valid. Request a new one and "
                 "use the most recent email."
+            )
+        if account.suliko_user_id is not None:
+            # The link was issued before this person's account became a
+            # suliko.ge one (an invitation sent ahead of their registering
+            # there). Their password is not ours to set any more.
+            raise PasswordManagedExternallyError(
+                "Your password is kept on suliko.ge. Reset it there, then sign in here."
             )
 
         now = datetime.now(UTC)
@@ -1219,6 +1362,11 @@ async def change_password(
     account = await db.get(Account, session.account_id) if session.account_id else None
     if account is None:
         raise AuthenticationError("Your account is no longer available.")
+    if account.suliko_user_id is not None:
+        # Nothing here to change: the password is suliko.ge's.
+        raise PasswordManagedExternallyError(
+            "Your password is kept on suliko.ge. Change it there, then sign in here."
+        )
 
     ok, _ = await verify_and_maybe_rehash_async(payload.current_password, account.password_hash)
     if not ok:
@@ -1302,7 +1450,13 @@ class SessionInfo(BaseModel):
     user_id: int
     username: str
     full_name: str
-    email: str
+    #: Null for someone who signs in with a phone number.
+    email: str | None
+    #: What they sign in with: the address, else the phone.
+    login: str
+    #: The password is kept on suliko.ge: Office cannot change it, and the
+    #: account page says where to.
+    password_managed_externally: bool = False
     role: str
     tenant_id: int
     tenant_slug: str
@@ -1339,9 +1493,15 @@ async def current_session(
     """What the BFF calls on every page load to hydrate the shell."""
     organizations: list[OrgChoice] = []
     own: OrgChoice | None = None
+    login = session.email or session.username
+    managed_externally = False
     if session.account_id is not None:
         async with get_sessionmaker()() as db:
             organizations, own = await _choices(db, session.account_id)
+            account = await db.get(Account, session.account_id)
+            if account is not None:
+                login = login_name(account) or login
+                managed_externally = account.suliko_user_id is not None
     return SessionInfo(
         organizations=organizations,
         personal=own,
@@ -1349,6 +1509,8 @@ async def current_session(
         username=session.username,
         full_name=session.full_name,
         email=session.email,
+        login=login,
+        password_managed_externally=managed_externally,
         role=session.role.value,
         tenant_id=session.tenant_id,
         tenant_slug=session.tenant_slug,

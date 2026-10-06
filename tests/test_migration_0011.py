@@ -26,10 +26,16 @@ def test_accounts_matches_the_model(revision: tuple[Any, RecordedOps]) -> None:
     _, ops = revision
     migrated = ops.tables["accounts"]
     declared = Account.__table__
-    assert set(migrated.columns.keys()) == set(declared.columns.keys())
+    # What revision 0012 adds to, or relaxes on, this table afterwards.
+    added_later = {"phone", "suliko_user_id"}
+    relaxed_later = {"email"}
+    assert set(migrated.columns.keys()) == set(declared.columns.keys()) - added_later
     for name, column in declared.columns.items():
+        if name in added_later:
+            continue
         other = migrated.columns[name]
-        assert other.nullable == column.nullable, f"accounts.{name}: nullability differs"
+        if name not in relaxed_later:
+            assert other.nullable == column.nullable, f"accounts.{name}: nullability differs"
         assert str(other.type) == str(column.type), f"accounts.{name}: type differs"
 
 

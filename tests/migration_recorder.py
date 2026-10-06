@@ -29,6 +29,11 @@ class RecordedOps:
     #: Columns added to tables an EARLIER revision owns, as (table, column).
     added_columns: list[tuple[str, sa.Column[object]]] = field(default_factory=list)
     dropped_columns: list[tuple[str, str]] = field(default_factory=list)
+    #: (table, column, nullable) for each `alter_column` that changed nullability.
+    altered_columns: list[tuple[str, str, bool]] = field(default_factory=list)
+    #: (name, table, columns) for each unique constraint created on an existing table.
+    unique_constraints: list[tuple[str, str, list[str]]] = field(default_factory=list)
+    dropped_constraints: list[tuple[str, str]] = field(default_factory=list)
 
     def get_bind(self) -> None:
         """There is no database.
@@ -45,6 +50,18 @@ class RecordedOps:
 
     def drop_column(self, table: str, name: str, **_kwargs: Any) -> None:
         self.dropped_columns.append((table, name))
+
+    def alter_column(
+        self, table: str, column: str, *, nullable: bool | None = None, **_kwargs: Any
+    ) -> None:
+        if nullable is not None:
+            self.altered_columns.append((table, column, nullable))
+
+    def create_unique_constraint(self, name: str, table: str, columns: list[str]) -> None:
+        self.unique_constraints.append((name, table, list(columns)))
+
+    def drop_constraint(self, name: str, table: str, **_kwargs: Any) -> None:
+        self.dropped_constraints.append((name, table))
 
     def create_table(self, name: str, *columns: Any, **kwargs: Any) -> sa.Table:
         # A private MetaData: the real one already holds these tables, and

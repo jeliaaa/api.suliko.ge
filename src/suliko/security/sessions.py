@@ -48,7 +48,8 @@ class AuthenticatedSession:
     user_id: int
     username: str
     full_name: str
-    email: str
+    #: None for someone who signs in with a phone number.
+    email: str | None
     role: Role
     tenant_id: int
     #: The bureau's slug and display name. Resolved here rather than fetched
@@ -221,9 +222,12 @@ async def resolve_session(db: AsyncSession, token: str) -> AuthenticatedSession 
         must_change_password = (
             account.must_change_password if account else user.must_change_password
         )
-        email_verified = (
-            account.email_verified_at if account else user.email_verified_at
-        ) is not None
+        # No address, nothing to confirm: someone who signs in with a phone
+        # number must not be nagged to verify an email they do not have.
+        has_address = (account.email if account else user.email) is not None
+        email_verified = not has_address or (
+            (account.email_verified_at if account else user.email_verified_at) is not None
+        )
 
         has_mfa = bool(
             await db.scalar(

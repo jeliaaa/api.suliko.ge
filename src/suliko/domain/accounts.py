@@ -1,11 +1,16 @@
 """People, their accounts, and the organisations they belong to.
 
-An `Account` is a person: one email, one password. Each organisation they
-belong to is a `users` row whose `account_id` points at it, carrying that
-organisation's role and permissions. This module is the one place that
-answers "which organisations can this person enter?" and that creates the
-personal workspace, so the sign-in chooser, the in-app switcher and
-invitations cannot disagree about either.
+An `Account` is a person: one sign-in (an email, or a phone number for
+someone who registered on suliko.ge with one) and one password. Each
+organisation they belong to is a `users` row whose `account_id` points at it,
+carrying that organisation's role and permissions. This module is the one
+place that answers "which organisations can this person enter?" and that
+creates the personal workspace, so the sign-in chooser, the in-app switcher
+and invitations cannot disagree about either.
+
+It is also where a person on suliko.ge becomes an account here
+(`upsert_from_suliko`): sign-in, the invite search and the import all go
+through that one rule, so they cannot disagree about who is who.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ from suliko.db.session import bind_tenant_guc
 from suliko.db.tenancy import bypass_tenant_scope, tenant_scope
 from suliko.domain.plans import TenantPlan
 from suliko.domain.reference_seed import seed_reference_data
+from suliko.integrations.suliko_backend import SulikoUser
 from suliko.models.reference import TenantSettings
 from suliko.models.tenant import Tenant, TenantStatus
 from suliko.models.user import Account, Role, User
@@ -44,10 +50,114 @@ def username_for(email: str) -> str:
     return email if len(email) <= 100 else email.split("@")[0][:100]
 
 
+def login_name(account: Account) -> str:
+    """What this person signs in with: their address, else their phone."""
+    return account.email or account.phone or ""
+
+
+def username_for_account(account: Account) -> str:
+    """`users.username` for a membership of this account."""
+    if account.email:
+        return username_for(account.email)
+    return (account.phone or "").strip()[:100]
+
+
 async def find_account(db: AsyncSession, email: str) -> Account | None:
     return (
         await db.execute(select(Account).where(Account.email == normalise_email(email)))
     ).scalar_one_or_none()
+
+
+async def find_account_by_login(db: AsyncSession, login: str) -> Account | None:
+    """The account an email or a phone number belongs to."""
+    login = login.strip()
+    if "@" in login:
+        return await find_account(db, login)
+    return (await db.execute(select(Account).where(Account.phone == login))).scalar_one_or_none()
+
+
+async def find_account_by_suliko_id(db: AsyncSession, suliko_user_id: str) -> Account | None:
+    return (
+        await db.execute(select(Account).where(Account.suliko_user_id == suliko_user_id))
+    ).scalar_one_or_none()
+
+
+class SulikoAccountConflictError(ConflictError):
+    """Two different people claim one sign-in. Needs a person to look at it."""
+
+    error_code = "suliko_account_conflict"
+
+
+@dataclass(frozen=True, slots=True)
+class SulikoLink:
+    account: Account
+    #: A new account was made for them.
+    created: bool
+    #: An Office account that already existed (same address) now answers to
+    #: suliko.ge's password instead of its own.
+    linked_existing: bool
+
+
+def link_account_to_suliko(account: Account, person: SulikoUser, *, now: datetime) -> None:
+    """Make `account` this suliko.ge person's, whose password is the one on suliko.ge.
+
+    The account's own password stops working: it is replaced by one that
+    verifies as nothing, so unlinking later cannot revive a stale password.
+    """
+    account.suliko_user_id = person.id
+    if person.phone and not account.phone:
+        account.phone = person.phone
+    account.password_hash = UNUSABLE_PASSWORD_HASH
+    account.must_change_password = False
+    if not account.full_name.strip():
+        account.full_name = person.full_name or person.user_name
+    # suliko.ge proved this address at registration (a code sent to it, or the
+    # provider's own verification), so it is as good as confirmed here.
+    if person.email and account.email == person.email and account.email_verified_at is None:
+        account.email_verified_at = now
+
+
+async def upsert_from_suliko(db: AsyncSession, person: SulikoUser) -> SulikoLink:
+    """The one rule for turning a person on suliko.ge into an account here.
+
+    1. Already linked by suliko.ge id: that account.
+    2. Their sign-in address belongs to an Office account that is not linked
+       to anyone: link it. Same address, proven on suliko.ge.
+    3. Otherwise a new account, with the address or the phone they sign in
+       with and no password of its own (it is suliko.ge's).
+
+    Identity is the suliko.ge id; the address or phone is only what they
+    type. A different suliko.ge person holding an address that an Office
+    account has linked elsewhere is a conflict, never a quiet takeover.
+    """
+    now = datetime.now(UTC)
+
+    linked = await find_account_by_suliko_id(db, person.id)
+    if linked is not None:
+        return SulikoLink(linked, created=False, linked_existing=False)
+
+    office = await find_account_by_login(db, person.user_name)
+    if office is not None:
+        if office.suliko_user_id not in (None, person.id):
+            raise SulikoAccountConflictError(
+                "This sign-in is already linked to another person. Contact support."
+            )
+        link_account_to_suliko(office, person, now=now)
+        await db.flush()
+        return SulikoLink(office, created=False, linked_existing=True)
+
+    account = Account(
+        email=person.email,
+        phone=person.phone,
+        suliko_user_id=person.id,
+        password_hash=UNUSABLE_PASSWORD_HASH,
+        full_name=person.full_name or person.user_name,
+        must_change_password=False,
+        email_verified_at=now if person.email else None,
+    )
+    db.add(account)
+    await db.flush()
+    return SulikoLink(account, created=True, linked_existing=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,7 +284,7 @@ async def _found_workspace(
         user = User(
             tenant_id=tenant_id,
             account_id=account.id,
-            username=username_for(account.email),
+            username=username_for_account(account),
             email=account.email,
             full_name=account.full_name.strip() or name,
             password_hash=UNUSABLE_PASSWORD_HASH,
@@ -192,7 +302,7 @@ async def create_personal_workspace(db: AsyncSession, account: Account) -> Membe
 
     Created the first time they pick "Personal account".
     """
-    name = account.full_name.strip() or account.email.split("@")[0]
+    name = account.full_name.strip() or login_name(account).split("@")[0]
     return await _found_workspace(
         db, account, name=name, plan=TenantPlan.FREELANCER, is_personal=True
     )
@@ -236,14 +346,22 @@ async def revoke_account_sessions(db: AsyncSession, account_id: int) -> None:
 __all__ = [
     "UNUSABLE_PASSWORD_HASH",
     "Membership",
+    "SulikoAccountConflictError",
+    "SulikoLink",
     "create_bureau",
     "create_personal_workspace",
     "find_account",
+    "find_account_by_login",
+    "find_account_by_suliko_id",
+    "link_account_to_suliko",
+    "login_name",
     "memberships",
     "normalise_email",
     "personal",
     "revoke_account_sessions",
     "slug_candidate",
     "unique_slug",
+    "upsert_from_suliko",
     "username_for",
+    "username_for_account",
 ]

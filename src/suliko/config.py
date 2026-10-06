@@ -219,6 +219,20 @@ class Settings(BaseSettings):
     #: `domain/portal.py`'s registration-link helpers.
     suliko_site_url: str = "https://suliko.ge"
 
+    # ── suliko.ge's backend (sign-in and the user directory) ───────────────
+    #: Base URL of suliko.ge's .NET backend, e.g. https://content.api24.ge.
+    #: Set, people sign in to Suliko Office with their suliko.ge email or phone
+    #: and password, which suliko.ge checks (`integrations/suliko_backend.py`).
+    #: Unset: that is off, and sign-in works on Office's own passwords alone.
+    suliko_api_url: str | None = None
+    #: The key suliko.ge's `Office:ApiKey` is set to; sent as `X-Office-Key` on
+    #: its user-directory endpoints. A password check needs none.
+    suliko_api_key: SecretStr = SecretStr("")
+    suliko_api_timeout_seconds: float = 10.0
+    #: Where a person resets a suliko.ge password — sent to those who ask to
+    #: reset it here, since Office does not hold it.
+    suliko_password_reset_url: str = "https://suliko.ge/login"  # noqa: S105 -- a URL
+
     # ── CORS ────────────────────────────────────────────────────────────────
     # The Next.js BFF calls this API server-side. The one exception is portal
     # file transfer, where a browser holding a signed ticket uploads or
@@ -247,6 +261,11 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
+
+    @property
+    def suliko_backend_enabled(self) -> bool:
+        """Whether suliko.ge's backend is wired in (see `suliko_api_url`)."""
+        return bool((self.suliko_api_url or "").strip())
 
     @property
     def email_configured(self) -> bool:
@@ -285,6 +304,11 @@ class Settings(BaseSettings):
                 "internet-facing API should not accept requests from callers "
                 "other than the frontend."
             )
+        if self.suliko_backend_enabled:
+            if not self.suliko_api_url or not self.suliko_api_url.startswith("https://"):
+                problems.append("SULIKO_API_URL must be https in production")
+            if len(self.suliko_api_key.get_secret_value()) < 24:
+                problems.append("SULIKO_API_KEY must be set (24+ characters) with SULIKO_API_URL")
         portal_secret = self.portal_shared_secret.get_secret_value()
         if portal_secret and len(portal_secret) < 32:
             # It signs statements about who a user is. A short key is a

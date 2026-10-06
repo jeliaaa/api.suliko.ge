@@ -88,11 +88,15 @@ def test_garbage_everywhere_falls_back_to_the_peer(gateway_secret: str) -> None:
 
 def test_sign_in_ignores_the_case_of_the_email() -> None:
     """Sign-in and "forgot password" take an email, which means nothing in
-    upper case; both compare it normalised."""
-    assert "normalise_email(payload.email)" in inspect.getsource(auth.login)
-    assert "normalise_email(payload.email)" in inspect.getsource(auth.forgot_password)
+    upper case; both compare it normalised. Sign-in's lookup lives in
+    `find_account_by_login`, which goes through the same `find_account`."""
+    from suliko.domain import accounts
     from suliko.domain.accounts import normalise_email
 
+    assert "login_text.lower()" in inspect.getsource(auth.login)
+    assert "normalise_email(payload.email)" in inspect.getsource(auth.forgot_password)
+    assert "find_account(db, login)" in inspect.getsource(accounts.find_account_by_login)
+    assert "normalise_email(email)" in inspect.getsource(accounts.find_account)
     assert normalise_email("  Nino@Mail.GE ") == "nino@mail.ge"
 
 

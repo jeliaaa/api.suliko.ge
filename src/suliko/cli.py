@@ -6,6 +6,8 @@
     python -m suliko.cli create-tenant --slug acme --name "Acme Translations"
     python -m suliko.cli create-superuser --tenant acme
     python -m suliko.cli seed-reference --tenant acme
+    python -m suliko.cli import-suliko-users --dry-run
+    python -m suliko.cli link-suliko-account --email me@example.com --suliko-login 599123456
     python -m suliko.cli check
 
 The superuser is created here and **never through the HTTP API**. There is no
@@ -33,10 +35,17 @@ from sqlalchemy import select, text
 
 from suliko.config import get_settings
 from suliko.core.crypto import encrypt_for_tenant
+from suliko.core.errors import ValidationError
 from suliko.db.session import bind_tenant_guc, dispose_engine, get_engine, get_sessionmaker
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
 from suliko.domain.accounts import UNUSABLE_PASSWORD_HASH, find_account, normalise_email
 from suliko.domain.reference_seed import seed_reference_data
+from suliko.domain.suliko_import import import_users, link_by_hand
+from suliko.integrations.suliko_backend import (
+    SulikoUnavailableError,
+    close_suliko_backend,
+    get_suliko_backend,
+)
 from suliko.models.directory import Client, ClientType  # noqa: F401 — registry
 from suliko.models.reference import TenantSettings
 from suliko.models.tenant import Tenant, TenantStatus
@@ -294,6 +303,77 @@ async def create_superuser(
         warn("This output contains the TOTP secret. Clear your scrollback when done.")
 
 
+# ── suliko.ge's people ──────────────────────────────────────────────────────
+
+
+def _require_suliko_backend() -> Any:
+    if not get_settings().suliko_backend_enabled:
+        raise SystemExit(
+            "SULIKO_API_URL is not set, so there is no suliko.ge to import from. "
+            "Set SULIKO_API_URL and SULIKO_API_KEY in .env first."
+        )
+    return get_suliko_backend()
+
+
+async def import_suliko_users(dry_run: bool) -> None:
+    """Give every person registered on suliko.ge an account here.
+
+    Safe to run again. `--dry-run` writes nothing and lists what a real run
+    would do, including which existing accounts would switch to a suliko.ge
+    password: read that list before the real run.
+    """
+    backend = _require_suliko_backend()
+    try:
+        async with get_sessionmaker()() as db:
+            report = await import_users(db, backend, dry_run=dry_run)
+            if dry_run:
+                await db.rollback()
+            else:
+                await db.commit()
+    except SulikoUnavailableError as exc:
+        raise SystemExit(f"Could not read suliko.ge's users: {exc.detail}") from exc
+    finally:
+        await close_suliko_backend()
+
+    heading("DRY RUN — nothing was written" if dry_run else "Import finished")
+    verb = "would be created" if dry_run else "created"
+    say(f"  people on suliko.ge     : {report.seen}")
+    say(f"  already in Office       : {report.already_linked}")
+    say(f"  new accounts {verb:<19}: {report.created}")
+    say(f"  existing accounts linked: {len(report.linked_existing)}")
+    if report.linked_existing:
+        warn("These Office accounts now sign in with their suliko.ge password; their")
+        warn("old Office password stops working. Each person can reset it on suliko.ge:")
+        for login in sorted(report.linked_existing):
+            say(f"    {login}")
+    if report.conflicts:
+        warn(f"{len(report.conflicts)} sign-in(s) claimed by two different people; left alone:")
+        for login in sorted(report.conflicts):
+            say(f"    {login}")
+    say(f"  Office accounts with no suliko.ge person: {len(report.office_only)}")
+    for login in report.office_only:
+        say(f"    {login}")
+    if report.office_only:
+        say("  (They keep their own password. If one of them signs in to suliko.ge with a")
+        say("   phone number, link it: link-suliko-account --email … --suliko-login …)")
+
+
+async def link_suliko_account(email: str, suliko_login: str) -> None:
+    """Link one existing Office account to the suliko.ge person with this sign-in."""
+    backend = _require_suliko_backend()
+    try:
+        async with get_sessionmaker()() as db:
+            message = await link_by_hand(db, backend, office_email=email, suliko_login=suliko_login)
+            await db.commit()
+    except SulikoUnavailableError as exc:
+        raise SystemExit(f"Could not ask suliko.ge: {exc.detail}") from exc
+    except ValidationError as exc:
+        raise SystemExit(exc.detail) from exc
+    finally:
+        await close_suliko_backend()
+    ok(message)
+
+
 # ── Reference data ──────────────────────────────────────────────────────────
 
 
@@ -543,6 +623,22 @@ def main() -> None:
         help="also seed the starter language-pair rates (verify them afterwards)",
     )
 
+    p = sub.add_parser(
+        "import-suliko-users", help="give everyone registered on suliko.ge an account here"
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="write nothing; list what a real run would do",
+    )
+
+    p = sub.add_parser(
+        "link-suliko-account",
+        help="link an existing account to the suliko.ge person with this sign-in",
+    )
+    p.add_argument("--email", required=True, help="the existing Office account's email")
+    p.add_argument("--suliko-login", required=True, help="their suliko.ge email or phone number")
+
     args = parser.parse_args()
 
     async def run() -> int:
@@ -564,6 +660,10 @@ def main() -> None:
                     await create_superuser(args.tenant, args.username, args.email, args.full_name)
                 case "seed-reference":
                     await seed_reference(args.tenant, with_rates=args.with_rates)
+                case "import-suliko-users":
+                    await import_suliko_users(args.dry_run)
+                case "link-suliko-account":
+                    await link_suliko_account(args.email, args.suliko_login)
             return 0
         finally:
             await dispose_engine()

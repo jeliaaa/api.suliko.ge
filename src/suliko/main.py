@@ -21,6 +21,7 @@ from suliko.core.gateway import GatewayMiddleware
 from suliko.db.session import dispose_engine
 from suliko.db.tenancy import install_tenant_filter
 from suliko.integrations.google_drive import close_drive_client
+from suliko.integrations.suliko_backend import close_suliko_backend
 
 
 def migration_head() -> str:
@@ -116,6 +117,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     structlog.get_logger().info("startup", version=__version__, environment=settings.environment)
     yield
     await close_drive_client()
+    await close_suliko_backend()
     await dispose_engine()
 
 

@@ -42,6 +42,7 @@ from suliko.integrations.google_drive import (
     DriveFile,
     get_drive_client,
 )
+from suliko.integrations.suliko_backend import UnconfiguredSulikoBackend
 from suliko.models.directory import Client, ClientType, Translator
 from suliko.models.drive import DriveSettings, OrderDocumentDriveFolder, OrderDriveFolder
 from suliko.models.order import CopyType, Order, OrderDocument, Urgency
@@ -1448,7 +1449,9 @@ async def test_staff_invite_records_the_suliko_account_match(
     with tenant_scope(ACME):
         async with maker() as db:
             session = _admin_session(ACME)
-            result = await users_api.invite_user(payload, db, session, session, RateLimiter(None))
+            result = await users_api.invite_user(
+                payload, db, session, session, RateLimiter(None), UnconfiguredSulikoBackend()
+            )
             await db.commit()
 
     assert result.suliko_account.status == "linked"
@@ -1478,7 +1481,9 @@ async def test_staff_invite_with_no_match_is_pending_and_emails_the_registration
     with tenant_scope(ACME):
         async with maker() as db:
             session = _admin_session(ACME)
-            result = await users_api.invite_user(payload, db, session, session, RateLimiter(None))
+            result = await users_api.invite_user(
+                payload, db, session, session, RateLimiter(None), UnconfiguredSulikoBackend()
+            )
             await db.commit()
 
     assert result.suliko_account.status == "pending"
@@ -1520,7 +1525,9 @@ async def test_inviting_an_existing_account_waits_for_acceptance(
     with tenant_scope(ACME):
         async with maker() as db:
             session = _admin_session(ACME)
-            result = await users_api.invite_user(payload, db, session, session, RateLimiter(None))
+            result = await users_api.invite_user(
+                payload, db, session, session, RateLimiter(None), UnconfiguredSulikoBackend()
+            )
             await db.commit()
 
     assert result.existing_account is True
@@ -1550,9 +1557,13 @@ async def test_the_same_person_cannot_be_invited_twice(
     with tenant_scope(ACME):
         async with maker() as db:
             session = _admin_session(ACME)
-            await users_api.invite_user(payload, db, session, session, RateLimiter(None))
+            await users_api.invite_user(
+                payload, db, session, session, RateLimiter(None), UnconfiguredSulikoBackend()
+            )
             await db.commit()
         async with maker() as db:
             session = _admin_session(ACME)
             with pytest.raises(ConflictError, match="already been invited"):
-                await users_api.invite_user(payload, db, session, session, RateLimiter(None))
+                await users_api.invite_user(
+                payload, db, session, session, RateLimiter(None), UnconfiguredSulikoBackend()
+            )

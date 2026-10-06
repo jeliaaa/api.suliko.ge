@@ -29,6 +29,7 @@ from suliko.core.ratelimit import RateLimiter
 from suliko.db.base import Base
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
 from suliko.domain.plans import TenantPlan, effective_permissions
+from suliko.integrations.suliko_backend import UnconfiguredSulikoBackend
 from suliko.models.tenant import Tenant, TenantStatus
 from suliko.models.user import Account, Role, User, UserPermissionOverride
 from suliko.security.passwords import hash_password
@@ -235,6 +236,7 @@ async def test_an_invite_cannot_restore_a_revoked_permission(db: AsyncSession) -
             stripped,
             None,
             RateLimiter(None),
+            UnconfiguredSulikoBackend(),
         )
 
 
