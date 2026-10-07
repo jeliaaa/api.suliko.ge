@@ -26,8 +26,10 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$StorageDir,
 
-    # The api.suliko.ge checkout. Defaults to the folder above this script.
-    [string]$RepoDir = (Split-Path -Parent $PSScriptRoot),
+    # The api.suliko.ge checkout. Defaults to the folder above this script
+    # (worked out below: Windows PowerShell 5.1 leaves $PSScriptRoot empty
+    # while parameter defaults are evaluated).
+    [string]$RepoDir = "",
 
     [string]$ServiceName = "SulikoAPI",
 
@@ -36,6 +38,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if (-not $RepoDir) {
+    $RepoDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+}
 
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
