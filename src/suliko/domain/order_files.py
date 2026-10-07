@@ -35,7 +35,12 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from suliko.core.errors import NotFoundError
-from suliko.integrations.object_storage import ObjectStorage, StorageError
+from suliko.integrations.object_storage import (
+    ObjectStorage,
+    StorageError,
+    VaultStorage,
+    vault_order_of,
+)
 from suliko.models.order import Order, OrderDocument
 from suliko.models.order_file import OrderFile
 from suliko.models.portal import FileKind
@@ -182,7 +187,19 @@ async def upload_document_file(
         document_id=document.id,
         public_id=public_id,
     )
-    await storage.put(key, content, content_type)
+    if isinstance(storage, VaultStorage):
+        # The vault picks the final key (its own order number and file id), and
+        # groups an order's files in one vault order.
+        key = await storage.put_file(
+            key,
+            content,
+            content_type,
+            file_name=file_name,
+            kind=kind.value,
+            sibling_key=await _vault_sibling_key(db, order.id),
+        )
+    else:
+        await storage.put(key, content, content_type)
 
     row = OrderFile(
         public_id=public_id,
@@ -198,6 +215,26 @@ async def upload_document_file(
     db.add(row)
     await db.flush()
     return row
+
+
+async def _vault_sibling_key(db: AsyncSession, order_id: int) -> str | None:
+    """A vault key of any file of this order, removed ones included — they
+    still sit in the vault until purged — so the next file joins that vault
+    order. None for the order's first file."""
+    return (
+        await db.execute(
+            select(OrderFile.storage_key)
+            .join(OrderDocument, OrderDocument.id == OrderFile.order_document_id)
+            .where(OrderDocument.order_id == order_id, OrderFile.storage_key.like("vault/%"))
+            .order_by(OrderFile.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+def vault_order(file: OrderFile) -> int | None:
+    """The Order Vault's own order number, for a file kept there."""
+    return vault_order_of(file.storage_key)
 
 
 async def remove_document_file(db: AsyncSession, file: OrderFile, *, removed_by: str) -> None:

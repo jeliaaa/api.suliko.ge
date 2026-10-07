@@ -21,6 +21,9 @@ three permissions: put, get and delete an object.
 - ``local`` — a directory on the API server. For development, and for a
   single-server deployment that would rather back up a folder than pay for a
   bucket.
+- ``vault`` — the Order Vault (``VaultStorage`` below): every file is
+  encrypted for the vault's team as it arrives and can only be opened in the
+  vault's panel. This API can put and delete files there, never read them back.
 
 Unset: order data works, file routes answer "storage is not configured".
 
@@ -87,6 +90,18 @@ class StorageError(Exception):
 
 class StorageNotConfiguredError(StorageError):
     """This server has no usable storage backend."""
+
+
+class StorageDownloadUnavailableError(StorageError):
+    """The file is kept where this API cannot read it back (the Order Vault).
+
+    ``vault_order`` is the vault's own order number, so a person can be told
+    where to find the file.
+    """
+
+    def __init__(self, message: str, vault_order: int | None = None) -> None:
+        super().__init__(message)
+        self.vault_order = vault_order
 
 
 class ObjectStorage(Protocol):
@@ -369,6 +384,152 @@ class LocalDiskStorage:
             raise StorageError(f"deleting from local storage failed: {type(exc).__name__}") from exc
 
 
+# ── The Order Vault ─────────────────────────────────────────────────────────
+
+#: What a file stored in the vault is keyed by in ``order_files.storage_key``:
+#: the vault's own order number and file id. Built from the vault's reply.
+VAULT_KEY = re.compile(r"^vault/(?P<order>[0-9]{1,9})/(?P<file>[0-9a-f]{32})$")
+
+#: Suliko keys look like ``tenants/<tenant>/orders/<order>/documents/<doc>/<id>``.
+_SULIKO_KEY = re.compile(r"^tenants/(?P<tenant>[0-9]+)/orders/(?P<order>[0-9]+)/")
+
+
+def vault_order_of(storage_key: str) -> int | None:
+    """The vault's order number, if this key points into the vault."""
+    match = VAULT_KEY.fullmatch(storage_key)
+    return int(match["order"]) if match else None
+
+
+class VaultStorage:
+    """Order files kept in the Order Vault, encrypted for its team.
+
+    The vault encrypts each file in memory the moment it arrives, for every
+    member of its team, and keeps only ciphertext. Only a team member's browser
+    holds a key that opens it, so — by design — this API can put and delete
+    files but never read one back: ``iter_get`` refuses.
+
+    All of one Suliko order's files land in one vault order. The first upload
+    creates it; later uploads are told which one through ``sibling_key``.
+
+    ``legacy`` serves keys written before the switch (a local folder or S3),
+    so older files stay downloadable and can still be purged.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        service_key: str,
+        legacy: ObjectStorage | None = None,
+        http: httpx.AsyncClient | None = None,
+    ) -> None:
+        parts = urlsplit(base_url.rstrip("/"))
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            raise StorageNotConfiguredError("VAULT_URL is not an http(s) URL")
+        if not service_key:
+            raise StorageNotConfiguredError("VAULT_SERVICE_KEY is not set")
+        self._base = f"{parts.scheme}://{parts.netloc}"
+        self._host = parts.netloc
+        # X-Vault: 1 is the vault's own guard on every state-changing call.
+        self._headers = {"Authorization": f"Bearer {service_key}", "X-Vault": "1"}
+        self._legacy = legacy
+        self._http = http or httpx.AsyncClient(timeout=METADATA_TIMEOUT)
+
+    @property
+    def configured(self) -> bool:
+        return True
+
+    @property
+    def description(self) -> str:
+        older = f"; older files in {self._legacy.description}" if self._legacy else ""
+        return f"order vault at {self._host}{older}"
+
+    async def aclose(self) -> None:
+        await self._http.aclose()
+        if isinstance(self._legacy, S3Storage):
+            await self._legacy.aclose()
+
+    async def put_file(
+        self,
+        key: str,
+        content: bytes,
+        content_type: str,
+        *,
+        file_name: str,
+        kind: str,
+        sibling_key: str | None = None,
+    ) -> str:
+        """Send one file. Returns the key it is now stored under (``vault/…``)."""
+        label = "Suliko order"
+        if match := _SULIKO_KEY.match(key):
+            label = f"Suliko order {match['order']} (bureau {match['tenant']})"
+        data = {"kind": kind, "label": label, "name": file_name}
+        # Beside the order's other files, if it has any in the vault already.
+        if sibling_key is not None and (order := vault_order_of(sibling_key)) is not None:
+            data["order"] = str(order)
+        try:
+            response = await self._http.post(
+                f"{self._base}/api/service/files",
+                headers=self._headers,
+                data=data,
+                files={"file": (file_name or "file", content, content_type)},
+                timeout=TRANSFER_TIMEOUT,
+            )
+        except httpx.HTTPError as exc:
+            raise StorageError(f"sending to the vault failed: {type(exc).__name__}") from exc
+        if response.status_code != 200:
+            raise StorageError(self._message(response), response.status_code)
+        try:
+            body = response.json()
+            order_no, file_id = int(body["orderNo"]), str(body["fileId"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise StorageError("the vault answered with something unexpected") from exc
+        stored = f"vault/{order_no}/{file_id}"
+        if not VAULT_KEY.fullmatch(stored):
+            raise StorageError("the vault answered with something unexpected")
+        return stored
+
+    async def put(self, key: str, content: bytes, content_type: str) -> None:
+        """Protocol shim. The key it ends up under is lost, so callers that
+        need it use ``put_file``."""
+        await self.put_file(key, content, content_type, file_name="file", kind="source")
+
+    async def iter_get(self, key: str) -> AsyncIterator[bytes]:
+        order = vault_order_of(key)
+        if order is not None:
+            raise StorageDownloadUnavailableError(
+                "files in the order vault cannot be read back by the API", order
+            )
+        if self._legacy is None:
+            raise StorageError("no such object", 404)
+        async for chunk in self._legacy.iter_get(key):
+            yield chunk
+
+    async def delete(self, key: str) -> None:
+        match = VAULT_KEY.fullmatch(key)
+        if match is None:
+            if self._legacy is None:
+                raise StorageError("a file stored before the vault, and no legacy storage is set")
+            await self._legacy.delete(key)
+            return
+        try:
+            response = await self._http.delete(
+                f"{self._base}/api/service/orders/{match['order']}/files/{match['file']}",
+                headers=self._headers,
+            )
+        except httpx.HTTPError as exc:
+            raise StorageError(f"removing from the vault failed: {type(exc).__name__}") from exc
+        # 404: already gone (shredded by retention, or by an admin in the vault).
+        if response.status_code >= 300 and response.status_code != 404:
+            raise StorageError(self._message(response), response.status_code)
+
+    @staticmethod
+    def _message(response: httpx.Response) -> str:
+        if response.status_code == 401:
+            return "the vault refused the service key (VAULT_SERVICE_KEY)"
+        return f"the vault returned {response.status_code}"
+
+
 # ── When nothing is configured ──────────────────────────────────────────────
 
 
@@ -407,41 +568,57 @@ def build_storage(settings: Settings) -> ObjectStorage:
     except files keeps working."""
     backend = settings.storage_backend
     try:
-        if backend == "local":
-            if not settings.storage_local_dir:
-                raise StorageNotConfiguredError("STORAGE_LOCAL_DIR is not set")
-            return LocalDiskStorage(settings.storage_local_dir)
-        if backend == "s3":
-            secret = (
-                settings.s3_secret_access_key.get_secret_value()
-                if settings.s3_secret_access_key
-                else ""
+        if backend == "vault":
+            legacy: ObjectStorage | None = None
+            if settings.storage_legacy_backend:
+                try:
+                    legacy = _build_blob_storage(settings, settings.storage_legacy_backend)
+                except StorageNotConfiguredError as exc:
+                    # Older files become unreadable; new ones still work.
+                    log.error("legacy_storage_misconfigured", error=str(exc))
+            key = (
+                settings.vault_service_key.get_secret_value() if settings.vault_service_key else ""
             )
-            missing = [
-                name
-                for name, value in (
-                    ("S3_BUCKET", settings.s3_bucket),
-                    ("S3_ACCESS_KEY_ID", settings.s3_access_key_id),
-                    ("S3_SECRET_ACCESS_KEY", secret),
-                )
-                if not value
-            ]
-            if missing:
-                raise StorageNotConfiguredError(f"missing {', '.join(missing)}")
-            return S3Storage(
-                # AWS needs no endpoint: it follows from the region.
-                endpoint_url=settings.s3_endpoint_url
-                or f"https://s3.{settings.s3_region}.amazonaws.com",
-                region=settings.s3_region,
-                bucket=str(settings.s3_bucket),
-                access_key_id=str(settings.s3_access_key_id),
-                secret_access_key=secret,
-                addressing_style=settings.s3_addressing_style,
-            )
+            if not settings.vault_url:
+                raise StorageNotConfiguredError("VAULT_URL is not set")
+            return VaultStorage(base_url=settings.vault_url, service_key=key, legacy=legacy)
+        if backend in ("local", "s3"):
+            return _build_blob_storage(settings, backend)
     except StorageNotConfiguredError as exc:
         # Loud, but not fatal.
         log.error("storage_misconfigured", backend=backend, error=str(exc))
     return UnconfiguredStorage()
+
+
+def _build_blob_storage(settings: Settings, backend: str) -> ObjectStorage:
+    """A local-folder or S3 backend from the settings. Raises when incomplete."""
+    if backend == "local":
+        if not settings.storage_local_dir:
+            raise StorageNotConfiguredError("STORAGE_LOCAL_DIR is not set")
+        return LocalDiskStorage(settings.storage_local_dir)
+    secret = (
+        settings.s3_secret_access_key.get_secret_value() if settings.s3_secret_access_key else ""
+    )
+    missing = [
+        name
+        for name, value in (
+            ("S3_BUCKET", settings.s3_bucket),
+            ("S3_ACCESS_KEY_ID", settings.s3_access_key_id),
+            ("S3_SECRET_ACCESS_KEY", secret),
+        )
+        if not value
+    ]
+    if missing:
+        raise StorageNotConfiguredError(f"missing {', '.join(missing)}")
+    return S3Storage(
+        # AWS needs no endpoint: it follows from the region.
+        endpoint_url=settings.s3_endpoint_url or f"https://s3.{settings.s3_region}.amazonaws.com",
+        region=settings.s3_region,
+        bucket=str(settings.s3_bucket),
+        access_key_id=str(settings.s3_access_key_id),
+        secret_access_key=secret,
+        addressing_style=settings.s3_addressing_style,
+    )
 
 
 _storage: ObjectStorage | None = None
@@ -457,6 +634,6 @@ def get_object_storage() -> ObjectStorage:
 
 async def close_object_storage() -> None:
     global _storage
-    if isinstance(_storage, S3Storage):
+    if isinstance(_storage, S3Storage | VaultStorage):
         await _storage.aclose()
     _storage = None

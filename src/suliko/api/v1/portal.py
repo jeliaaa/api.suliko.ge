@@ -60,6 +60,7 @@ from suliko.domain.order_files import (
     safe_content_type,
     safe_file_name,
     upload_document_file,
+    vault_order,
 )
 from suliko.domain.portal import (
     AssignedDocument,
@@ -133,6 +134,9 @@ class OrderFileOut(BaseModel):
     created_at: datetime | None
     #: Only these can be removed from the portal.
     uploaded_by_me: bool
+    #: Kept in the bureau's Order Vault: it cannot be downloaded here, the
+    #: bureau hands it over. (Absent/false for ordinary stored files.)
+    in_vault: bool = False
 
 
 #: ok — listed, and uploads work; unavailable — listed, but file storage is
@@ -302,6 +306,7 @@ def _file_out(row: OrderFile, identity: PortalIdentity) -> OrderFileOut:
         size_bytes=row.size_bytes,
         created_at=row.created_at,
         uploaded_by_me=row.uploaded_by == _uploader_tag(identity),
+        in_vault=vault_order(row) is not None,
     )
 
 

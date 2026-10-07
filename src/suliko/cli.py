@@ -51,6 +51,7 @@ from suliko.domain.reference_seed import seed_reference_data
 from suliko.domain.suliko_import import import_users, link_by_hand
 from suliko.integrations.object_storage import (
     StorageError,
+    VaultStorage,
     close_object_storage,
     get_object_storage,
 )
@@ -478,14 +479,28 @@ async def check() -> int:
         # write passes a mere "can I connect" check.
         key = f"_suliko/healthcheck/{secrets.token_hex(8)}"
         try:
-            await storage.put(key, b"ok", "text/plain")
-            body = b"".join([chunk async for chunk in storage.iter_get(key)])
-            await storage.delete(key)
-            if body == b"ok":
-                ok("write, read and delete all work")
+            if isinstance(storage, VaultStorage):
+                # The vault cannot be read back by design: prove the key and
+                # the connection with a write and a delete. (This leaves one
+                # empty "healthcheck" order in the vault's panel.)
+                stored = await storage.put_file(
+                    key,
+                    b"%PDF-1.4 suliko healthcheck",
+                    "application/pdf",
+                    file_name="healthcheck.pdf",
+                    kind="source",
+                )
+                await storage.delete(stored)
+                ok("write and delete work (the vault cannot be read back by design)")
             else:
-                fail("read back different bytes than were written")
-                problems += 1
+                await storage.put(key, b"ok", "text/plain")
+                body = b"".join([chunk async for chunk in storage.iter_get(key)])
+                await storage.delete(key)
+                if body == b"ok":
+                    ok("write, read and delete all work")
+                else:
+                    fail("read back different bytes than were written")
+                    problems += 1
         except StorageError as exc:
             fail(f"storage round trip failed: {exc}")
             problems += 1

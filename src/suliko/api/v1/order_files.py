@@ -3,7 +3,10 @@ Translation files.
 
 Translators see and add to the same files through the portal
 (``api/v1/portal.py``). Both read the ``order_files`` table; the bytes are in
-Suliko's object storage.
+Suliko's object storage — or, with ``STORAGE_BACKEND=vault``, in the Order
+Vault, which keeps them encrypted where this API cannot read them back. Those
+files are listed (``in_vault``) but a download answers 409; the team opens
+them in the vault's own panel.
 
 Tenant-scoped through the normal staff session, like every other Suliko Office route.
 """
@@ -24,7 +27,7 @@ from suliko.api.deps import CurrentSession, Db, require
 from suliko.api.portal_deps import Storage
 from suliko.api.v1._files import read_upload
 from suliko.config import get_settings
-from suliko.core.errors import AppError, NotFoundError, UpstreamUnavailableError
+from suliko.core.errors import AppError, ConflictError, NotFoundError, UpstreamUnavailableError
 from suliko.domain.order_files import (
     attachment_headers,
     get_document_file,
@@ -34,8 +37,13 @@ from suliko.domain.order_files import (
     safe_content_type,
     safe_file_name,
     upload_document_file,
+    vault_order,
 )
-from suliko.integrations.object_storage import StorageError, StorageNotConfiguredError
+from suliko.integrations.object_storage import (
+    StorageDownloadUnavailableError,
+    StorageError,
+    StorageNotConfiguredError,
+)
 from suliko.models.order import Order, OrderDocument
 from suliko.models.order_file import OrderFile
 from suliko.models.portal import FileKind
@@ -57,9 +65,14 @@ class StaffFileOut(BaseModel):
     #: `user:<id>` for a Suliko Office upload, `portal:<id>` for a translator's.
     uploaded_by: str | None
     created_at: datetime | None
+    #: Kept in the Order Vault: listed here, opened only in the vault's panel.
+    in_vault: bool = False
+    #: The vault's own order number for that file, to find it by.
+    vault_order: int | None = None
 
 
 def _out(row: OrderFile) -> StaffFileOut:
+    vault_no = vault_order(row)
     return StaffFileOut(
         id=row.public_id,
         name=row.file_name,
@@ -68,10 +81,25 @@ def _out(row: OrderFile) -> StaffFileOut:
         size_bytes=row.size_bytes,
         uploaded_by=row.uploaded_by,
         created_at=row.created_at,
+        in_vault=vault_no is not None,
+        vault_order=vault_no,
     )
 
 
+class StoredInVaultError(ConflictError):
+    """A download of a file that only the Order Vault's team can open."""
+
+    error_code = "stored_in_vault"
+
+
 def storage_failure(exc: StorageError) -> AppError:
+    if isinstance(exc, StorageDownloadUnavailableError):
+        where = f" (vault order {exc.vault_order})" if exc.vault_order else ""
+        return StoredInVaultError(
+            f"This file is kept in the Order Vault{where}, where only the vault's team can "
+            "open it. It cannot be downloaded here.",
+            vault_order=exc.vault_order,
+        )
     if isinstance(exc, StorageNotConfiguredError):
         log.error("storage_not_configured")
         return UpstreamUnavailableError("File storage is not configured on the server.")

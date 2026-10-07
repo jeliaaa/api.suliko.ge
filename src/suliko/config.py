@@ -186,7 +186,17 @@ class Settings(BaseSettings):
     # Suliko stores every bureau's order files itself; see
     # integrations/object_storage.py. Unset: order data still works, file
     # routes report that storage is not configured.
-    storage_backend: Literal["s3", "local"] | None = None
+    storage_backend: Literal["s3", "local", "vault"] | None = None
+    #: STORAGE_BACKEND=vault: the Order Vault's public address (no trailing
+    #: slash) and the shared key it expects (its `Vault:ServiceKey`). Files go
+    #: in encrypted and cannot be read back here — only the vault's team can
+    #: open them, in the vault's own panel.
+    vault_url: str | None = None
+    vault_service_key: SecretStr | None = None
+    #: STORAGE_BACKEND=vault only: where files stored BEFORE the switch live,
+    #: so they can still be downloaded and removed. Uses the STORAGE_LOCAL_DIR
+    #: or S3_* settings below. Unset: those older files cannot be read.
+    storage_legacy_backend: Literal["s3", "local"] | None = None
     #: STORAGE_BACKEND=local: the directory files are written under.
     storage_local_dir: str | None = None
     #: STORAGE_BACKEND=s3. Leave the endpoint unset for AWS itself — it

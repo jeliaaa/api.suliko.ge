@@ -11,11 +11,12 @@ from __future__ import annotations
 import io
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 import pytest_asyncio
 from fastapi import UploadFile
@@ -24,10 +25,12 @@ from sqlalchemy.pool import StaticPool
 from starlette.datastructures import Headers
 
 from suliko.api.v1 import order_files
+from suliko.api.v1.order_files import StoredInVaultError
 from suliko.core.errors import NotFoundError
 from suliko.db.base import Base
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
-from suliko.integrations.object_storage import LocalDiskStorage
+from suliko.domain.order_files import purge_removed_files
+from suliko.integrations.object_storage import LocalDiskStorage, VaultStorage
 from suliko.models.directory import Client, ClientType
 from suliko.models.order import CopyType, Order, OrderDocument, Urgency
 from suliko.models.order_file import OrderFile
@@ -212,3 +215,73 @@ async def test_a_document_of_another_order_is_not_found(db: AsyncSession, tmp_pa
             storage,
             None,  # type: ignore[arg-type]
         )
+
+
+async def test_files_go_to_the_vault_and_cannot_be_downloaded_here(db: AsyncSession) -> None:
+    """The vault encrypts and keeps the bytes; the API keeps the row, lists it,
+    refuses to serve it, and shreds it in the vault when the purge runs."""
+    calls: list[tuple[str, str, bytes]] = []
+
+    def vault(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path, request.read()))
+        if request.method == "POST":
+            posts = sum(1 for call in calls if call[0] == "POST")
+            return httpx.Response(200, json={"orderNo": 41, "fileId": f"{posts:032x}", "size": 1})
+        return httpx.Response(200)
+
+    storage = VaultStorage(
+        base_url="https://vault.example",
+        service_key="k" * 40,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(vault)),
+    )
+    staff = Staff(user_id=7, tenant_id=ACME)
+
+    with tenant_scope(ACME):
+        source = await order_files.upload_file(
+            100,
+            1000,
+            _upload("scan.pdf", b"%PDF-1.7 source"),
+            db,
+            staff,
+            storage,
+            None,  # type: ignore[arg-type]
+            kind=FileKind.SOURCE,
+        )
+        translation = await order_files.upload_file(
+            100,
+            1000,
+            _upload("done.pdf", b"%PDF-1.7 translation"),
+            db,
+            staff,
+            storage,
+            None,  # type: ignore[arg-type]
+            kind=FileKind.TRANSLATION,
+        )
+
+        # Both are vault files, in the same vault order.
+        assert (source.in_vault, source.vault_order) == (True, 41)
+        assert (translation.in_vault, translation.vault_order) == (True, 41)
+        # Only the second upload had to be told which vault order to join.
+        assert b'name="order"' not in calls[0][2]
+        assert b'name="order"' in calls[1][2]
+
+        listed = await order_files.list_files(100, 1000, db, None)  # type: ignore[arg-type]
+        assert [f.name for f in listed] == ["scan.pdf", "done.pdf"]
+
+        # A download is refused with an explanation, not a stack trace.
+        with pytest.raises(StoredInVaultError) as refused:
+            await order_files.download_file(100, 1000, source.id, db, storage, None)  # type: ignore[arg-type]
+        assert "Order Vault" in refused.value.detail
+        assert refused.value.extra == {"vault_order": 41}
+
+        # Removing hides it at once; the purge shreds it in the vault.
+        await order_files.delete_file(100, 1000, source.id, db, staff, None)  # type: ignore[arg-type]
+        assert [f.name for f in await order_files.list_files(100, 1000, db, None)] == ["done.pdf"]  # type: ignore[arg-type]
+        assert not any(call[0] == "DELETE" for call in calls)
+
+        result = await purge_removed_files(
+            db, storage, cutoff=datetime.now(UTC) + timedelta(days=1)
+        )
+        assert (result.purged, result.failed) == (1, 0)
+        method, path, _ = calls[-1]
+        assert (method, path) == ("DELETE", f"/api/service/orders/41/files/{1:032x}")
