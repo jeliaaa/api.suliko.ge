@@ -33,21 +33,19 @@ from suliko.domain.accounts import (
     find_account,
     find_account_by_login,
     find_account_by_suliko_id,
+    find_suliko_person,
     login_name,
+    phone_variants,
     upsert_from_suliko,
     username_for_account,
 )
 from suliko.domain.suliko_import import import_users, link_by_hand
-from suliko.integrations.suliko_backend import (
-    PasswordCheck,
-    PasswordOutcome,
-    SulikoUnavailableError,
-    SulikoUser,
-)
+from suliko.integrations.suliko_backend import SulikoUnavailableError, SulikoUser
 from suliko.models.reference import DocumentType, Language, LanguagePairPrice, TenantSettings
 from suliko.models.tenant import Tenant
 from suliko.models.user import Account, Role, User
 from suliko.security.passwords import hash_password, verify_password
+from suliko_fakes import FakeBackend, person
 
 TABLES = [
     Tenant.__table__,
@@ -60,76 +58,6 @@ TABLES = [
 ]
 
 LOCAL_PASSWORD = "an-office-only-password"
-
-
-def person(
-    suliko_id: str = "g1",
-    user_name: str = "nino@suliko.ge",
-    first: str = "Nino",
-    last: str = "Beridze",
-) -> SulikoUser:
-    return SulikoUser(
-        id=suliko_id,
-        user_name=user_name,
-        first_name=first,
-        last_name=last,
-        user_type="normal",
-        created_at=None,
-    )
-
-
-class FakeBackend:
-    """suliko.ge, from a dict. `passwords` maps a suliko id to its password."""
-
-    def __init__(
-        self,
-        people: list[SulikoUser] | None = None,
-        passwords: dict[str, str] | None = None,
-        *,
-        enabled: bool = True,
-        down: bool = False,
-        directory_down: bool = False,
-    ) -> None:
-        self.people = people or []
-        self.passwords = passwords or {}
-        self._enabled = enabled
-        self.down = down
-        self.directory_down = directory_down
-        self.directory_calls = 0
-
-    @property
-    def enabled(self) -> bool:
-        return self._enabled
-
-    async def check_password(self, login: str, password: str) -> PasswordCheck:
-        if self.down:
-            return PasswordCheck(PasswordOutcome.UNAVAILABLE)
-        for p in self.people:
-            same_login = p.user_name.lower() == login.strip().lower()
-            if same_login and self.passwords.get(p.id) == password:
-                return PasswordCheck(PasswordOutcome.ACCEPTED, p.id)
-        return PasswordCheck(PasswordOutcome.REJECTED)
-
-    def _guard(self) -> None:
-        self.directory_calls += 1
-        if self.directory_down:
-            raise SulikoUnavailableError("down")
-
-    async def get_user(self, user_id: str) -> SulikoUser | None:
-        self._guard()
-        return next((p for p in self.people if p.id == user_id), None)
-
-    async def find_user(self, login: str) -> SulikoUser | None:
-        self._guard()
-        return next((p for p in self.people if p.user_name.lower() == login.strip().lower()), None)
-
-    async def iter_users(self, page_size: int = 200) -> AsyncIterator[SulikoUser]:
-        self._guard()
-        for p in self.people:
-            yield p
-
-    async def aclose(self) -> None:
-        return None
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -484,12 +412,12 @@ def test_no_address_means_nothing_to_verify() -> None:
 # ── Searching for someone to invite ─────────────────────────────────────────
 
 
-async def _lookup(db: AsyncSession, email: str, backend: FakeBackend) -> Any:
+async def _lookup(db: AsyncSession, login: str, backend: FakeBackend) -> Any:
     return await users.lookup_account(
         db=db,
         session=None,  # type: ignore[arg-type]
         _=None,
-        email=email,  # type: ignore[arg-type]
+        identifier=login,
         backend=backend,
     )
 
@@ -591,7 +519,7 @@ def test_the_other_invitations_are_as_they_were() -> None:
 
 def test_invite_resolves_people_through_suliko_before_creating_a_placeholder() -> None:
     source = inspect.getsource(users.invite_user)
-    assert source.index("backend.find_user") < source.index("clash = (")
+    assert source.index("find_suliko_person") < source.index("clash = (")
     assert source.index("upsert_from_suliko") < source.index("needs_registration = ")
     assert "UNUSABLE_PASSWORD_HASH" in source
 
@@ -818,3 +746,115 @@ def test_production_refuses_a_half_configured_suliko(
 ) -> None:
     with pytest.raises(RuntimeError, match=expected):
         _prod_settings(**overrides).validate_for_production()
+
+
+# ── Phone numbers ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("599123456", ["599123456", "+995599123456", "995599123456"]),
+        (
+            "+995 599 12 34 56",
+            ["+995 599 12 34 56", "995599123456", "599123456", "+995599123456"],
+        ),
+        ("0599123456", ["0599123456", "599123456", "+995599123456", "995599123456"]),
+        ("12345", ["12345"]),
+        ("", []),
+        ("   ", []),
+    ],
+)
+def test_a_phone_number_is_tried_in_each_form_it_may_be_stored(
+    raw: str, expected: list[str]
+) -> None:
+    assert phone_variants(raw) == expected
+
+
+async def test_a_phone_account_is_found_however_the_number_is_typed(db: AsyncSession) -> None:
+    plain = (await upsert_from_suliko(db, person("g2", "599123456", "Gela", ""))).account
+    prefixed = (await upsert_from_suliko(db, person("g3", "+995577000111", "Tako", ""))).account
+
+    for typed in ("599123456", "+995 599 12 34 56", "0599123456", "995599123456"):
+        assert await find_account_by_login(db, typed) is plain
+    # Stored with the country code, typed without it.
+    assert await find_account_by_login(db, "577 00 01 11") is prefixed
+    assert await find_account_by_login(db, "599123457") is None
+
+
+async def test_suliko_is_asked_about_each_form_of_a_number_until_found() -> None:
+    backend = FakeBackend([person("g2", "+995599123456", "Gela", "")])
+
+    found = await find_suliko_person(backend, "599 12 34 56")
+
+    assert found is not None and found.id == "g2"
+    assert (
+        await find_suliko_person(FakeBackend([person("g2", "599123456", "Gela", "")]), "000")
+        is None
+    )
+
+
+async def test_an_address_is_one_question_to_suliko() -> None:
+    backend = FakeBackend([person()])
+
+    assert (await find_suliko_person(backend, " Nino@Suliko.GE ")) is not None
+    assert backend.directory_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (" Nino@Suliko.GE ", "nino@suliko.ge"),
+        ("599 12 34 56", "599 12 34 56"),
+        ("+995599123456", "+995599123456"),
+    ],
+)
+def test_the_search_and_the_invite_accept_an_address_or_a_number(raw: str, expected: str) -> None:
+    assert users._checked_login(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [None, "", "   ", "not-an-email@", "a@b", "12345", "abc"])
+def test_anything_else_is_refused_with_a_422(raw: str | None) -> None:
+    with pytest.raises(ValidationError):
+        users._checked_login(raw)
+
+
+def test_an_invite_needs_an_address_or_a_phone_number() -> None:
+    users.UserInvite(full_name="A", email="a@b.ge")
+    users.UserInvite(full_name="A", phone="599123456")
+    users.UserInvite(full_name="A", email="a@b.ge", phone="599123456")
+    with pytest.raises(ValueError, match="email address or a phone"):
+        users.UserInvite(full_name="A")
+    with pytest.raises(ValueError, match="email address or a phone"):
+        users.UserInvite(full_name="A", phone="12")
+
+
+async def test_a_phone_only_person_is_found_by_their_number(db: AsyncSession) -> None:
+    backend = FakeBackend([person("g2", "599123456", "Gela", "Beridze")])
+
+    result = await _lookup(db, "+995 599 12 34 56", backend)
+
+    assert (result.exists, result.full_name, result.member) == (True, "Gela Beridze", False)
+    assert (await db.execute(select(Account))).scalars().all() == []
+
+
+async def test_a_number_nobody_uses_is_not_found(db: AsyncSession) -> None:
+    result = await _lookup(db, "599000000", FakeBackend([person("g2", "599123456", "Gela", "")]))
+
+    assert result.exists is False and result.registration_required is True
+
+
+async def test_a_phone_account_here_is_found_without_asking_suliko(db: AsyncSession) -> None:
+    await upsert_from_suliko(db, person("g2", "599123456", "Gela", "Beridze"))
+    backend = FakeBackend([], directory_down=True)
+
+    result = await _lookup(db, "0599123456", backend)
+
+    assert result.exists and result.full_name == "Gela Beridze"
+    assert backend.directory_calls == 0
+
+
+@pytest.mark.parametrize("raw", ["abc", "12", "a@b"])
+async def test_a_search_that_is_neither_is_refused(db: AsyncSession, raw: str) -> None:
+    with pytest.raises(ValidationError):
+        await _lookup(db, raw, FakeBackend([person()]))

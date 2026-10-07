@@ -1292,7 +1292,6 @@ async def test_invite_translator_with_no_match_is_pending_and_emails_the_registr
     assert registration_url() in body
 
 
-
 async def test_pending_translator_invite_resolves_when_admin_marks_the_account(
     client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
 ) -> None:
@@ -1541,9 +1540,7 @@ async def test_inviting_an_existing_account_waits_for_acceptance(
         assert account is not None
         assert account.password_hash == "$their-own$"
         with tenant_scope(ACME):
-            row = (
-                await db.execute(select(User).where(User.account_id == account_id))
-            ).scalar_one()
+            row = (await db.execute(select(User).where(User.account_id == account_id))).scalar_one()
         assert row.invitation_pending is True
 
 
@@ -1565,5 +1562,124 @@ async def test_the_same_person_cannot_be_invited_twice(
             session = _admin_session(ACME)
             with pytest.raises(ConflictError, match="already been invited"):
                 await users_api.invite_user(
-                payload, db, session, session, RateLimiter(None), UnconfiguredSulikoBackend()
+                    payload, db, session, session, RateLimiter(None), UnconfiguredSulikoBackend()
+                )
+
+
+# ── Inviting by phone number ────────────────────────────────────────────────
+#
+# Someone who registered on suliko.ge with a phone number has no address to
+# write to. A bureau can still invite them — by the number — provided suliko.ge
+# knows it: the invitation is then a link the inviter passes on themselves.
+
+
+async def _invite_by_phone(
+    maker: async_sessionmaker[AsyncSession],
+    backend: Any,
+    *,
+    phone: str = "+995 599 12 34 56",
+    email: str | None = None,
+) -> Any:
+    from suliko.api.v1 import users as users_api
+
+    payload = users_api.UserInvite(
+        full_name="Gela Beridze", email=email, phone=phone, role=Role.STAFF
+    )
+    with tenant_scope(ACME):
+        async with maker() as db:
+            session = _admin_session(ACME)
+            result = await users_api.invite_user(
+                payload, db, session, session, RateLimiter(None), backend
             )
+            await db.commit()
+    return result
+
+
+async def test_inviting_by_phone_reaches_someone_with_no_email(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
+) -> None:
+    from suliko.domain.accounts import find_account_by_suliko_id
+    from suliko_fakes import FakeBackend, person
+
+    backend = FakeBackend([person("g2", "599123456", "Gela", "Beridze")])
+
+    result = await _invite_by_phone(maker, backend)
+
+    # Nothing to email, so the link is the whole invitation.
+    assert result.invited_by_phone and not result.email_sent
+    assert sent_mail == []
+    assert "accept-invite?token=" in result.invite_link
+    assert result.existing_account and not result.needs_suliko_registration
+    assert result.user.email is None
+    assert result.user.username == "599123456"
+    assert result.user.invitation_pending
+    assert result.suliko_account.status == "linked"
+
+    # Their account was made from suliko.ge's record of them, not from the form.
+    async with maker() as db:
+        account = await find_account_by_suliko_id(db, "g2")
+    assert account is not None
+    assert (account.phone, account.email) == ("599123456", None)
+
+
+async def test_a_number_suliko_does_not_know_cannot_be_invited(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
+) -> None:
+    from sqlalchemy import func
+
+    from suliko_fakes import FakeBackend, person
+
+    backend = FakeBackend([person("g2", "599123456", "Gela", "Beridze")])
+
+    with pytest.raises(ValidationError, match=r"No suliko\.ge account uses this number"):
+        await _invite_by_phone(maker, backend, phone="599000000")
+
+    async with maker() as db:
+        assert await db.scalar(select(func.count()).select_from(Account)) == 0
+    assert sent_mail == []
+
+
+async def test_a_number_cannot_be_invited_when_suliko_is_not_connected(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    with pytest.raises(ValidationError, match=r"No suliko\.ge account uses this number"):
+        await _invite_by_phone(maker, UnconfiguredSulikoBackend())
+
+
+async def test_the_same_number_cannot_be_invited_twice(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
+) -> None:
+    from suliko_fakes import FakeBackend, person
+
+    backend = FakeBackend([person("g2", "599123456", "Gela", "Beridze")])
+    await _invite_by_phone(maker, backend)
+
+    # Typed another way: the same person.
+    with pytest.raises(ConflictError, match="already been invited"):
+        await _invite_by_phone(maker, backend, phone="0599123456")
+
+
+async def test_a_phone_invite_to_someone_who_also_has_an_address_is_emailed(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
+) -> None:
+    """An Office account linked by hand to a phone sign-in keeps its address, so
+    the invitation can go there as well as being shown to the inviter."""
+    from suliko_fakes import FakeBackend, person
+
+    async with maker() as db:
+        db.add(
+            Account(
+                email="owner@office.ge",
+                phone="599123456",
+                suliko_user_id="g2",
+                password_hash="!",
+                full_name="Gela Owner",
+            )
+        )
+        await db.commit()
+
+    result = await _invite_by_phone(maker, FakeBackend([person("g2", "599123456", "Gela", "")]))
+
+    assert not result.invited_by_phone and result.email_sent
+    assert result.user.email == "owner@office.ge"
+    assert [m["to"] for m in sent_mail] == ["owner@office.ge"]

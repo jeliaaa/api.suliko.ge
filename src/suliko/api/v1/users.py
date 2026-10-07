@@ -30,7 +30,8 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Query
 from fastapi import status as http_status
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, TypeAdapter, model_validator
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import func, or_, select
 
 from suliko.api.deps import CurrentSession, Db, require
@@ -47,10 +48,12 @@ from suliko.core.errors import (
 from suliko.core.ratelimit import RateLimiter, get_rate_limiter
 from suliko.domain.accounts import (
     UNUSABLE_PASSWORD_HASH,
-    find_account,
+    find_account_by_login,
+    find_suliko_person,
     normalise_email,
     upsert_from_suliko,
     username_for,
+    username_for_account,
 )
 from suliko.domain.plans import (
     NON_OVERRIDABLE,
@@ -113,14 +116,24 @@ class UserInvite(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     full_name: str = Field(min_length=1, max_length=255)
-    email: EmailStr
+    #: Who to invite, by address — or, when it is left out, by `phone`: someone
+    #: registered on suliko.ge with a phone number has no address to write to.
+    email: EmailStr | None = None
     position: str | None = Field(default=None, max_length=100)
+    #: Their phone number. When there is no `email` it is also WHO is invited:
+    #: it must be the number they sign in to suliko.ge with.
     phone: str | None = Field(default=None, max_length=50)
     #: The bundle their access STARTS from. `permissions` below then says
     #: exactly what they end up with; the role remains as the label on the
     #: Users screen and in the audit log.
     role: Role = Role.STAFF
     permissions: list[str] | None = None
+
+    @model_validator(mode="after")
+    def _someone_to_invite(self) -> UserInvite:
+        if self.email is None and normalize_phone(self.phone) is None:
+            raise ValueError("an email address or a phone number is required")
+        return self
 
 
 class SulikoAccountOut(BaseModel):
@@ -150,6 +163,10 @@ class InviteOut(BaseModel):
     #: Nobody anywhere, and suliko.ge is connected: the email asks them to
     #: register there with this address first, and the link above only accepts.
     needs_suliko_registration: bool = False
+    #: Invited by phone number, and they have no email address: nothing was
+    #: emailed, so the link above is the only way the invitation reaches them —
+    #: the inviter passes it on themselves.
+    invited_by_phone: bool = False
     invite_expires_at: datetime
     #: Whether the email actually left. False is not an error: the account
     #: exists either way, and the link above is the fallback.
@@ -442,8 +459,27 @@ async def list_users(
     )
 
 
+def _checked_login(raw: str | None) -> str:
+    """An email address (lower-cased) or a phone number, or a 422 saying which.
+
+    Shared by the search box and the invite, so both accept exactly the same
+    things.
+    """
+    login = (raw or "").strip()
+    if not login:
+        raise ValidationError("Enter an email address or a phone number.")
+    if "@" in login:
+        try:
+            return normalise_email(str(TypeAdapter(EmailStr).validate_python(login)))
+        except PydanticValidationError:
+            raise ValidationError("Enter a valid email address.") from None
+    if normalize_phone(login) is None:
+        raise ValidationError("Enter a valid email address or phone number.")
+    return login
+
+
 class AccountLookup(BaseModel):
-    """What the invite form's search box learns about an address."""
+    """What the invite form's search box learns about an address or a phone."""
 
     #: A Suliko account uses this address.
     exists: bool
@@ -462,10 +498,13 @@ async def lookup_account(
     db: Db,
     session: CurrentSession,
     _: Annotated[object, Depends(require(Permission.USERS_MANAGE))],
-    email: Annotated[EmailStr, Query()],
     backend: Annotated[SulikoBackend, Depends(get_suliko_backend)],
+    identifier: Annotated[str | None, Query(max_length=255)] = None,
+    email: Annotated[str | None, Query(max_length=255)] = None,
 ) -> AccountLookup:
-    """Search for a person to invite, by email.
+    """Search for a person to invite, by email address or phone number.
+
+    `email` is the old name for `identifier`, still accepted.
 
     Behind `users.manage`, like the invite it leads to: it tells an
     organisation's administrator whether someone has an account, which is the
@@ -477,10 +516,11 @@ async def lookup_account(
     than "no account" — an administrator who is told nobody exists would
     invite them to register again.
     """
-    account = await find_account(db, str(email))
+    login = _checked_login(identifier or email)
+    account = await find_account_by_login(db, login)
     if account is None:
         if backend.enabled:
-            person = await backend.find_user(str(email))
+            person = await find_suliko_person(backend, login)
             if person is not None:
                 return AccountLookup(
                     exists=True,
@@ -612,17 +652,36 @@ async def invite_user(
             retry_after=retry,
         )
 
-    email = normalise_email(str(payload.email))
-    username = username_for(email)
-    account = await find_account(db, email)
+    phone = (payload.phone or "").strip() or None
+    # Who is being invited: by address, or — with no address — by the phone
+    # number they sign in to suliko.ge with.
+    by_phone = payload.email is None
+    login = _checked_login(phone if by_phone else str(payload.email))
+    account = await find_account_by_login(db, login)
     if account is None and backend.enabled:
         # Registered on suliko.ge, never seen here: make their account now, so
         # the invitation is to a real person with a password of their own. A
         # suliko.ge that cannot be asked is a 503 (SulikoUnavailableError), not
         # a reason to invite them to register a second time.
-        person = await backend.find_user(email)
+        person = await find_suliko_person(backend, login)
         if person is not None:
             account = (await upsert_from_suliko(db, person)).account
+    if by_phone and account is None:
+        # Nobody to write to, so no placeholder and no registration email: a
+        # number can only be invited if suliko.ge already has it.
+        raise ValidationError(
+            "No suliko.ge account uses this number. Ask them to register on "
+            "suliko.ge, or invite them by email."
+        )
+
+    # What this membership is called, and where mail to it goes. Someone who
+    # signs in to suliko.ge with a phone number may have no address at all.
+    if by_phone and account is not None:
+        member_email = account.email
+        username = username_for_account(account)
+    else:
+        member_email = login
+        username = username_for(login)
 
     clash = (
         (
@@ -630,7 +689,7 @@ async def invite_user(
                 select(User).where(
                     or_(
                         func.lower(User.username) == username,
-                        func.lower(User.email) == email,
+                        *([func.lower(User.email) == member_email] if member_email else []),
                         *([User.account_id == account.id] if account else []),
                     )
                 )
@@ -664,7 +723,7 @@ async def invite_user(
         # (`upsert_from_suliko` finds it by this address). Otherwise the
         # set-password link below replaces it.
         account = Account(
-            email=email,
+            email=login,
             password_hash=(
                 UNUSABLE_PASSWORD_HASH
                 if needs_registration
@@ -675,11 +734,10 @@ async def invite_user(
         db.add(account)
         await db.flush()
 
-    phone = (payload.phone or "").strip() or None
     row = User(
         account_id=account.id,
         username=username,
-        email=email,
+        email=member_email,
         full_name=payload.full_name.strip(),
         position=(payload.position or "").strip() or None,
         phone=phone,
@@ -698,34 +756,42 @@ async def invite_user(
     # portal, so a match is recorded, not acted on. `db` doubles as the
     # platform session here for the same reason `api/v1/translators.py`
     # documents at its invite route.
-    matches = await account_matches(db, phone=phone, email=email)
-    matched_display_name: str | None = None
-    invite = PortalAccountInvite(
-        tenant_id=session.tenant_id,
-        kind=InviteKind.STAFF,
-        user_id=row.id,
-        full_name=row.full_name,
-        email=email,
-        phone=phone,
-        normalized_email=normalize_email(email),
-        normalized_phone=normalize_phone(phone),
-        invited_by_user_id=session.user_id,
-    )
-    if len(matches) == 1:
-        portal_account, _reason = matches[0]
-        matched_display_name = portal_account.display_name
-        invite.portal_translator_id = portal_account.id
-        invite.status = InviteStatus.LINKED
-        invite.resolved_at = datetime.now(UTC)
-    else:
-        invite.status = InviteStatus.PENDING
-    db.add(invite)
-    await db.flush()
+    if member_email is not None:
+        matches = await account_matches(db, phone=phone, email=member_email)
+        matched_display_name: str | None = None
+        invite = PortalAccountInvite(
+            tenant_id=session.tenant_id,
+            kind=InviteKind.STAFF,
+            user_id=row.id,
+            full_name=row.full_name,
+            email=member_email,
+            phone=phone,
+            normalized_email=normalize_email(member_email),
+            normalized_phone=normalize_phone(phone),
+            invited_by_user_id=session.user_id,
+        )
+        if len(matches) == 1:
+            portal_account, _reason = matches[0]
+            matched_display_name = portal_account.display_name
+            invite.portal_translator_id = portal_account.id
+            invite.status = InviteStatus.LINKED
+            invite.resolved_at = datetime.now(UTC)
+        else:
+            invite.status = InviteStatus.PENDING
+        db.add(invite)
+        await db.flush()
 
-    suliko_account = SulikoAccountOut(
-        status="linked" if invite.status is InviteStatus.LINKED else "pending",
-        matched_display_name=matched_display_name,
-    )
+        suliko_account = SulikoAccountOut(
+            status="linked" if invite.status is InviteStatus.LINKED else "pending",
+            matched_display_name=matched_display_name,
+        )
+    else:
+        # No address to match on, and nothing to wait for: they were found on
+        # suliko.ge itself, by the number they sign in with. (A match record
+        # needs an address; this person has none.)
+        suliko_account = SulikoAccountOut(
+            status="linked", matched_display_name=account.full_name or None
+        )
 
     from suliko.core.audit import record
 
@@ -756,18 +822,20 @@ async def invite_user(
     else:
         token = await reset_tokens.issue(db, row, ttl_seconds=ttl_seconds)
         invite_link = f"{base}/reset-password?token={quote(token, safe='')}&invite=1"
-    subject, body = _invite_email(
-        row,
-        session.tenant_name,
-        invite_link,
-        session.full_name,
-        max(1, settings.invite_link_ttl_hours // 24),
-        existing_account=existing_account,
-        suliko_account=suliko_account,
-        needs_registration=needs_registration,
-    )
     await limiter.record_invite(tenant_key)
-    result = await mail.send(email, subject, body)
+    email_sent = False
+    if member_email is not None:
+        subject, body = _invite_email(
+            row,
+            session.tenant_name,
+            invite_link,
+            session.full_name,
+            max(1, settings.invite_link_ttl_hours // 24),
+            existing_account=existing_account,
+            suliko_account=suliko_account,
+            needs_registration=needs_registration,
+        )
+        email_sent = (await mail.send(member_email, subject, body)).delivered
 
     overrides = (await _overrides_for(db, [row.id])).get(row.id, {})
     return InviteOut(
@@ -775,8 +843,9 @@ async def invite_user(
         invite_link=invite_link,
         existing_account=existing_account,
         needs_suliko_registration=needs_registration,
+        invited_by_phone=member_email is None,
         invite_expires_at=datetime.now(UTC) + timedelta(seconds=ttl_seconds),
-        email_sent=result.delivered,
+        email_sent=email_sent,
         suliko_account=suliko_account,
     )
 

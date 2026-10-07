@@ -29,7 +29,7 @@ from suliko.db.session import bind_tenant_guc
 from suliko.db.tenancy import bypass_tenant_scope, tenant_scope
 from suliko.domain.plans import TenantPlan
 from suliko.domain.reference_seed import seed_reference_data
-from suliko.integrations.suliko_backend import SulikoUser
+from suliko.integrations.suliko_backend import SulikoBackend, SulikoUser
 from suliko.models.reference import TenantSettings
 from suliko.models.tenant import Tenant, TenantStatus
 from suliko.models.user import Account, Role, User
@@ -68,12 +68,55 @@ async def find_account(db: AsyncSession, email: str) -> Account | None:
     ).scalar_one_or_none()
 
 
+def phone_variants(raw: str) -> list[str]:
+    """The ways one phone number is likely to be written, most literal first.
+
+    suliko.ge keeps a phone sign-in exactly as it was typed at registration, so
+    "599 12 34 56", "+995599123456" and "0599123456" may all be one person. We
+    cannot know which form is stored, so a search tries each. Fewer than six
+    digits is not a number: the typed text alone, so junk matches nothing.
+    """
+    stripped = raw.strip()
+    digits = "".join(ch for ch in stripped if ch.isdigit())
+    if len(digits) < 6:
+        return [stripped] if stripped else []
+    local = digits[3:] if digits.startswith("995") and len(digits) == 12 else digits
+    if len(local) == 10 and local.startswith("05"):
+        local = local[1:]
+    variants: list[str] = []
+    for candidate in (stripped, digits, local, f"+995{local}", f"995{local}"):
+        if candidate not in variants:
+            variants.append(candidate)
+    return variants
+
+
 async def find_account_by_login(db: AsyncSession, login: str) -> Account | None:
     """The account an email or a phone number belongs to."""
     login = login.strip()
     if "@" in login:
         return await find_account(db, login)
-    return (await db.execute(select(Account).where(Account.phone == login))).scalar_one_or_none()
+    return (
+        (await db.execute(select(Account).where(Account.phone.in_(phone_variants(login)))))
+        .scalars()
+        .first()
+    )
+
+
+async def find_suliko_person(backend: SulikoBackend, login: str) -> SulikoUser | None:
+    """The person on suliko.ge who signs in with this email or phone number.
+
+    An address is asked about once; a phone number in each of the forms it may
+    be stored in (`phone_variants`), stopping at the first that is found.
+    Raises SulikoUnavailableError if suliko.ge cannot be asked.
+    """
+    login = login.strip()
+    if "@" in login:
+        return await backend.find_user(login)
+    for variant in phone_variants(login):
+        person = await backend.find_user(variant)
+        if person is not None:
+            return person
+    return None
 
 
 async def find_account_by_suliko_id(db: AsyncSession, suliko_user_id: str) -> Account | None:
@@ -353,11 +396,13 @@ __all__ = [
     "find_account",
     "find_account_by_login",
     "find_account_by_suliko_id",
+    "find_suliko_person",
     "link_account_to_suliko",
     "login_name",
     "memberships",
     "normalise_email",
     "personal",
+    "phone_variants",
     "revoke_account_sessions",
     "slug_candidate",
     "unique_slug",
