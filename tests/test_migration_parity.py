@@ -39,6 +39,8 @@ LATER_REVISIONS = (
     "0011_accounts.py",
     # Columns, constraints and nullability only — see test_migration_0012.py.
     "0012_suliko_accounts.py",
+    # order_files in, the Drive tables out — see test_migration_0013.py.
+    "0013_order_file_storage.py",
 )
 
 
@@ -173,10 +175,14 @@ def test_every_model_table_is_created_by_exactly_one_revision() -> None:
         table.name for table in import_revision("0001_initial_schema_and_rls.py")._revision_tables()
     }
     for name in LATER_REVISIONS:
-        tables = set(import_revision(name).NEW_TABLES)
+        module = import_revision(name)
+        tables = set(module.NEW_TABLES)
         overlap = seen & tables
         assert not overlap, f"{name} creates tables an earlier revision already creates: {overlap}"
         seen |= tables
+        dropped = set(getattr(module, "DROPPED_TABLES", ()))
+        assert dropped <= seen, f"{name} drops tables nothing created: {dropped - seen}"
+        seen -= dropped
 
     assert seen == set(Base.metadata.tables), (
         f"models without a migration: {sorted(set(Base.metadata.tables) - seen)} | "

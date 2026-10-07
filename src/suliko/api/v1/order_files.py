@@ -1,15 +1,16 @@
-"""Order files for bureau staff: the Suliko Office side of the Shared Drive folders.
+"""Order files for bureau staff: the Suliko Office side of a document's Source and
+Translation files.
 
-Staff can also work in Drive directly — drop a scan into a document's ``Source``
-folder and the assigned translator sees it. These routes are for doing the same
-from Suliko Office, and for creating a document's folders ahead of time so there is
-somewhere to drop files before the translator first opens the order.
+Translators see and add to the same files through the portal
+(``api/v1/portal.py``). Both read the ``order_files`` table; the bytes are in
+Suliko's object storage.
 
 Tenant-scoped through the normal staff session, like every other Suliko Office route.
 """
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated
 
 import structlog
@@ -20,30 +21,23 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from suliko.api.deps import CurrentSession, Db, require
-from suliko.api.portal_deps import Drive
+from suliko.api.portal_deps import Storage
 from suliko.api.v1._files import read_upload
 from suliko.config import get_settings
-from suliko.core.errors import (
-    AppError,
-    NotFoundError,
-    UpstreamUnavailableError,
-    ValidationError,
-)
+from suliko.core.errors import AppError, NotFoundError, UpstreamUnavailableError
 from suliko.domain.order_files import (
-    DocumentFolders,
-    DriveNotLinkedError,
     attachment_headers,
-    authorize_file,
-    ensure_document_folders,
-    folder_url,
+    get_document_file,
     list_document_files,
+    open_download,
+    remove_document_file,
     safe_content_type,
     safe_file_name,
     upload_document_file,
 )
-from suliko.integrations.google_drive import DriveError, DriveNotConfiguredError
-from suliko.models.directory import Client
+from suliko.integrations.object_storage import StorageError, StorageNotConfiguredError
 from suliko.models.order import Order, OrderDocument
+from suliko.models.order_file import OrderFile
 from suliko.models.portal import FileKind
 from suliko.security.permissions import Permission
 
@@ -51,12 +45,7 @@ log = structlog.get_logger()
 
 router = APIRouter(prefix="/orders", tags=["order-files"])
 
-DriveFileIdPath = Annotated[str, Path(pattern=r"^[A-Za-z0-9_-]{8,100}$")]
-
-
-class DocumentFoldersOut(BaseModel):
-    source_folder_url: str
-    translation_folder_url: str
+FileIdPath = Annotated[str, Path(pattern=r"^[A-Za-z0-9_-]{8,100}$")]
 
 
 class StaffFileOut(BaseModel):
@@ -65,55 +54,43 @@ class StaffFileOut(BaseModel):
     kind: FileKind
     content_type: str
     size_bytes: int | None
+    #: `user:<id>` for a Suliko Office upload, `portal:<id>` for a translator's.
     uploaded_by: str | None
+    created_at: datetime | None
 
 
-def _failure(exc: DriveError) -> AppError:
-    if isinstance(exc, DriveNotConfiguredError):
-        log.error("drive_not_configured")
+def _out(row: OrderFile) -> StaffFileOut:
+    return StaffFileOut(
+        id=row.public_id,
+        name=row.file_name,
+        kind=row.kind,
+        content_type=row.content_type,
+        size_bytes=row.size_bytes,
+        uploaded_by=row.uploaded_by,
+        created_at=row.created_at,
+    )
+
+
+def storage_failure(exc: StorageError) -> AppError:
+    if isinstance(exc, StorageNotConfiguredError):
+        log.error("storage_not_configured")
         return UpstreamUnavailableError("File storage is not configured on the server.")
-    log.warning("drive_call_failed", status=exc.status, error=str(exc))
-    return UpstreamUnavailableError("Google Drive is not available right now. Please try again.")
+    if exc.is_not_found:
+        # A row whose bytes are gone: worth a loud log line, not a 503.
+        log.error("storage_object_missing", error=str(exc))
+        return NotFoundError("That file is no longer there.")
+    log.warning("storage_call_failed", status=exc.status, error=str(exc))
+    return UpstreamUnavailableError("File storage is not available right now. Please try again.")
 
 
 async def _document(
     db: AsyncSession, order_id: int, document_id: int
-) -> tuple[Order, OrderDocument, str]:
+) -> tuple[Order, OrderDocument]:
     order = await db.get(Order, order_id)
     document = await db.get(OrderDocument, document_id)
     if order is None or document is None or document.order_id != order_id:
         raise NotFoundError("Document not found.")
-    client = await db.get(Client, order.client_id)
-    return order, document, client.name if client else ""
-
-
-async def _folders(
-    db: AsyncSession, drive: Drive, order_id: int, document_id: int
-) -> DocumentFolders:
-    order, document, client_name = await _document(db, order_id, document_id)
-    try:
-        return await ensure_document_folders(
-            db, drive, order=order, document=document, client_name=client_name
-        )
-    except DriveNotLinkedError as exc:
-        raise ValidationError("This organisation has not connected a Google Drive yet.") from exc
-    except DriveError as exc:
-        raise _failure(exc) from exc
-
-
-@router.post("/{order_id}/documents/{document_id}/drive-folders", response_model=DocumentFoldersOut)
-async def create_document_folders(
-    order_id: int,
-    document_id: int,
-    db: Db,
-    drive: Drive,
-    _: Annotated[object, Depends(require(Permission.ORDERS_WRITE))],
-) -> DocumentFoldersOut:
-    folders = await _folders(db, drive, order_id, document_id)
-    return DocumentFoldersOut(
-        source_folder_url=folder_url(folders.source_folder_id),
-        translation_folder_url=folder_url(folders.translation_folder_id),
-    )
+    return order, document
 
 
 @router.get("/{order_id}/documents/{document_id}/files", response_model=list[StaffFileOut])
@@ -121,25 +98,10 @@ async def list_files(
     order_id: int,
     document_id: int,
     db: Db,
-    drive: Drive,
     _: Annotated[object, Depends(require(Permission.ORDERS_READ))],
 ) -> list[StaffFileOut]:
-    folders = await _folders(db, drive, order_id, document_id)
-    try:
-        files = await list_document_files(drive, folders)
-    except DriveError as exc:
-        raise _failure(exc) from exc
-    return [
-        StaffFileOut(
-            id=file.id,
-            name=file.name,
-            kind=kind,
-            content_type=file.mime_type,
-            size_bytes=file.size_bytes,
-            uploaded_by=file.app_properties.get("suliko_uploaded_by"),
-        )
-        for kind, file in files
-    ]
+    await _document(db, order_id, document_id)
+    return [_out(row) for row in await list_document_files(db, document_id)]
 
 
 @router.post(
@@ -153,29 +115,26 @@ async def upload_file(
     file: Annotated[UploadFile, File()],
     db: Db,
     session: CurrentSession,
-    drive: Drive,
+    storage: Storage,
     _: Annotated[object, Depends(require(Permission.ORDERS_WRITE))],
     kind: FileKind = FileKind.SOURCE,
 ) -> StaffFileOut:
-    order, document, client_name = await _document(db, order_id, document_id)
-    content = await read_upload(file, get_settings().drive_file_max_bytes)
+    order, document = await _document(db, order_id, document_id)
+    content = await read_upload(file, get_settings().order_file_max_bytes)
     try:
-        uploaded = await upload_document_file(
+        row = await upload_document_file(
             db,
-            drive,
+            storage,
             order=order,
             document=document,
-            client_name=client_name,
             kind=kind,
             file_name=safe_file_name(file.filename),
             content=content,
             content_type=safe_content_type(file.content_type),
             uploaded_by=f"user:{session.user_id}",
         )
-    except DriveNotLinkedError as exc:
-        raise ValidationError("This organisation has not connected a Google Drive yet.") from exc
-    except DriveError as exc:
-        raise _failure(exc) from exc
+    except StorageError as exc:
+        raise storage_failure(exc) from exc
 
     from suliko.core.audit import record
 
@@ -185,38 +144,30 @@ async def upload_file(
         action="order.file_uploaded",
         entity_type="order",
         entity_id=order_id,
-        after={"document_id": document_id, "kind": kind.value, "file_name": uploaded.name},
+        after={"document_id": document_id, "kind": kind.value, "file_name": row.file_name},
     )
-    return StaffFileOut(
-        id=uploaded.id,
-        name=uploaded.name,
-        kind=kind,
-        content_type=uploaded.mime_type,
-        size_bytes=uploaded.size_bytes,
-        uploaded_by=f"user:{session.user_id}",
-    )
+    return _out(row)
 
 
 @router.get("/{order_id}/documents/{document_id}/files/{file_id}")
 async def download_file(
     order_id: int,
     document_id: int,
-    file_id: DriveFileIdPath,
+    file_id: FileIdPath,
     db: Db,
-    drive: Drive,
+    storage: Storage,
     _: Annotated[object, Depends(require(Permission.ORDERS_READ))],
 ) -> StreamingResponse:
-    folders = await _folders(db, drive, order_id, document_id)
+    await _document(db, order_id, document_id)
+    row = await get_document_file(db, document_id, file_id)
     try:
-        _kind, file = await authorize_file(drive, folders, file_id)
-    except DriveError as exc:
-        raise _failure(exc) from exc
-    if file.mime_type.startswith("application/vnd.google-apps."):
-        raise ValidationError("This is a Google Docs file; open it in Drive instead.")
+        body = await open_download(storage, row)
+    except StorageError as exc:
+        raise storage_failure(exc) from exc
     return StreamingResponse(
-        drive.iter_download(file.id),
-        media_type=safe_content_type(file.mime_type),
-        headers=attachment_headers(file.name),
+        body,
+        media_type=safe_content_type(row.content_type),
+        headers={**attachment_headers(row.file_name), "Content-Length": str(row.size_bytes)},
     )
 
 
@@ -227,19 +178,15 @@ async def download_file(
 async def delete_file(
     order_id: int,
     document_id: int,
-    file_id: DriveFileIdPath,
+    file_id: FileIdPath,
     db: Db,
     session: CurrentSession,
-    drive: Drive,
     _: Annotated[object, Depends(require(Permission.ORDERS_WRITE))],
 ) -> None:
-    """Move a file to the drive's bin (recoverable there for 30 days)."""
-    folders = await _folders(db, drive, order_id, document_id)
-    try:
-        kind, file = await authorize_file(drive, folders, file_id)
-        await drive.trash_file(file.id)
-    except DriveError as exc:
-        raise _failure(exc) from exc
+    """Remove a file. Restorable by support until the retention period ends."""
+    await _document(db, order_id, document_id)
+    row = await get_document_file(db, document_id, file_id)
+    await remove_document_file(db, row, removed_by=f"user:{session.user_id}")
 
     from suliko.core.audit import record
 
@@ -249,5 +196,5 @@ async def delete_file(
         action="order.file_removed",
         entity_type="order",
         entity_id=order_id,
-        before={"document_id": document_id, "kind": kind.value, "file_name": file.name},
+        before={"document_id": document_id, "kind": row.kind.value, "file_name": row.file_name},
     )

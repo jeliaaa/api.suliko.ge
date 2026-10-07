@@ -9,6 +9,7 @@
     python -m suliko.cli import-suliko-users --dry-run
     python -m suliko.cli link-suliko-account --email me@example.com --suliko-login 599123456
     python -m suliko.cli check
+    python -m suliko.cli purge-files        # daily: reclaim removed order files
 
 The superuser is created here and **never through the HTTP API**. There is no
 sign-up path, no "first user becomes admin" rule, and no way to escalate into
@@ -24,9 +25,10 @@ import argparse
 import asyncio
 import getpass
 import re
+import secrets
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -36,11 +38,22 @@ from sqlalchemy import select, text
 from suliko.config import get_settings
 from suliko.core.crypto import encrypt_for_tenant
 from suliko.core.errors import ValidationError
-from suliko.db.session import bind_tenant_guc, dispose_engine, get_engine, get_sessionmaker
+from suliko.db.session import (
+    bind_tenant_guc,
+    dispose_engine,
+    get_engine,
+    get_sessionmaker,
+    session_scope,
+)
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
 from suliko.domain.accounts import UNUSABLE_PASSWORD_HASH, find_account, normalise_email
 from suliko.domain.reference_seed import seed_reference_data
 from suliko.domain.suliko_import import import_users, link_by_hand
+from suliko.integrations.object_storage import (
+    StorageError,
+    close_object_storage,
+    get_object_storage,
+)
 from suliko.integrations.suliko_backend import (
     SulikoUnavailableError,
     close_suliko_backend,
@@ -453,6 +466,32 @@ async def check() -> int:
             fail(str(exc))
             problems += 1
 
+    heading("Order file storage")
+    storage = get_object_storage()
+    if not storage.configured:
+        fail("STORAGE_BACKEND is not set or incomplete — order files cannot be stored")
+        problems += 1
+    else:
+        say(f"  backend     : {storage.description}")
+        # The three calls the app makes, on a throwaway key. Proves the
+        # credentials AND the permissions — a key that can read but not
+        # write passes a mere "can I connect" check.
+        key = f"_suliko/healthcheck/{secrets.token_hex(8)}"
+        try:
+            await storage.put(key, b"ok", "text/plain")
+            body = b"".join([chunk async for chunk in storage.iter_get(key)])
+            await storage.delete(key)
+            if body == b"ok":
+                ok("write, read and delete all work")
+            else:
+                fail("read back different bytes than were written")
+                problems += 1
+        except StorageError as exc:
+            fail(f"storage round trip failed: {exc}")
+            problems += 1
+        finally:
+            await close_object_storage()
+
     heading("Database")
     try:
         async with get_sessionmaker()() as db:
@@ -485,6 +524,53 @@ async def check() -> int:
     else:
         ok("all checks passed")
     return 1 if problems else 0
+
+
+# ── Order file housekeeping ─────────────────────────────────────────────────
+
+
+async def purge_files() -> int:
+    """Delete the bytes of order files removed longer ago than the retention
+    period. Safe to run as often as you like; schedule it daily.
+
+    One tenant at a time, each inside its own scope, so row-level security
+    applies exactly as it does to a request. Exit code 1 if any object could
+    not be deleted — those rows are kept and retried next run.
+    """
+    from suliko.domain.order_files import purge_removed_files
+
+    settings = get_settings()
+    storage = get_object_storage()
+    if not storage.configured:
+        fail("STORAGE_BACKEND is not set — nothing to purge from")
+        return 1
+
+    cutoff = datetime.now(UTC) - timedelta(days=settings.file_retention_days)
+    say(f"Purging files removed before {cutoff:%Y-%m-%d %H:%M} UTC from {storage.description}")
+
+    async with get_sessionmaker()() as db, db.begin():
+        with bypass_tenant_scope():
+            tenants = (await db.execute(select(Tenant.id, Tenant.slug))).all()
+
+    purged = purged_bytes = failed = 0
+    try:
+        for tenant_id, slug in tenants:
+            with tenant_scope(int(tenant_id)):
+                async with session_scope() as db:
+                    result = await purge_removed_files(db, storage, cutoff=cutoff)
+            if result.purged or result.failed:
+                say(f"  {slug}: {result.purged} purged, {result.failed} failed")
+            purged += result.purged
+            purged_bytes += result.purged_bytes
+            failed += result.failed
+    finally:
+        await close_object_storage()
+
+    ok(f"{purged} file(s) purged, {purged_bytes / (1024 * 1024):.1f} MB reclaimed")
+    if failed:
+        fail(f"{failed} file(s) could not be deleted from storage; they will be retried")
+        return 1
+    return 0
 
 
 # ── Interactive bootstrap ───────────────────────────────────────────────────
@@ -603,6 +689,9 @@ def main() -> None:
     sub.add_parser("migrate", help="alembic upgrade head")
     sub.add_parser("check", help="verify configuration and connectivity")
     sub.add_parser("schema-diff", help="report tables and columns the database is missing")
+    sub.add_parser(
+        "purge-files", help="delete the bytes of order files removed past the retention period"
+    )
 
     p = sub.add_parser("create-tenant", help="register a partner bureau")
     p.add_argument("--slug", required=True)
@@ -654,6 +743,8 @@ def main() -> None:
                     return await check()
                 case "schema-diff":
                     return await schema_diff()
+                case "purge-files":
+                    return await purge_files()
                 case "create-tenant":
                     await create_tenant(args.slug, args.name, args.locale)
                 case "create-superuser":

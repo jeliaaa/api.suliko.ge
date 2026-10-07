@@ -1,94 +1,57 @@
-"""Order files in a bureau's Shared Drive.
+"""Order files: rows in ``order_files``, bytes in object storage.
 
 ## Layout
 
-    <Shared Drive>/
-      Suliko Orders/
-        #123 · Client name/                  order_drive_folders
-          Document 456 · en → ka/            order_document_drive_folders.folder_id
-            Source/                          …source_folder_id
-            Translation/                     …translation_folder_id
+    tenants/<tenant id>/orders/<order id>/documents/<document id>/<public id>
 
-A folder per document because translators are assigned per document and may see
-only their own documents' files. Staff drop source files into ``Source``
-directly in Drive; translators upload into ``Translation`` through the portal.
+The key carries the tenant and order so the bucket reads sensibly to a person
+looking at it, and so one bureau's files can be exported or removed with a
+single prefix. It deliberately carries NO file name: names are what people type,
+they live in the row, and keeping them out of the key means no encoding rules,
+no length limits and no collisions to think about.
 
-Every function here takes a TENANT-SCOPED session. The folder rows are tenant
-data, and the order and document passed in must already have been loaded inside
-that tenant's scope — this module never looks anything up by a caller's id.
+Every function here takes a TENANT-SCOPED session. The rows are tenant data,
+and the order and document passed in must already have been loaded inside that
+tenant's scope — this module never looks anything up by a caller's id alone.
 
-## A Drive file id is never trusted on its own
+## A file id is never trusted on its own
 
-Callers name files by Drive id. Before a file is served or removed its metadata
-is fetched and its parent must be the Source or Translation folder of a document
-the caller may see. Without that check, any file the service account can reach —
-in any bureau's drive — would be downloadable by anyone holding a portal login.
+A file is always looked up by its public id AND the document it is claimed to
+belong to, inside the tenant's scope. A guessed or leaked id from another
+document — or another bureau — is simply not found.
 """
 
 from __future__ import annotations
 
 import hashlib
-import hmac
 import re
+import secrets
+from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from urllib.parse import quote
 
-from sqlalchemy import delete, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from suliko.core.errors import NotFoundError
-from suliko.db.tenancy import TenantContextError, is_bypassed, try_get_current_tenant_id
-from suliko.integrations.google_drive import DriveClient, DriveError, DriveFile
-from suliko.models.drive import DriveSettings, OrderDocumentDriveFolder, OrderDriveFolder
+from suliko.integrations.object_storage import ObjectStorage, StorageError
 from suliko.models.order import Order, OrderDocument
+from suliko.models.order_file import OrderFile
 from suliko.models.portal import FileKind
 
-ROOT_FOLDER_NAME = "Suliko Orders"
-KIND_FOLDER_NAMES = {FileKind.SOURCE: "Source", FileKind.TRANSLATION: "Translation"}
-
-#: Written onto every file Suliko uploads, so the portal can tell a translator
-#: which files are theirs to remove. Files staff add in Drive carry neither.
-APP_PROPERTY_KIND = "suliko_kind"
-APP_PROPERTY_UPLOADED_BY = "suliko_uploaded_by"
-
-DRIVE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,100}$")
+#: Public ids are 22 URL-safe characters; the wider pattern is what the
+#: frontends and the old Drive ids already used, so their routes still match.
+FILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,100}$")
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
 
 
-class DriveNotLinkedError(Exception):
-    """This bureau has not linked a Shared Drive yet."""
+def new_public_id() -> str:
+    return secrets.token_urlsafe(16)
 
 
-@dataclass(frozen=True, slots=True)
-class DocumentFolders:
-    drive_id: str
-    folder_id: str
-    source_folder_id: str
-    translation_folder_id: str
-
-    def folder_for(self, kind: FileKind) -> str:
-        return self.source_folder_id if kind is FileKind.SOURCE else self.translation_folder_id
-
-    def kind_of(self, file: DriveFile) -> FileKind | None:
-        """Which of this document's folders the file sits in, if either."""
-        if self.source_folder_id in file.parents:
-            return FileKind.SOURCE
-        if self.translation_folder_id in file.parents:
-            return FileKind.TRANSLATION
-        return None
-
-
-def folder_url(folder_id: str) -> str:
-    return f"https://drive.google.com/drive/folders/{folder_id}"
-
-
-def parse_shared_drive_id(value: str) -> str | None:
-    """Accept a Shared Drive id or a pasted Drive link. None when neither."""
-    value = value.strip()
-    match = re.search(r"/drive/(?:u/\d+/)?folders/([A-Za-z0-9_-]+)", value)
-    if match:
-        value = match.group(1)
-    return value if DRIVE_ID_PATTERN.fullmatch(value) else None
+def storage_key(*, tenant_id: int, order_id: int, document_id: int, public_id: str) -> str:
+    return f"tenants/{tenant_id}/orders/{order_id}/documents/{document_id}/{public_id}"
 
 
 def _clean_name(value: str, limit: int = 200) -> str:
@@ -99,7 +62,7 @@ def safe_file_name(name: str | None) -> str:
     """The last path segment of an uploaded name, without control characters.
 
     Browsers send only a base name, but the multipart field is caller-controlled
-    and the name ends up in Drive and in a Content-Disposition header.
+    and the name ends up in a Content-Disposition header.
     """
     base = re.split(r"[\\/]", name or "")[-1]
     return _clean_name(base) or "file"
@@ -130,377 +93,217 @@ def attachment_headers(file_name: str) -> dict[str, str]:
     }
 
 
-async def get_drive_settings(db: AsyncSession) -> DriveSettings | None:
-    return (await db.execute(select(DriveSettings))).scalars().first()
+# ── Reading ─────────────────────────────────────────────────────────────────
 
 
-# ── Linking a bureau to a Shared Drive ──────────────────────────────────────
-#
-# Shared by the two places that do it: a bureau's own Settings → Integrations,
-# and the suliko.ge admin panel. One implementation, so the checks that matter
-# cannot drift between them.
-#
-# ## Why a bureau has to PROVE it owns the drive
-#
-# Every bureau adds the SAME Suliko service account to its drive, so that
-# account can open every linked drive on the platform, and a drive id is all
-# it takes to point a tenant at one. Without a proof, bureau A could paste
-# bureau B's drive id and read B's documents through Suliko Office.
-#
-# The proof is the same shape as domain verification. Each tenant has a fixed
-# folder name nobody else can predict (`drive_verification_name`), and the
-# drive must contain a folder with that name at its top level. Creating one
-# needs write access to the drive — which is precisely what an attacker
-# pointing at someone else's drive does not have. Suliko itself never creates
-# folders at a drive's top level except `Suliko Orders`, so no request can be
-# used to plant the marker on a bureau's behalf.
-
-
-class DriveLinkError(Exception):
-    """A drive could not be linked. `message` is written to be shown."""
-
-    def __init__(self, message: str, *, upstream: bool = False) -> None:
-        super().__init__(message)
-        self.message = message
-        #: True when Google, not the input, is at fault.
-        self.upstream = upstream
-
-
-async def resolve_shared_drive(
-    drive: DriveClient, raw: str | None
-) -> tuple[str | None, str | None]:
-    """Parse a pasted id or link and open the drive, before anything is saved.
-
-    Returns ``(None, None)`` for "disconnect". Opening it first means a typo, or
-    a drive nobody shared with Suliko, is caught now rather than at the first
-    upload.
-    """
-    from suliko.integrations.google_drive import DriveNotConfiguredError
-
-    if raw is None or not raw.strip():
-        return None, None
-
-    drive_id = parse_shared_drive_id(raw)
-    if drive_id is None:
-        raise DriveLinkError("That is not a Shared Drive id or link.")
-
-    try:
-        name = await drive.get_shared_drive_name(drive_id)
-    except DriveNotConfiguredError as exc:
-        raise DriveLinkError(
-            "Google Drive is not configured on the API server "
-            "(GOOGLE_SERVICE_ACCOUNT_FILE is not set)."
-        ) from exc
-    except DriveError as exc:
-        if exc.status in (403, 404):
-            raise DriveLinkError(
-                "Suliko cannot open that Shared Drive. Add "
-                f"{drive.service_account_email} to it as a Content manager, then try again."
-            ) from exc
-        raise DriveLinkError("Google Drive is not available right now.", upstream=True) from exc
-
-    return drive_id, name
-
-
-VERIFICATION_PREFIX = "suliko-verify-"
-
-
-def drive_verification_name(tenant_id: int) -> str:
-    """The folder a tenant must create in its drive before linking it.
-
-    Derived, not stored: an HMAC of the tenant id under the server's master
-    key. Stable across page loads, so the instructions a bureau reads do not
-    change under them — and unguessable from outside, so no bureau can work
-    out another's. A leaked value is harmless: it only ever verifies a drive
-    for the tenant it was derived from.
-    """
-    from suliko.config import get_settings
-
-    key = get_settings().encryption_master_key.get_secret_value().encode()
-    digest = hmac.new(key, f"suliko-drive-verify:{tenant_id}".encode(), hashlib.sha256)
-    return VERIFICATION_PREFIX + digest.hexdigest()[:16]
-
-
-async def verify_drive_ownership(
-    db: AsyncSession, drive: DriveClient, *, drive_id: str, tenant_id: int
-) -> None:
-    """Refuse a drive this tenant has not proved it controls.
-
-    Two checks, in the order that gives the clearer message:
-
-    1. No OTHER tenant has this drive linked. A drive holds one bureau's
-       files; sharing one would mix two bureaus' folders in it.
-    2. The drive contains this tenant's verification folder at its top level.
-
-    Check 1 reads across tenants and is therefore only as good as what the
-    session can see. It is defence in depth — check 2 is the one that holds on
-    its own, because it needs write access to the drive itself.
-    """
-    from suliko.db.tenancy import bypass_tenant_scope
-
-    with bypass_tenant_scope():
-        taken = (
+async def list_document_files(db: AsyncSession, document_id: int) -> list[OrderFile]:
+    """The document's live files, oldest first."""
+    return list(
+        (
             await db.execute(
-                select(DriveSettings.tenant_id).where(
-                    DriveSettings.shared_drive_id == drive_id,
-                    DriveSettings.tenant_id != tenant_id,
+                select(OrderFile)
+                .where(
+                    OrderFile.order_document_id == document_id,
+                    OrderFile.deleted_at.is_(None),
                 )
+                .order_by(OrderFile.id)
             )
-        ).first()
-    if taken is not None:
-        raise DriveLinkError(
-            "That Shared Drive is already connected to another organisation on Suliko."
         )
-
-    marker = drive_verification_name(tenant_id)
-    try:
-        found = await drive.find_folder(drive_id=drive_id, parent_id=drive_id, name=marker)
-    except DriveError as exc:
-        raise DriveLinkError("Google Drive is not available right now.", upstream=True) from exc
-
-    if found is None:
-        raise DriveLinkError(
-            f'Create a folder named "{marker}" at the top level of that Shared Drive, '
-            "then try again. It proves the drive is yours; you can delete it once the "
-            "drive is connected."
-        )
-
-
-async def save_drive_link(
-    db: AsyncSession, drive_id: str | None, drive_name: str | None
-) -> str | None:
-    """Store the link for the tenant IN SCOPE, and return the previous drive id.
-
-    `db` must already be scoped to the target tenant — ambient context, RLS
-    GUC and all. The stale-folder cleanup below relies on the ORM filter to
-    pick that tenant's rows, so an unscoped session here would wipe every
-    bureau's folder ids at once.
-    """
-    # Refuse rather than trust the caller. Under `bypass_tenant_scope()` the
-    # cleanup below is unfiltered and deletes EVERY bureau's folder ids — and
-    # the platform router, the natural caller, holds that bypass for its reads.
-    # Failing loudly here turns a silent platform-wide wipe into a stack trace.
-    if is_bypassed() or try_get_current_tenant_id() is None:
-        raise TenantContextError(
-            "save_drive_link needs a single tenant in scope. Wrap the call in "
-            "tenant_scope(tenant_id), not bypass_tenant_scope()."
-        )
-
-    settings = await get_drive_settings(db)
-    previous = settings.shared_drive_id if settings else None
-
-    if drive_id is None:
-        if settings is not None:
-            await db.delete(settings)
-    elif settings is None:
-        db.add(DriveSettings(shared_drive_id=drive_id, drive_name=drive_name))
-    else:
-        settings.shared_drive_id = drive_id
-        settings.drive_name = drive_name
-
-    if previous != drive_id:
-        # Folder ids point into the previous drive and mean nothing in a new
-        # one. Loaded and deleted through the ORM, so the tenant filter —
-        # which covers SELECTs, not bulk DELETEs — decides what goes.
-        for model in (OrderDocumentDriveFolder, OrderDriveFolder):
-            for stale in (await db.execute(select(model))).scalars():
-                await db.delete(stale)
-
-    await db.flush()
-    return previous
-
-
-async def _find_or_create(
-    drive: DriveClient, *, drive_id: str, parent_id: str, name: str
-) -> DriveFile:
-    existing = await drive.find_folder(drive_id=drive_id, parent_id=parent_id, name=name)
-    return existing or await drive.create_folder(parent_id=parent_id, name=name)
-
-
-async def _order_folder_id(
-    db: AsyncSession, drive: DriveClient, drive_id: str, order: Order, client_name: str
-) -> str:
-    stored = (
-        await db.execute(select(OrderDriveFolder).where(OrderDriveFolder.order_id == order.id))
-    ).scalar_one_or_none()
-    if stored is not None:
-        return stored.folder_id
-
-    root = await _find_or_create(
-        drive, drive_id=drive_id, parent_id=drive_id, name=ROOT_FOLDER_NAME
+        .scalars()
+        .all()
     )
-    folder = await _find_or_create(
-        drive,
-        drive_id=drive_id,
-        parent_id=root.id,
-        name=_clean_name(f"#{order.id} · {client_name}"),
-    )
-    db.add(OrderDriveFolder(order_id=order.id, folder_id=folder.id))
-    await db.flush()
-    return folder.id
 
 
-async def ensure_document_folders(
-    db: AsyncSession,
-    drive: DriveClient,
-    *,
-    order: Order,
-    document: OrderDocument,
-    client_name: str,
-) -> DocumentFolders:
-    """The document's folders, creating whatever is missing.
-
-    The order row is locked first, so two first-time requests for documents of
-    the same order cannot both create the order folder. (SQLite ignores the
-    lock; the unique constraint still refuses the second row.)
-    """
-    settings = await get_drive_settings(db)
-    if settings is None:
-        raise DriveNotLinkedError
-    drive_id = settings.shared_drive_id
-
-    await db.execute(select(Order.id).where(Order.id == order.id).with_for_update())
-
-    stored = (
+async def get_document_file(db: AsyncSession, document_id: int, public_id: str) -> OrderFile:
+    """The file, if it is a live file of this document. Otherwise 404 — never 403."""
+    if not FILE_ID_PATTERN.fullmatch(public_id):
+        raise NotFoundError("File not found.")
+    row = (
         await db.execute(
-            select(OrderDocumentDriveFolder).where(
-                OrderDocumentDriveFolder.order_document_id == document.id
+            select(OrderFile).where(
+                OrderFile.public_id == public_id,
+                OrderFile.order_document_id == document_id,
+                OrderFile.deleted_at.is_(None),
             )
         )
     ).scalar_one_or_none()
-    if stored is not None:
-        return DocumentFolders(
-            drive_id=drive_id,
-            folder_id=stored.folder_id,
-            source_folder_id=stored.source_folder_id,
-            translation_folder_id=stored.translation_folder_id,
-        )
-
-    name = _clean_name(
-        f"Document {document.id} · {document.source_language} → {document.target_language}"
-    )
-    order_folder_id = await _order_folder_id(db, drive, drive_id, order, client_name)
-    try:
-        folder = await _find_or_create(
-            drive, drive_id=drive_id, parent_id=order_folder_id, name=name
-        )
-    except DriveError as exc:
-        if not exc.is_not_found:
-            raise
-        # The order folder was deleted in Drive. Forget it and start again.
-        await db.execute(delete(OrderDriveFolder).where(OrderDriveFolder.order_id == order.id))
-        order_folder_id = await _order_folder_id(db, drive, drive_id, order, client_name)
-        folder = await _find_or_create(
-            drive, drive_id=drive_id, parent_id=order_folder_id, name=name
-        )
-
-    source = await _find_or_create(
-        drive, drive_id=drive_id, parent_id=folder.id, name=KIND_FOLDER_NAMES[FileKind.SOURCE]
-    )
-    translation = await _find_or_create(
-        drive,
-        drive_id=drive_id,
-        parent_id=folder.id,
-        name=KIND_FOLDER_NAMES[FileKind.TRANSLATION],
-    )
-    db.add(
-        OrderDocumentDriveFolder(
-            order_document_id=document.id,
-            folder_id=folder.id,
-            source_folder_id=source.id,
-            translation_folder_id=translation.id,
-        )
-    )
-    await db.flush()
-    return DocumentFolders(
-        drive_id=drive_id,
-        folder_id=folder.id,
-        source_folder_id=source.id,
-        translation_folder_id=translation.id,
-    )
-
-
-async def forget_document_folders(db: AsyncSession, document_id: int) -> None:
-    """Drop stored folder ids so the next use recreates them."""
-    await db.execute(
-        delete(OrderDocumentDriveFolder).where(
-            OrderDocumentDriveFolder.order_document_id == document_id
-        )
-    )
-
-
-async def list_document_files(
-    drive: DriveClient, folders: DocumentFolders
-) -> list[tuple[FileKind, DriveFile]]:
-    files: list[tuple[FileKind, DriveFile]] = []
-    for kind in FileKind:
-        children = await drive.list_children(
-            drive_id=folders.drive_id, folder_id=folders.folder_for(kind)
-        )
-        files.extend((kind, child) for child in children if not child.is_folder)
-    return files
-
-
-async def authorize_file(
-    drive: DriveClient, folders: DocumentFolders, file_id: str
-) -> tuple[FileKind, DriveFile]:
-    """The file, if it belongs to this document. Otherwise 404 — never 403."""
-    if not DRIVE_ID_PATTERN.fullmatch(file_id):
+    if row is None:
         raise NotFoundError("File not found.")
+    return row
+
+
+async def open_download(storage: ObjectStorage, file: OrderFile) -> AsyncIterator[bytes]:
+    """The file's bytes, with the first chunk already fetched.
+
+    Fetched up front so that a missing object or a storage outage surfaces as
+    an ordinary error response. Once a ``StreamingResponse`` has sent its
+    headers, the only way left to report a failure is a cut connection.
+    """
+    stream = storage.iter_get(file.storage_key)
     try:
-        file = await drive.get_file(file_id)
-    except DriveError as exc:
-        if exc.is_not_found:
-            raise NotFoundError("File not found.") from exc
-        raise
-    kind = folders.kind_of(file)
-    if kind is None or file.trashed or file.is_folder:
-        raise NotFoundError("File not found.")
-    return kind, file
+        first = await anext(stream)
+    except StopAsyncIteration:
+        first = b""
+
+    async def rest() -> AsyncIterator[bytes]:
+        if first:
+            yield first
+        async for chunk in stream:
+            yield chunk
+
+    return rest()
+
+
+# ── Writing ─────────────────────────────────────────────────────────────────
 
 
 async def upload_document_file(
     db: AsyncSession,
-    drive: DriveClient,
+    storage: ObjectStorage,
     *,
     order: Order,
     document: OrderDocument,
-    client_name: str,
     kind: FileKind,
     file_name: str,
     content: bytes,
     content_type: str,
     uploaded_by: str,
-) -> DriveFile:
-    """Upload into the document's Source or Translation folder.
+) -> OrderFile:
+    """Store the bytes, then record the row.
 
-    A folder deleted in Drive since it was recorded fails the upload with 404;
-    the stored ids are then dropped and the upload retried once into fresh
-    folders.
+    In that order so a storage failure leaves nothing behind. The reverse
+    failure — stored, then the transaction does not commit — leaves an object
+    no row points at; it is rare, harmless, and costs a few megabytes.
     """
-    properties = {APP_PROPERTY_KIND: kind.value, APP_PROPERTY_UPLOADED_BY: uploaded_by}
-    folders = await ensure_document_folders(
-        db, drive, order=order, document=document, client_name=client_name
+    public_id = new_public_id()
+    key = storage_key(
+        tenant_id=order.tenant_id,
+        order_id=order.id,
+        document_id=document.id,
+        public_id=public_id,
     )
-    try:
-        return await drive.upload_file(
-            parent_id=folders.folder_for(kind),
-            name=file_name,
-            content=content,
-            content_type=content_type,
-            app_properties=properties,
-        )
-    except DriveError as exc:
-        if not exc.is_not_found:
-            raise
-    await forget_document_folders(db, document.id)
-    folders = await ensure_document_folders(
-        db, drive, order=order, document=document, client_name=client_name
-    )
-    return await drive.upload_file(
-        parent_id=folders.folder_for(kind),
-        name=file_name,
-        content=content,
+    await storage.put(key, content, content_type)
+
+    row = OrderFile(
+        public_id=public_id,
+        order_document_id=document.id,
+        kind=kind,
+        file_name=file_name,
         content_type=content_type,
-        app_properties=properties,
+        size_bytes=len(content),
+        sha256=hashlib.sha256(content).hexdigest(),
+        storage_key=key,
+        uploaded_by=uploaded_by,
     )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def remove_document_file(db: AsyncSession, file: OrderFile, *, removed_by: str) -> None:
+    """Hide the file now; ``purge_removed_files`` deletes the bytes later."""
+    file.deleted_at = datetime.now(UTC)
+    file.deleted_by = removed_by
+    await db.flush()
+
+
+async def remove_files_of_documents(
+    db: AsyncSession, document_ids: Iterable[int], *, removed_by: str
+) -> int:
+    """Mark every live file of these documents removed, before they are deleted.
+
+    Loaded and updated through the ORM, so the tenant filter decides which
+    rows are touched. Returns how many were.
+    """
+    ids = list(document_ids)
+    if not ids:
+        return 0
+    rows = (
+        (
+            await db.execute(
+                select(OrderFile).where(
+                    OrderFile.order_document_id.in_(ids),
+                    OrderFile.deleted_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    now = datetime.now(UTC)
+    for row in rows:
+        row.deleted_at = now
+        row.deleted_by = removed_by
+    await db.flush()
+    return len(rows)
+
+
+# ── Housekeeping ────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class PurgeResult:
+    purged: int
+    purged_bytes: int
+    failed: int
+
+
+async def purge_removed_files(
+    db: AsyncSession, storage: ObjectStorage, *, cutoff: datetime
+) -> PurgeResult:
+    """Delete the bytes and rows of files removed before ``cutoff``.
+
+    Run per tenant (the session must be scoped to one). A row whose document
+    vanished without the handler marking it — a direct SQL delete, say — is
+    marked now, so it gets the same grace period as everything else.
+
+    A file whose object cannot be deleted keeps its row and is retried on the
+    next run: deleting the row first would orphan the bytes for good.
+    """
+    now = datetime.now(UTC)
+    for orphan in (
+        await db.execute(
+            select(OrderFile).where(
+                OrderFile.order_document_id.is_(None), OrderFile.deleted_at.is_(None)
+            )
+        )
+    ).scalars():
+        orphan.deleted_at = now
+        orphan.deleted_by = "system:document-deleted"
+
+    purged = purged_bytes = failed = 0
+    due = (
+        (
+            await db.execute(
+                select(OrderFile).where(
+                    OrderFile.deleted_at.is_not(None), OrderFile.deleted_at < cutoff
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in due:
+        try:
+            await storage.delete(row.storage_key)
+        except StorageError:
+            failed += 1
+            continue
+        purged += 1
+        purged_bytes += row.size_bytes
+        await db.delete(row)
+    await db.flush()
+    return PurgeResult(purged=purged, purged_bytes=purged_bytes, failed=failed)
+
+
+async def storage_usage(db: AsyncSession) -> tuple[int, int]:
+    """(files, bytes) held for the tenant in scope, removed-but-not-purged included.
+
+    Removed files still occupy storage until they are purged, so they count.
+    """
+    count, total = (
+        await db.execute(
+            select(func.count(OrderFile.id), func.coalesce(func.sum(OrderFile.size_bytes), 0))
+        )
+    ).one()
+    return int(count), int(total)

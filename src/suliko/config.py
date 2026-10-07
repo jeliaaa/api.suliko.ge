@@ -10,7 +10,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, PostgresDsn, SecretStr, field_validator
+from pydantic import AliasChoices, Field, PostgresDsn, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Environment = Literal["development", "staging", "production"]
@@ -173,16 +173,35 @@ class Settings(BaseSettings):
     portal_ticket_max_age_seconds: int = 300
 
     #: Personal-order files live in the database, so they are capped harder
-    #: than files that go to an organisation's Shared Drive.
+    #: than order files, which go to object storage.
     personal_file_max_bytes: int = 25 * 1024 * 1024
-    drive_file_max_bytes: int = 50 * 1024 * 1024
+    #: Read from DRIVE_FILE_MAX_BYTES too, so a server .env written for the
+    #: Google Drive era keeps its limit.
+    order_file_max_bytes: int = Field(
+        default=50 * 1024 * 1024,
+        validation_alias=AliasChoices("ORDER_FILE_MAX_BYTES", "DRIVE_FILE_MAX_BYTES"),
+    )
 
-    # ── Google Drive ────────────────────────────────────────────────────────
-    #: Path to Suliko's service-account JSON key. Each organisation adds the
-    #: service account's email to one of its Shared Drives, and the suliko.ge
-    #: admin records that drive against the tenant. Unset disables Drive: order
-    #: data still works, file lists report that storage is not configured.
-    google_service_account_file: str | None = None
+    # ── Order file storage ──────────────────────────────────────────────────
+    # Suliko stores every bureau's order files itself; see
+    # integrations/object_storage.py. Unset: order data still works, file
+    # routes report that storage is not configured.
+    storage_backend: Literal["s3", "local"] | None = None
+    #: STORAGE_BACKEND=local: the directory files are written under.
+    storage_local_dir: str | None = None
+    #: STORAGE_BACKEND=s3. Leave the endpoint unset for AWS itself — it
+    #: follows from the region. Cloudflare R2 uses region "auto".
+    s3_endpoint_url: str | None = None
+    s3_region: str = "us-east-1"
+    s3_bucket: str | None = None
+    s3_access_key_id: str | None = None
+    s3_secret_access_key: SecretStr | None = None
+    #: "path" (bucket in the path) works with every provider; "virtual"
+    #: (bucket in the host name) is AWS's preferred form.
+    s3_addressing_style: Literal["path", "virtual"] = "path"
+    #: How long a removed file stays restorable before `suliko purge-files`
+    #: deletes its bytes.
+    file_retention_days: int = 30
 
     # ── Outbound email (platform) ───────────────────────────────────────────
     # AUTH mail only: password resets, and later invites and welcome mail.

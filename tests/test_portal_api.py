@@ -1,6 +1,6 @@
 """The translator portal and its admin, end to end through the app.
 
-In-memory SQLite and a fake Google Drive, in the spirit of
+In-memory SQLite and an in-memory object store, in the spirit of
 ``test_tenant_isolation.py``: the ORM tenant filter and every access rule in
 the portal routers run with no infrastructure. PostgreSQL row-level security
 does not — see that module's note on ``test_rls.py``.
@@ -13,10 +13,9 @@ shows up as an extra item instead of passing silently.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
-from dataclasses import replace
-from datetime import UTC, date, datetime
+from datetime import date
 from decimal import Decimal
 from typing import Any
 
@@ -36,16 +35,16 @@ from suliko.db.base import Base
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
 from suliko.domain.plans import TenantPlan
 from suliko.domain.portal import registration_url
-from suliko.integrations.google_drive import (
-    FOLDER_MIME_TYPE,
-    DriveError,
-    DriveFile,
-    get_drive_client,
+from suliko.integrations.object_storage import (
+    NOT_CONFIGURED,
+    StorageError,
+    StorageNotConfiguredError,
+    get_object_storage,
 )
 from suliko.integrations.suliko_backend import UnconfiguredSulikoBackend
 from suliko.models.directory import Client, ClientType, Translator
-from suliko.models.drive import DriveSettings, OrderDocumentDriveFolder, OrderDriveFolder
 from suliko.models.order import CopyType, Order, OrderDocument, Urgency
+from suliko.models.order_file import OrderFile
 from suliko.models.portal import (
     InviteStatus,
     PersonalOrder,
@@ -78,8 +77,6 @@ NINO = "22222222-2222-4222-8222-222222222222"
 STRANGER = "33333333-3333-4333-8333-333333333333"
 ADMIN = "99999999-9999-4999-8999-999999999999"
 
-ACME_DRIVE = "0AAcmeSharedDrive01"
-
 MODELS = [
     Tenant,
     Client,
@@ -93,9 +90,7 @@ MODELS = [
     PersonalOrder,
     PersonalOrderLanguagePair,
     PersonalOrderFile,
-    DriveSettings,
-    OrderDriveFolder,
-    OrderDocumentDriveFolder,
+    OrderFile,
     # Before User: a membership points at the person's account.
     Account,
     User,
@@ -107,112 +102,34 @@ MODELS = [
 API = "/api/v1"
 
 
-# ── A Google Drive that lives in a dict ─────────────────────────────────────
+# ── Object storage that lives in a dict ────────────────────────────────────
 
 
-class FakeDrive:
-    service_account_email = "suliko-drive@suliko-test.iam.gserviceaccount.com"
+class FakeStorage:
+    def __init__(self, *, configured: bool = True) -> None:
+        self.objects: dict[str, bytes] = {}
+        self._configured = configured
 
-    def __init__(self) -> None:
-        self.drives = {ACME_DRIVE: "Acme Shared Drive"}
-        self.files: dict[str, DriveFile] = {}
-        self.content: dict[str, bytes] = {}
-        self._next = 0
+    @property
+    def configured(self) -> bool:
+        return self._configured
 
-    def _new_id(self) -> str:
-        self._next += 1
-        return f"drivefile{self._next:06d}"
+    @property
+    def description(self) -> str:
+        return "fake"
 
-    def _require_parent(self, parent_id: str) -> None:
-        if parent_id not in self.drives and parent_id not in self.files:
-            raise DriveError("parent not found", 404)
+    async def put(self, key: str, content: bytes, content_type: str) -> None:
+        if not self._configured:
+            raise StorageNotConfiguredError(NOT_CONFIGURED)
+        self.objects[key] = content
 
-    def add_file(
-        self,
-        parent_id: str,
-        name: str,
-        content: bytes,
-        app_properties: Mapping[str, str] | None = None,
-    ) -> DriveFile:
-        """What staff dropping a file straight into Drive looks like."""
-        file = DriveFile(
-            id=self._new_id(),
-            name=name,
-            mime_type="application/pdf",
-            size_bytes=len(content),
-            created_at=datetime.now(UTC),
-            parents=(parent_id,),
-            app_properties=dict(app_properties or {}),
-        )
-        self.files[file.id] = file
-        self.content[file.id] = content
-        return file
+    async def iter_get(self, key: str) -> AsyncIterator[bytes]:
+        if key not in self.objects:
+            raise StorageError("no such object", 404)
+        yield self.objects[key]
 
-    async def get_shared_drive_name(self, drive_id: str) -> str:
-        if drive_id not in self.drives:
-            raise DriveError("drive not found", 404)
-        return self.drives[drive_id]
-
-    async def find_folder(self, *, drive_id: str, parent_id: str, name: str) -> DriveFile | None:
-        for file in self.files.values():
-            if (
-                file.is_folder
-                and not file.trashed
-                and parent_id in file.parents
-                and file.name == name
-            ):
-                return file
-        return None
-
-    async def create_folder(self, *, parent_id: str, name: str) -> DriveFile:
-        self._require_parent(parent_id)
-        folder = DriveFile(
-            id=self._new_id(),
-            name=name,
-            mime_type=FOLDER_MIME_TYPE,
-            size_bytes=None,
-            created_at=datetime.now(UTC),
-            parents=(parent_id,),
-        )
-        self.files[folder.id] = folder
-        return folder
-
-    async def list_children(self, *, drive_id: str, folder_id: str) -> list[DriveFile]:
-        return [f for f in self.files.values() if folder_id in f.parents and not f.trashed]
-
-    async def get_file(self, file_id: str) -> DriveFile:
-        if file_id not in self.files:
-            raise DriveError("file not found", 404)
-        return self.files[file_id]
-
-    async def upload_file(
-        self,
-        *,
-        parent_id: str,
-        name: str,
-        content: bytes,
-        content_type: str,
-        app_properties: Mapping[str, str],
-    ) -> DriveFile:
-        self._require_parent(parent_id)
-        file = DriveFile(
-            id=self._new_id(),
-            name=name,
-            mime_type=content_type,
-            size_bytes=len(content),
-            created_at=datetime.now(UTC),
-            parents=(parent_id,),
-            app_properties=dict(app_properties),
-        )
-        self.files[file.id] = file
-        self.content[file.id] = content
-        return file
-
-    async def iter_download(self, file_id: str) -> AsyncIterator[bytes]:
-        yield self.content[file_id]
-
-    async def trash_file(self, file_id: str) -> None:
-        self.files[file_id] = replace(self.files[file_id], trashed=True)
+    async def delete(self, key: str) -> None:
+        self.objects.pop(key, None)
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
@@ -403,13 +320,13 @@ async def maker() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
 
 
 @pytest.fixture
-def drive() -> FakeDrive:
-    return FakeDrive()
+def storage() -> FakeStorage:
+    return FakeStorage()
 
 
 @pytest_asyncio.fixture
 async def client(
-    maker: async_sessionmaker[AsyncSession], drive: FakeDrive
+    maker: async_sessionmaker[AsyncSession], storage: FakeStorage
 ) -> AsyncIterator[httpx.AsyncClient]:
     from suliko.main import create_app
 
@@ -437,7 +354,7 @@ async def client(
 
     app.dependency_overrides[get_platform_db] = platform_db
     app.dependency_overrides[get_tenant_sessions] = lambda: tenant_session
-    app.dependency_overrides[get_drive_client] = lambda: drive
+    app.dependency_overrides[get_object_storage] = lambda: storage
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -491,15 +408,6 @@ async def link(
     )
 
 
-async def connect_acme_drive(client: httpx.AsyncClient) -> None:
-    response = await client.put(
-        f"{API}/portal-admin/organizations/acme/drive",
-        json={"shared_drive": ACME_DRIVE},
-        headers=as_admin(),
-    )
-    assert response.status_code == 200, response.text
-
-
 async def giorgi_at_acme(client: httpx.AsyncClient) -> None:
     await add_translator(client)
     assert (await link(client, "acme", 1)).status_code == 200
@@ -509,17 +417,36 @@ def files_path(document_id: int, order_id: int = 101, slug: str = "acme") -> str
     return f"{API}/portal/organizations/{slug}/orders/{order_id}/documents/{document_id}/files"
 
 
-async def source_folder(maker: async_sessionmaker[AsyncSession], document_id: int) -> str:
+async def staff_file(
+    maker: async_sessionmaker[AsyncSession],
+    storage: FakeStorage,
+    document_id: int,
+    name: str,
+    content: bytes,
+) -> str:
+    """What a bureau uploading a source file through the CRM leaves behind."""
+    from suliko.domain.order_files import upload_document_file
+    from suliko.models.portal import FileKind
+
     with tenant_scope(ACME):
         async with maker() as db:
-            row = (
-                await db.execute(
-                    select(OrderDocumentDriveFolder).where(
-                        OrderDocumentDriveFolder.order_document_id == document_id
-                    )
-                )
-            ).scalar_one()
-            return row.source_folder_id
+            document = await db.get(OrderDocument, document_id)
+            assert document is not None
+            order = await db.get(Order, document.order_id)
+            assert order is not None
+            row = await upload_document_file(
+                db,
+                storage,
+                order=order,
+                document=document,
+                kind=FileKind.SOURCE,
+                file_name=name,
+                content=content,
+                content_type="application/pdf",
+                uploaded_by="user:1",
+            )
+            await db.commit()
+            return row.public_id
 
 
 # ── Who is calling ──────────────────────────────────────────────────────────
@@ -656,37 +583,24 @@ async def test_relinking_replaces_the_row_and_unlinking_removes_the_bureau(
     assert me["organizations"] == []
 
 
-async def test_drive_is_checked_before_it_is_saved(client: httpx.AsyncClient) -> None:
-    response = await client.put(
-        f"{API}/portal-admin/organizations/acme/drive",
-        json={"shared_drive": "0AUnsharedDrive999"},
-        headers=as_admin(),
-    )
-    assert response.status_code == 422
-    assert FakeDrive.service_account_email in response.json()["detail"]
-
-    response = await client.put(
-        f"{API}/portal-admin/organizations/acme/drive",
-        json={"shared_drive": f"https://drive.google.com/drive/u/0/folders/{ACME_DRIVE}"},
-        headers=as_admin(),
-    )
-    assert response.status_code == 200
-    assert response.json()["shared_drive_id"] == ACME_DRIVE
-    assert response.json()["drive_name"] == "Acme Shared Drive"
+async def test_admin_sees_each_organisations_storage_use(
+    client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession], storage: FakeStorage
+) -> None:
+    await staff_file(maker, storage, 1001, "passport.pdf", b"%PDF-1234")
 
     organizations = (
         await client.get(f"{API}/portal-admin/organizations", headers=as_admin())
     ).json()
     by_slug = {o["slug"]: o for o in organizations}
-    assert by_slug["acme"]["shared_drive_id"] == ACME_DRIVE
-    assert by_slug["globex"]["shared_drive_id"] is None
+    assert (by_slug["acme"]["file_count"], by_slug["acme"]["storage_bytes"]) == (1, 9)
+    assert (by_slug["globex"]["file_count"], by_slug["globex"]["storage_bytes"]) == (0, 0)
 
-    response = await client.put(
-        f"{API}/portal-admin/organizations/acme/drive",
-        json={"shared_drive": None},
-        headers=as_admin(),
+
+async def test_the_drive_routes_are_gone(client: httpx.AsyncClient) -> None:
+    assert (await client.get(f"{API}/portal-admin/drive", headers=as_admin())).status_code in (
+        404,
+        405,
     )
-    assert response.json()["shared_drive_id"] is None
 
 
 # ── Assigned orders ─────────────────────────────────────────────────────────
@@ -765,19 +679,28 @@ async def test_deactivated_translator_loses_the_tab(client: httpx.AsyncClient) -
     assert response.status_code == 403
 
 
-async def test_order_without_a_drive_reports_it(client: httpx.AsyncClient) -> None:
+async def test_order_without_storage_reports_it(
+    client: httpx.AsyncClient, storage: FakeStorage
+) -> None:
+    storage._configured = False
     await giorgi_at_acme(client)
     detail = (
         await client.get(f"{API}/portal/organizations/acme/orders/101", headers=as_user(GIORGI))
     ).json()
-    assert {d["files_state"] for d in detail["documents"]} == {"not_linked"}
+    assert {d["files_state"] for d in detail["documents"]} == {"unavailable"}
+
+    response = await client.post(
+        files_path(1001),
+        headers=as_user(GIORGI),
+        files={"file": ("t.docx", b"x", "application/msword")},
+    )
+    assert response.status_code == 503
 
 
 async def test_order_detail_lists_each_documents_files(
-    client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession], drive: FakeDrive
+    client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession], storage: FakeStorage
 ) -> None:
     await giorgi_at_acme(client)
-    await connect_acme_drive(client)
     url = f"{API}/portal/organizations/acme/orders/101"
 
     first = (await client.get(url, headers=as_user(GIORGI))).json()
@@ -785,12 +708,9 @@ async def test_order_detail_lists_each_documents_files(
         (1001, "ok", []),
         (1003, "ok", []),
     ]
-    folder_names = {f.name for f in drive.files.values() if f.is_folder}
-    assert {"Suliko Orders", "#101 · Nino Beridze", "Source", "Translation"} <= folder_names
-    assert "Document 1001 · en → ka" in folder_names
 
-    # Staff drop a scan straight into Drive.
-    drive.add_file(await source_folder(maker, 1001), "passport.pdf", b"%PDF-source")
+    # The bureau adds a scan through the CRM.
+    await staff_file(maker, storage, 1001, "passport.pdf", b"%PDF-source")
 
     second = (await client.get(url, headers=as_user(GIORGI))).json()
     files_1001 = second["documents"][0]["files"]
@@ -801,10 +721,12 @@ async def test_order_detail_lists_each_documents_files(
 
 
 async def test_translation_upload_and_download_with_tickets(
-    client: httpx.AsyncClient, drive: FakeDrive, audit: list[dict[str, Any]]
+    client: httpx.AsyncClient,
+    storage: FakeStorage,
+    maker: async_sessionmaker[AsyncSession],
+    audit: list[dict[str, Any]],
 ) -> None:
     await giorgi_at_acme(client)
-    await connect_acme_drive(client)
     path = files_path(1001)
 
     # No assertion header: the browser holds only the ticket.
@@ -817,9 +739,17 @@ async def test_translation_upload_and_download_with_tickets(
     uploaded = response.json()
     assert uploaded["kind"] == "translation"
     assert uploaded["uploaded_by_me"] is True
-    stored = drive.files[uploaded["id"]]
-    assert stored.app_properties["suliko_uploaded_by"] == f"portal:{GIORGI}"
     assert any(e["action"] == "order.file_uploaded" for e in audit)
+
+    with tenant_scope(ACME):
+        async with maker() as db:
+            row = (
+                await db.execute(select(OrderFile).where(OrderFile.public_id == uploaded["id"]))
+            ).scalar_one()
+    assert row.uploaded_by == f"portal:{GIORGI}"
+    # The key names the tenant, order and document, and never the file name.
+    assert row.storage_key == f"tenants/{ACME}/orders/101/documents/1001/{uploaded['id']}"
+    assert storage.objects[row.storage_key] == b"translated bytes"
 
     download = f"{path}/{uploaded['id']}"
     response = await client.get(download, params=ticket(GIORGI, "GET", download))
@@ -829,11 +759,8 @@ async def test_translation_upload_and_download_with_tickets(
     assert response.headers["x-content-type-options"] == "nosniff"
 
 
-async def test_a_ticket_opens_only_its_own_request(
-    client: httpx.AsyncClient, drive: FakeDrive
-) -> None:
+async def test_a_ticket_opens_only_its_own_request(client: httpx.AsyncClient) -> None:
     await giorgi_at_acme(client)
-    await connect_acme_drive(client)
     upload = {"file": ("t.txt", b"x", "text/plain")}
 
     # Issued for document 1001, presented at 1003.
@@ -850,38 +777,48 @@ async def test_a_ticket_opens_only_its_own_request(
 
 
 async def test_a_file_is_served_only_through_its_own_document(
-    client: httpx.AsyncClient, drive: FakeDrive, maker: async_sessionmaker[AsyncSession]
+    client: httpx.AsyncClient, storage: FakeStorage, maker: async_sessionmaker[AsyncSession]
 ) -> None:
     await giorgi_at_acme(client)
-    await connect_acme_drive(client)
-    await client.get(f"{API}/portal/organizations/acme/orders/101", headers=as_user(GIORGI))
-    scan = drive.add_file(await source_folder(maker, 1001), "passport.pdf", b"%PDF")
+    scan = await staff_file(maker, storage, 1001, "passport.pdf", b"%PDF")
 
-    # Giorgi may see document 1003, but this file is not in 1003's folders.
-    response = await client.get(f"{files_path(1003)}/{scan.id}", headers=as_user(GIORGI))
+    response = await client.get(f"{files_path(1001)}/{scan}", headers=as_user(GIORGI))
+    assert response.status_code == 200
+
+    # Giorgi may see document 1003, but this file belongs to 1001.
+    response = await client.get(f"{files_path(1003)}/{scan}", headers=as_user(GIORGI))
     assert response.status_code == 404
 
     # Document 1002 is someone else's; its path is not Giorgi's to use at all.
-    response = await client.get(f"{files_path(1002)}/{scan.id}", headers=as_user(GIORGI))
+    response = await client.get(f"{files_path(1002)}/{scan}", headers=as_user(GIORGI))
     assert response.status_code == 404
 
-    # A Drive id from outside any order folder.
-    stray = drive.add_file(ACME_DRIVE, "salaries.xlsx", b"secret")
-    response = await client.get(f"{files_path(1001)}/{stray.id}", headers=as_user(GIORGI))
+    # An id that matches no file at all.
+    response = await client.get(
+        f"{files_path(1001)}/AAAAAAAAAAAAAAAAAAAAAA", headers=as_user(GIORGI)
+    )
+    assert response.status_code == 404
+
+
+async def test_a_file_whose_bytes_are_gone_is_404_not_a_broken_stream(
+    client: httpx.AsyncClient, storage: FakeStorage, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    await giorgi_at_acme(client)
+    scan = await staff_file(maker, storage, 1001, "passport.pdf", b"%PDF")
+    storage.objects.clear()
+
+    response = await client.get(f"{files_path(1001)}/{scan}", headers=as_user(GIORGI))
     assert response.status_code == 404
 
 
 async def test_translators_remove_only_their_own_translations(
-    client: httpx.AsyncClient, drive: FakeDrive, maker: async_sessionmaker[AsyncSession]
+    client: httpx.AsyncClient, storage: FakeStorage, maker: async_sessionmaker[AsyncSession]
 ) -> None:
     await giorgi_at_acme(client)
-    await connect_acme_drive(client)
-    await client.get(f"{API}/portal/organizations/acme/orders/101", headers=as_user(GIORGI))
-    scan = drive.add_file(await source_folder(maker, 1001), "passport.pdf", b"%PDF")
+    scan = await staff_file(maker, storage, 1001, "passport.pdf", b"%PDF")
 
-    response = await client.delete(f"{files_path(1001)}/{scan.id}", headers=as_user(GIORGI))
+    response = await client.delete(f"{files_path(1001)}/{scan}", headers=as_user(GIORGI))
     assert response.status_code == 403
-    assert drive.files[scan.id].trashed is False
 
     uploaded = (
         await client.post(
@@ -892,7 +829,16 @@ async def test_translators_remove_only_their_own_translations(
     ).json()
     response = await client.delete(f"{files_path(1001)}/{uploaded['id']}", headers=as_user(GIORGI))
     assert response.status_code == 204
-    assert drive.files[uploaded["id"]].trashed is True
+
+    detail = (
+        await client.get(f"{API}/portal/organizations/acme/orders/101", headers=as_user(GIORGI))
+    ).json()
+    assert [f["name"] for f in detail["documents"][0]["files"]] == ["passport.pdf"]
+    # Removed, not erased: the bytes wait for the purge.
+    assert len(storage.objects) == 2
+
+    response = await client.get(f"{files_path(1001)}/{uploaded['id']}", headers=as_user(GIORGI))
+    assert response.status_code == 404
 
 
 # ── Personal orders ─────────────────────────────────────────────────────────

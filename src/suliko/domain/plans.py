@@ -21,10 +21,10 @@ grants; the plan is what withholds `users.manage`.
 ## Freelancer
 
 One person, no employees, no payroll. The tabs are Dashboard, Translations,
-Clients, Notaries, Calculator, Reports and Settings; the only external service
-is Google Drive. They are still the OWNER of their tenant — they can change
-their own settings and their own billing — they simply have nobody to manage
-and nobody to pay.
+Clients, Notaries, Calculator, Reports and Settings; they connect no external
+services (order file storage is built in, for every plan). They are still the
+OWNER of their tenant — they can change their own settings and their own
+billing — they simply have nobody to manage and nobody to pay.
 
 Note what this deliberately withholds: `finance.*`. A freelancer invoices
 through the Translations screen and the invoice document; the Finances screen
@@ -117,11 +117,12 @@ PLAN_FEATURES: MappingProxyType[TenantPlan, frozenset[Feature]] = MappingProxyTy
     }
 )
 
-#: External services each plan may connect. Invoicing is not here because it is
-#: not an integration — it is built in, and both plans have it.
+#: External services each plan may connect. Invoicing and order file storage
+#: are not here because they are not integrations — they are built in, and
+#: both plans have them.
 PLAN_PROVIDERS: MappingProxyType[TenantPlan, frozenset[IntegrationProvider]] = MappingProxyType(
     {
-        TenantPlan.FREELANCER: frozenset({IntegrationProvider.GOOGLE_DRIVE}),
+        TenantPlan.FREELANCER: frozenset(),
         TenantPlan.BUREAU: frozenset(IntegrationProvider),
     }
 )

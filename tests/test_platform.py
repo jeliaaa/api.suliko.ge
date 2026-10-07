@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import AsyncIterator
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -23,11 +23,12 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from suliko.api.v1 import platform
+from suliko.core.errors import NotFoundError
 from suliko.db.base import Base
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
 from suliko.models.directory import Client, ClientType
-from suliko.models.drive import DriveSettings, OrderDocumentDriveFolder, OrderDriveFolder
 from suliko.models.order import CopyType, Order, OrderDocument, Urgency
+from suliko.models.order_file import OrderFile
 from suliko.models.reference import DocumentType, Language, LanguagePairPrice
 from suliko.models.tenant import Tenant, TenantStatus
 from suliko.models.user import Role, User
@@ -44,9 +45,7 @@ PORTABLE_TABLES = [
     LanguagePairPrice.__table__,
     Order.__table__,
     OrderDocument.__table__,
-    DriveSettings.__table__,
-    OrderDriveFolder.__table__,
-    OrderDocumentDriveFolder.__table__,
+    OrderFile.__table__,
 ]
 
 
@@ -383,305 +382,183 @@ def test_impersonation_is_not_implemented() -> None:
     )
 
 
-# ── Linking a Shared Drive ──────────────────────────────────────────────────
+# ── Order file storage ──────────────────────────────────────────────────────
+#
+# The Drive linking these tests used to cover is gone; files are stored by
+# Suliko itself. What matters across tenants now is that a file row, a
+# removal and a purge only ever touch the tenant in scope.
 
 
-async def _seed_folders(db: AsyncSession) -> None:
-    """Both bureaus already have a linked drive and folders inside it."""
-    with bypass_tenant_scope():
-        db.add_all(
-            [
-                DriveSettings(tenant_id=ACME, shared_drive_id="0AAcmeDrive0001", drive_name="Acme"),
-                DriveSettings(
-                    tenant_id=GLOBEX, shared_drive_id="0AGlobexDrive01", drive_name="Globex"
-                ),
-                OrderDriveFolder(tenant_id=ACME, order_id=1, folder_id="acmeOrderFolder1"),
-                OrderDriveFolder(tenant_id=GLOBEX, order_id=2, folder_id="globexOrderFold1"),
-            ]
-        )
-        await db.commit()
+class _MemoryStorage:
+    configured = True
+    description = "memory"
 
+    def __init__(self, *, failing: set[str] | None = None) -> None:
+        self.objects: dict[str, bytes] = {}
+        self.failing = failing or set()
 
-async def _folder_owners(db: AsyncSession) -> set[int]:
-    from sqlalchemy import select
+    async def put(self, key: str, content: bytes, content_type: str) -> None:
+        self.objects[key] = content
 
-    with bypass_tenant_scope():
-        return set((await db.execute(select(OrderDriveFolder.tenant_id))).scalars().all())
+    async def iter_get(self, key: str) -> AsyncIterator[bytes]:
+        yield self.objects[key]
 
+    async def delete(self, key: str) -> None:
+        from suliko.integrations.object_storage import StorageError
 
-async def test_relinking_one_bureau_leaves_the_others_folders_alone(db: AsyncSession) -> None:
-    """The failure this guards against is quiet and total.
+        if key in self.failing:
+            raise StorageError("refused", 503)
+        self.objects.pop(key, None)
 
-    Changing a drive clears the folder ids that pointed into the old one. That
-    cleanup relies on the ORM tenant filter to pick the right rows — so if it
-    ran unscoped, relinking ACME would wipe GLOBEX's folder ids too, and every
-    one of their documents would silently lose its folder.
-    """
-    from suliko.domain.order_files import save_drive_link
 
-    await _seed_folders(db)
-    assert await _folder_owners(db) == {ACME, GLOBEX}
+async def _upload(db: AsyncSession, storage: _MemoryStorage, tenant: int, document_id: int) -> str:
+    from suliko.domain.order_files import upload_document_file
+    from suliko.models.portal import FileKind
 
-    with tenant_scope(ACME):
-        previous = await save_drive_link(db, "0ANewAcmeDrive1", "Acme (new)")
-        await db.commit()
-
-    assert previous == "0AAcmeDrive0001"
-    assert await _folder_owners(db) == {GLOBEX}, "relinking Acme touched Globex's folders"
-
-
-async def test_relinking_under_the_bypass_is_refused(db: AsyncSession) -> None:
-    """The tempting mistake in a cross-tenant router, and what it would cost.
-
-    Under `bypass_tenant_scope()` the stale-folder cleanup is unfiltered, so
-    relinking one bureau would delete every bureau's folder ids. The function
-    refuses instead — and nothing is touched.
-    """
-    from suliko.db.tenancy import TenantContextError
-    from suliko.domain.order_files import save_drive_link
-
-    await _seed_folders(db)
-
-    with bypass_tenant_scope(), pytest.raises(TenantContextError, match="tenant_scope"):
-        await save_drive_link(db, "0ANewAcmeDrive1", "Acme (new)")
-    await db.rollback()
-
-    assert await _folder_owners(db) == {ACME, GLOBEX}
-
-
-async def test_relinking_with_no_tenant_is_refused(db: AsyncSession) -> None:
-    from suliko.db.tenancy import TenantContextError
-    from suliko.domain.order_files import save_drive_link
-
-    with pytest.raises(TenantContextError):
-        await save_drive_link(db, "0ANewAcmeDrive1", "Acme (new)")
-
-
-async def test_relinking_to_the_same_drive_keeps_the_folders(db: AsyncSession) -> None:
-    """Only a CHANGE of drive invalidates the folder ids."""
-    from suliko.domain.order_files import save_drive_link
-
-    await _seed_folders(db)
-
-    with tenant_scope(ACME):
-        await save_drive_link(db, "0AAcmeDrive0001", "Acme renamed")
-        await db.commit()
-
-    assert await _folder_owners(db) == {ACME, GLOBEX}
-
-
-async def test_disconnecting_removes_only_that_bureaus_link(db: AsyncSession) -> None:
-    from sqlalchemy import select
-
-    from suliko.domain.order_files import save_drive_link
-
-    await _seed_folders(db)
-
-    with tenant_scope(ACME):
-        await save_drive_link(db, None, None)
-        await db.commit()
-
-    with bypass_tenant_scope():
-        linked = set((await db.execute(select(DriveSettings.tenant_id))).scalars().all())
-    assert linked == {GLOBEX}
-
-
-class _FakeDrive:
-    service_account_email = "suliko-drive@suliko.iam.gserviceaccount.com"
-
-    def __init__(
-        self, *, status: int | None = None, top_level_folders: dict[str, set[str]] | None = None
-    ) -> None:
-        self.status = status
-        #: drive id -> folder names at that drive's top level.
-        self.top_level_folders = top_level_folders or {}
-        self.lookups: list[tuple[str, str, str]] = []
-
-    async def find_folder(self, *, drive_id: str, parent_id: str, name: str) -> object | None:
-        self.lookups.append((drive_id, parent_id, name))
-        return object() if name in self.top_level_folders.get(parent_id, set()) else None
-
-    async def get_shared_drive_name(self, drive_id: str) -> str:
-        from suliko.integrations.google_drive import DriveError
-
-        if self.status is not None:
-            raise DriveError("nope", self.status)
-        return f"Drive {drive_id}"
-
-
-async def test_a_pasted_link_is_accepted() -> None:
-    from suliko.domain.order_files import resolve_shared_drive
-
-    drive_id, name = await resolve_shared_drive(
-        _FakeDrive(),  # type: ignore[arg-type]
-        "https://drive.google.com/drive/u/0/folders/0AAbcDefGhiJklMn",
-    )
-    assert drive_id == "0AAbcDefGhiJklMn"
-    assert name == "Drive 0AAbcDefGhiJklMn"
-
-
-async def test_blank_means_disconnect() -> None:
-    from suliko.domain.order_files import resolve_shared_drive
-
-    assert await resolve_shared_drive(_FakeDrive(), "   ") == (None, None)  # type: ignore[arg-type]
-    assert await resolve_shared_drive(_FakeDrive(), None) == (None, None)  # type: ignore[arg-type]
-
-
-async def test_garbage_is_refused_before_google_is_asked() -> None:
-    from suliko.domain.order_files import DriveLinkError, resolve_shared_drive
-
-    with pytest.raises(DriveLinkError, match="not a Shared Drive"):
-        await resolve_shared_drive(_FakeDrive(), "not a drive!")  # type: ignore[arg-type]
-
-
-@pytest.mark.parametrize("status", [403, 404])
-async def test_an_unshared_drive_names_the_account_to_add(status: int) -> None:
-    """The one error an operator will actually hit, and the fix is in the
-    message: which address to add, and with what role."""
-    from suliko.domain.order_files import DriveLinkError, resolve_shared_drive
-
-    with pytest.raises(DriveLinkError) as caught:
-        await resolve_shared_drive(_FakeDrive(status=status), "0AAbcDefGhiJklMn")  # type: ignore[arg-type]
-
-    assert "suliko-drive@suliko.iam.gserviceaccount.com" in caught.value.message
-    assert "Content manager" in caught.value.message
-    assert caught.value.upstream is False
-
-
-async def test_a_google_outage_is_reported_as_upstream() -> None:
-    from suliko.domain.order_files import DriveLinkError, resolve_shared_drive
-
-    with pytest.raises(DriveLinkError) as caught:
-        await resolve_shared_drive(_FakeDrive(status=500), "0AAbcDefGhiJklMn")  # type: ignore[arg-type]
-    assert caught.value.upstream is True
-
-
-def test_the_platform_console_only_reports_the_drive() -> None:
-    """Connecting a drive lives in Settings → Integrations, behind the
-    ownership check. The platform console shows the link and nothing more."""
-    source = inspect.getsource(platform)
-    assert "save_drive_link" not in source
-    assert "resolve_shared_drive" not in source
-    for route in platform.router.routes:
-        assert "drive" not in route.path, f"{route.path} writes drive settings"  # type: ignore[attr-defined]
-
-
-# ── Proving a drive belongs to the organisation connecting it ───────────────
-
-
-def test_every_tenant_gets_its_own_verification_folder() -> None:
-    from suliko.domain.order_files import VERIFICATION_PREFIX, drive_verification_name
-
-    names = {drive_verification_name(tenant_id) for tenant_id in range(1, 201)}
-    assert len(names) == 200
-    assert all(n.startswith(VERIFICATION_PREFIX) for n in names)
-
-
-def test_the_verification_folder_is_stable() -> None:
-    """The instructions a bureau reads must not change between page loads."""
-    from suliko.domain.order_files import drive_verification_name
-
-    assert drive_verification_name(ACME) == drive_verification_name(ACME)
-
-
-def test_the_verification_folder_is_not_guessable_from_the_tenant_id() -> None:
-    """Keyed on the server secret. A bare hash of the id could be computed by
-    any bureau for any other bureau, which would make the check decorative."""
-    import hashlib
-
-    from suliko.domain.order_files import VERIFICATION_PREFIX, drive_verification_name
-
-    plain = hashlib.sha256(f"suliko-drive-verify:{ACME}".encode()).hexdigest()[:16]
-    assert drive_verification_name(ACME) != VERIFICATION_PREFIX + plain
-
-
-async def test_a_drive_with_the_folder_is_accepted(db: AsyncSession) -> None:
-    from suliko.domain.order_files import drive_verification_name, verify_drive_ownership
-
-    drive = _FakeDrive(top_level_folders={"0AAcmeNewDrive1": {drive_verification_name(ACME)}})
-    await verify_drive_ownership(db, drive, drive_id="0AAcmeNewDrive1", tenant_id=ACME)  # type: ignore[arg-type]
-
-    # Looked for at the TOP of the drive: parent is the drive itself.
-    assert drive.lookups == [("0AAcmeNewDrive1", "0AAcmeNewDrive1", drive_verification_name(ACME))]
-
-
-async def test_a_drive_without_the_folder_is_refused_with_the_name_to_create(
-    db: AsyncSession,
-) -> None:
-    from suliko.domain.order_files import (
-        DriveLinkError,
-        drive_verification_name,
-        verify_drive_ownership,
-    )
-
-    with pytest.raises(DriveLinkError) as caught:
-        await verify_drive_ownership(
+    with tenant_scope(tenant):
+        document = await db.get(OrderDocument, document_id)
+        assert document is not None
+        order = await db.get(Order, document.order_id)
+        assert order is not None
+        row = await upload_document_file(
             db,
-            _FakeDrive(),  # type: ignore[arg-type]
-            drive_id="0AAcmeNewDrive1",
-            tenant_id=ACME,
+            storage,  # type: ignore[arg-type]
+            order=order,
+            document=document,
+            kind=FileKind.SOURCE,
+            file_name="scan.pdf",
+            content=b"x" * 10,
+            content_type="application/pdf",
+            uploaded_by="user:1",
         )
-    assert drive_verification_name(ACME) in caught.value.message
-    assert caught.value.upstream is False
+        return row.public_id
 
 
-async def test_another_bureaus_folder_does_not_verify_this_one(db: AsyncSession) -> None:
-    """The attack itself: Globex points at a drive where only ACME's marker
-    exists. Globex cannot create its own marker there, and ACME's is useless
-    to it."""
-    from suliko.domain.order_files import (
-        DriveLinkError,
-        drive_verification_name,
-        verify_drive_ownership,
-    )
+async def test_a_file_is_invisible_to_the_other_tenant(db: AsyncSession) -> None:
+    from suliko.domain.order_files import get_document_file, list_document_files
 
-    drive = _FakeDrive(top_level_folders={"0AAcmeNewDrive1": {drive_verification_name(ACME)}})
-    with pytest.raises(DriveLinkError, match="Create a folder"):
-        await verify_drive_ownership(db, drive, drive_id="0AAcmeNewDrive1", tenant_id=GLOBEX)  # type: ignore[arg-type]
+    storage = _MemoryStorage()
+    public_id = await _upload(db, storage, ACME, 1)
 
+    with tenant_scope(GLOBEX):
+        assert await list_document_files(db, 1) == []
+        with pytest.raises(NotFoundError):
+            await get_document_file(db, 1, public_id)
 
-async def test_a_drive_another_bureau_has_connected_is_refused(db: AsyncSession) -> None:
-    """Even WITH a valid marker: someone who later gains write access to a
-    drive must not be able to pull it away from the bureau using it."""
-    from suliko.domain.order_files import (
-        DriveLinkError,
-        drive_verification_name,
-        verify_drive_ownership,
-    )
-
-    await _seed_folders(db)  # Globex has 0AGlobexDrive01 connected
-
-    drive = _FakeDrive(top_level_folders={"0AGlobexDrive01": {drive_verification_name(ACME)}})
-    with pytest.raises(DriveLinkError, match="another organisation"):
-        await verify_drive_ownership(db, drive, drive_id="0AGlobexDrive01", tenant_id=ACME)  # type: ignore[arg-type]
-
-    # Refused before Google was even asked.
-    assert drive.lookups == []
+    with tenant_scope(ACME):
+        assert [f.public_id for f in await list_document_files(db, 1)] == [public_id]
+        # The right file through the wrong document is still not found.
+        with pytest.raises(NotFoundError):
+            await get_document_file(db, 2, public_id)
 
 
-async def test_reconnecting_your_own_drive_is_not_a_clash(db: AsyncSession) -> None:
-    from suliko.domain.order_files import drive_verification_name, verify_drive_ownership
+async def test_usage_counts_only_the_tenant_in_scope(db: AsyncSession) -> None:
+    from suliko.domain.order_files import storage_usage
 
-    await _seed_folders(db)  # ACME already has 0AAcmeDrive0001
+    storage = _MemoryStorage()
+    await _upload(db, storage, ACME, 1)
+    await _upload(db, storage, ACME, 2)
+    await _upload(db, storage, GLOBEX, 3)
 
-    drive = _FakeDrive(top_level_folders={"0AAcmeDrive0001": {drive_verification_name(ACME)}})
-    await verify_drive_ownership(db, drive, drive_id="0AAcmeDrive0001", tenant_id=ACME)  # type: ignore[arg-type]
-
-
-def test_the_settings_endpoint_verifies_before_it_saves() -> None:
-    """The order is the control: nothing is written until ownership holds."""
-    from suliko.api.v1 import integrations
-
-    body = inspect.getsource(integrations.connect_drive)
-    assert body.index("verify_drive_ownership") < body.index("save_drive_link")
-    assert "tenant_id=session.tenant_id" in body, "must verify for the CALLER's tenant"
-    assert "await record(" in body
+    with tenant_scope(ACME):
+        assert await storage_usage(db) == (2, 20)
+    with tenant_scope(GLOBEX):
+        assert await storage_usage(db) == (1, 10)
 
 
-def test_the_drive_routes_are_matched_before_the_generic_provider_routes() -> None:
-    """Otherwise `/integrations/drive` is read as a provider called "drive"
-    and 422s before the Drive handler is ever reached."""
+async def test_removing_a_documents_files_spares_other_documents(db: AsyncSession) -> None:
+    from suliko.domain.order_files import list_document_files, remove_files_of_documents
+
+    storage = _MemoryStorage()
+    await _upload(db, storage, ACME, 1)
+    await _upload(db, storage, ACME, 2)
+
+    with tenant_scope(ACME):
+        assert await remove_files_of_documents(db, [1], removed_by="user:1") == 1
+        assert await list_document_files(db, 1) == []
+        assert len(await list_document_files(db, 2)) == 1
+    # Hidden, not erased: the bytes wait for the purge.
+    assert len(storage.objects) == 2
+
+
+async def test_purge_deletes_only_what_is_past_retention(db: AsyncSession) -> None:
+    from sqlalchemy import select
+
+    from suliko.domain.order_files import purge_removed_files, remove_files_of_documents
+    from suliko.models.order_file import OrderFile
+
+    storage = _MemoryStorage()
+    await _upload(db, storage, ACME, 1)
+    await _upload(db, storage, ACME, 2)
+    await _upload(db, storage, GLOBEX, 3)
+
+    now = datetime.now(UTC)
+    with tenant_scope(GLOBEX):
+        await remove_files_of_documents(db, [3], removed_by="user:9")
+    with tenant_scope(ACME):
+        await remove_files_of_documents(db, [1], removed_by="user:1")
+
+        # Not yet due.
+        result = await purge_removed_files(db, storage, cutoff=now - timedelta(days=30))  # type: ignore[arg-type]
+        assert (result.purged, result.failed) == (0, 0)
+
+        # Due — and only ACME's removed file goes, never GLOBEX's.
+        result = await purge_removed_files(db, storage, cutoff=now + timedelta(seconds=5))  # type: ignore[arg-type]
+        assert (result.purged, result.purged_bytes, result.failed) == (1, 10, 0)
+        remaining = (await db.execute(select(OrderFile))).scalars().all()
+        assert [r.order_document_id for r in remaining] == [2]
+
+    assert sorted(k.split("/")[1] for k in storage.objects) == [str(ACME), str(GLOBEX)]
+
+
+async def test_a_failed_delete_keeps_the_row_for_the_next_run(db: AsyncSession) -> None:
+    from sqlalchemy import select
+
+    from suliko.domain.order_files import purge_removed_files, remove_files_of_documents
+    from suliko.models.order_file import OrderFile
+
+    storage = _MemoryStorage()
+    await _upload(db, storage, ACME, 1)
+    storage.failing = set(storage.objects)
+
+    with tenant_scope(ACME):
+        await remove_files_of_documents(db, [1], removed_by="user:1")
+        later = datetime.now(UTC) + timedelta(seconds=5)
+        result = await purge_removed_files(db, storage, cutoff=later)  # type: ignore[arg-type]
+        assert (result.purged, result.failed) == (0, 1)
+        assert len((await db.execute(select(OrderFile))).scalars().all()) == 1
+
+
+async def test_a_file_left_without_a_document_starts_its_grace_period(db: AsyncSession) -> None:
+    """A document deleted behind the app's back (SET NULL, nothing marked)."""
+    from sqlalchemy import select
+
+    from suliko.domain.order_files import purge_removed_files
+    from suliko.models.order_file import OrderFile
+
+    storage = _MemoryStorage()
+    await _upload(db, storage, ACME, 1)
+    with tenant_scope(ACME):
+        row = (await db.execute(select(OrderFile))).scalar_one()
+        row.order_document_id = None
+        await db.flush()
+
+        result = await purge_removed_files(
+            db, storage, cutoff=datetime.now(UTC) - timedelta(days=30)
+        )  # type: ignore[arg-type]
+        assert result.purged == 0
+        assert row.deleted_at is not None
+        assert row.deleted_by == "system:document-deleted"
+
+
+def test_the_platform_console_reports_storage_not_drive() -> None:
+    fields = set(platform.TenantDetail.model_fields)
+    assert "storage" in fields
+    assert "drive" not in fields
+
+
+def test_the_drive_endpoints_are_gone() -> None:
     from suliko.api.v1 import integrations
 
     paths = [route.path for route in integrations.router.routes]  # type: ignore[attr-defined]
-    assert paths.index("/integrations/drive") < paths.index("/integrations/{provider}")
+    assert not [p for p in paths if p.endswith("/drive")]

@@ -6,7 +6,7 @@ Two kinds of order, kept apart on purpose:
   translator's directory row. Read one bureau at a time, inside that bureau's
   tenant scope. The translator sees the order id, client name and due date, and
   ONLY the documents assigned to them: never prices, other documents, or other
-  translators. Files live in the bureau's Shared Drive.
+  translators. Files live in Suliko's order file storage.
 - **Personal** — orders the translator created for themselves. Platform-level,
   visible to no bureau, files stored in the database.
 
@@ -36,31 +36,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import undefer
 
 from suliko.api.portal_deps import (
-    Drive,
     PlatformDb,
     PortalCaller,
     PortalFileCaller,
     PortalIdentity,
+    Storage,
     TenantSessions,
 )
 from suliko.api.v1._files import read_upload
+from suliko.api.v1.order_files import storage_failure
 from suliko.config import get_settings
 from suliko.core.errors import (
-    AppError,
     NotFoundError,
     PermissionDeniedError,
-    UpstreamUnavailableError,
     ValidationError,
 )
 from suliko.domain.order_files import (
-    APP_PROPERTY_UPLOADED_BY,
-    DocumentFolders,
-    DriveNotLinkedError,
     attachment_headers,
-    authorize_file,
-    ensure_document_folders,
-    get_drive_settings,
+    get_document_file,
     list_document_files,
+    open_download,
+    remove_document_file,
     safe_content_type,
     safe_file_name,
     upload_document_file,
@@ -74,8 +70,9 @@ from suliko.domain.portal import (
     linked_organizations,
     resolve_pending_invites,
 )
-from suliko.integrations.google_drive import DriveError, DriveFile, DriveNotConfiguredError
+from suliko.integrations.object_storage import StorageError
 from suliko.models.audit import ActorType
+from suliko.models.order_file import OrderFile
 from suliko.models.portal import (
     FileKind,
     PersonalOrder,
@@ -89,7 +86,7 @@ log = structlog.get_logger()
 router = APIRouter(prefix="/portal", tags=["portal"])
 
 SlugPath = Annotated[str, Path(pattern=r"^[a-z0-9][a-z0-9-]{1,62}$")]
-DriveFileIdPath = Annotated[str, Path(pattern=r"^[A-Za-z0-9_-]{8,100}$")]
+FileIdPath = Annotated[str, Path(pattern=r"^[A-Za-z0-9_-]{8,100}$")]
 
 MAX_LANGUAGE_PAIRS = 20
 
@@ -138,9 +135,11 @@ class OrderFileOut(BaseModel):
     uploaded_by_me: bool
 
 
-#: ok — listed; not_linked — the bureau has no Shared Drive yet;
-#: unavailable — Drive failed or is not configured on the server.
-FilesState = Literal["ok", "not_linked", "unavailable"]
+#: ok — listed, and uploads work; unavailable — listed, but file storage is
+#: not configured on the server, so nothing can be uploaded or downloaded.
+#: ("not_linked" belonged to the Google Drive era: there is nothing left for
+#: a bureau to link.)
+FilesState = Literal["ok", "unavailable"]
 
 
 class AssignedDocumentDetail(AssignedDocumentOut):
@@ -294,51 +293,16 @@ def _document_out(item: AssignedDocument) -> AssignedDocumentOut:
     )
 
 
-def _file_out(kind: FileKind, file: DriveFile, identity: PortalIdentity) -> OrderFileOut:
+def _file_out(row: OrderFile, identity: PortalIdentity) -> OrderFileOut:
     return OrderFileOut(
-        id=file.id,
-        name=file.name,
-        kind=kind,
-        content_type=file.mime_type,
-        size_bytes=file.size_bytes,
-        created_at=file.created_at,
-        uploaded_by_me=file.app_properties.get(APP_PROPERTY_UPLOADED_BY) == _uploader_tag(identity),
+        id=row.public_id,
+        name=row.file_name,
+        kind=row.kind,
+        content_type=row.content_type,
+        size_bytes=row.size_bytes,
+        created_at=row.created_at,
+        uploaded_by_me=row.uploaded_by == _uploader_tag(identity),
     )
-
-
-def _log_drive_failure(exc: DriveError) -> None:
-    if isinstance(exc, DriveNotConfiguredError):
-        log.error("drive_not_configured")
-    else:
-        log.warning("drive_call_failed", status=exc.status, error=str(exc))
-
-
-def _drive_failure(exc: DriveError) -> AppError:
-    _log_drive_failure(exc)
-    if isinstance(exc, DriveNotConfiguredError):
-        return UpstreamUnavailableError("File storage is not configured on the server.")
-    return UpstreamUnavailableError("Google Drive is not available right now. Please try again.")
-
-
-def _not_linked() -> ValidationError:
-    return ValidationError("This organisation has not connected a Google Drive yet.")
-
-
-async def _folders(
-    tenant_db: AsyncSession, drive: Drive, order: AssignedOrder, item: AssignedDocument
-) -> DocumentFolders:
-    try:
-        return await ensure_document_folders(
-            tenant_db,
-            drive,
-            order=order.order,
-            document=item.document,
-            client_name=order.client_name,
-        )
-    except DriveNotLinkedError as exc:
-        raise _not_linked() from exc
-    except DriveError as exc:
-        raise _drive_failure(exc) from exc
 
 
 # ── Who am I ────────────────────────────────────────────────────────────────
@@ -404,41 +368,24 @@ async def get_assigned_order(
     identity: PortalCaller,
     db: PlatformDb,
     tenants: TenantSessions,
-    drive: Drive,
+    storage: Storage,
 ) -> AssignedOrderDetail:
     """One order, with the caller's documents and their files.
 
-    Opening an order creates its Drive folders if they do not exist yet, so the
-    bureau has somewhere to put source files. A Drive failure degrades one
-    document's file list rather than failing the whole page.
+    The lists come from the database, so they never wait on storage.
     """
     organization = await _organization(db, identity, slug)
+    state: FilesState = "ok" if storage.configured else "unavailable"
 
     async with tenants(organization.tenant_id) as tenant_db:
         order = await _assigned_order(tenant_db, organization, order_id)
-        linked = await get_drive_settings(tenant_db) is not None
 
         documents: list[AssignedDocumentDetail] = []
         for item in order.documents:
-            state: FilesState = "not_linked"
-            files: list[OrderFileOut] = []
-            if linked:
-                try:
-                    folders = await ensure_document_folders(
-                        tenant_db,
-                        drive,
-                        order=order.order,
-                        document=item.document,
-                        client_name=order.client_name,
-                    )
-                    files = [
-                        _file_out(kind, file, identity)
-                        for kind, file in await list_document_files(drive, folders)
-                    ]
-                    state = "ok"
-                except DriveError as exc:
-                    _log_drive_failure(exc)
-                    state = "unavailable"
+            files = [
+                _file_out(row, identity)
+                for row in await list_document_files(tenant_db, item.document.id)
+            ]
             documents.append(
                 AssignedDocumentDetail(
                     **_document_out(item).model_dump(), files_state=state, files=files
@@ -468,14 +415,14 @@ async def upload_translation(
     identity: PortalFileCaller,
     db: PlatformDb,
     tenants: TenantSessions,
-    drive: Drive,
+    storage: Storage,
 ) -> OrderFileOut:
-    """Upload a translated version into the document's Translation folder.
+    """Upload a translated version of the document.
 
     Translators upload translations only; source files come from the bureau.
     """
     organization = await _organization(db, identity, slug)
-    content = await read_upload(file, get_settings().drive_file_max_bytes)
+    content = await read_upload(file, get_settings().order_file_max_bytes)
 
     async with tenants(organization.tenant_id) as tenant_db:
         order = await _assigned_order(tenant_db, organization, order_id)
@@ -483,20 +430,17 @@ async def upload_translation(
         try:
             uploaded = await upload_document_file(
                 tenant_db,
-                drive,
+                storage,
                 order=order.order,
                 document=item.document,
-                client_name=order.client_name,
                 kind=FileKind.TRANSLATION,
                 file_name=safe_file_name(file.filename),
                 content=content,
                 content_type=safe_content_type(file.content_type),
                 uploaded_by=_uploader_tag(identity),
             )
-        except DriveNotLinkedError as exc:
-            raise _not_linked() from exc
-        except DriveError as exc:
-            raise _drive_failure(exc) from exc
+        except StorageError as exc:
+            raise storage_failure(exc) from exc
 
         from suliko.core.audit import record
 
@@ -511,12 +455,12 @@ async def upload_translation(
             after={
                 "document_id": document_id,
                 "kind": FileKind.TRANSLATION.value,
-                "file_name": uploaded.name,
+                "file_name": uploaded.file_name,
                 "actor_external_user_id": identity.user_id,
             },
         )
 
-    return _file_out(FileKind.TRANSLATION, uploaded, identity)
+    return _file_out(uploaded, identity)
 
 
 @router.get("/organizations/{slug}/orders/{order_id}/documents/{document_id}/files/{file_id}")
@@ -524,33 +468,28 @@ async def download_order_file(
     slug: SlugPath,
     order_id: int,
     document_id: int,
-    file_id: DriveFileIdPath,
+    file_id: FileIdPath,
     identity: PortalFileCaller,
     db: PlatformDb,
     tenants: TenantSessions,
-    drive: Drive,
+    storage: Storage,
 ) -> StreamingResponse:
     organization = await _organization(db, identity, slug)
 
     async with tenants(organization.tenant_id) as tenant_db:
         order = await _assigned_order(tenant_db, organization, order_id)
         item = _assigned_document(order, document_id)
-        folders = await _folders(tenant_db, drive, order, item)
-        try:
-            _kind, file = await authorize_file(drive, folders, file_id)
-        except DriveError as exc:
-            raise _drive_failure(exc) from exc
+        row = await get_document_file(tenant_db, item.document.id, file_id)
 
-    if file.mime_type.startswith("application/vnd.google-apps."):
-        # Native Google Docs have no bytes to download, only exports.
-        raise ValidationError(
-            "This is a Google Docs file. Ask the organisation to add it as a PDF or Word file."
-        )
+    try:
+        body = await open_download(storage, row)
+    except StorageError as exc:
+        raise storage_failure(exc) from exc
 
     return StreamingResponse(
-        drive.iter_download(file.id),
-        media_type=safe_content_type(file.mime_type),
-        headers=attachment_headers(file.name),
+        body,
+        media_type=safe_content_type(row.content_type),
+        headers={**attachment_headers(row.file_name), "Content-Length": str(row.size_bytes)},
     )
 
 
@@ -562,32 +501,25 @@ async def delete_order_file(
     slug: SlugPath,
     order_id: int,
     document_id: int,
-    file_id: DriveFileIdPath,
+    file_id: FileIdPath,
     identity: PortalCaller,
     db: PlatformDb,
     tenants: TenantSessions,
-    drive: Drive,
 ) -> None:
-    """Move a translation the caller uploaded to the drive's bin.
+    """Remove a translation the caller uploaded.
 
     Anything else — source files, or files the bureau added — belongs to the
-    bureau and is removed in Drive or Suliko Office, not from the portal.
+    bureau and is removed in Suliko Office, not from the portal.
     """
     organization = await _organization(db, identity, slug)
 
     async with tenants(organization.tenant_id) as tenant_db:
         order = await _assigned_order(tenant_db, organization, order_id)
         item = _assigned_document(order, document_id)
-        folders = await _folders(tenant_db, drive, order, item)
-        try:
-            kind, file = await authorize_file(drive, folders, file_id)
-            if kind is not FileKind.TRANSLATION or file.app_properties.get(
-                APP_PROPERTY_UPLOADED_BY
-            ) != _uploader_tag(identity):
-                raise PermissionDeniedError("You can only remove translations you uploaded.")
-            await drive.trash_file(file.id)
-        except DriveError as exc:
-            raise _drive_failure(exc) from exc
+        row = await get_document_file(tenant_db, item.document.id, file_id)
+        if row.kind is not FileKind.TRANSLATION or row.uploaded_by != _uploader_tag(identity):
+            raise PermissionDeniedError("You can only remove translations you uploaded.")
+        await remove_document_file(tenant_db, row, removed_by=_uploader_tag(identity))
 
         from suliko.core.audit import record
 
@@ -601,7 +533,7 @@ async def delete_order_file(
             actor_type=ActorType.PORTAL_TRANSLATOR,
             before={
                 "document_id": document_id,
-                "file_name": file.name,
+                "file_name": row.file_name,
                 "actor_external_user_id": identity.user_id,
             },
         )

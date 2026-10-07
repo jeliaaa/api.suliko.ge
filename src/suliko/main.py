@@ -20,7 +20,7 @@ from suliko.core.errors import install_error_handlers
 from suliko.core.gateway import GatewayMiddleware
 from suliko.db.session import dispose_engine
 from suliko.db.tenancy import install_tenant_filter
-from suliko.integrations.google_drive import close_drive_client
+from suliko.integrations.object_storage import close_object_storage, get_object_storage
 from suliko.integrations.suliko_backend import close_suliko_backend
 
 
@@ -114,9 +114,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             ),
         )
 
+    storage = get_object_storage()
+    if storage.configured:
+        structlog.get_logger().info("storage", backend=storage.description)
+    else:
+        # Not fatal — orders, clients and finances all work without it — but
+        # every file upload fails, so it has to be loud on every boot.
+        structlog.get_logger().warning(
+            "storage_not_configured",
+            detail=(
+                "STORAGE_BACKEND is not set (or is incomplete). Order files cannot "
+                "be uploaded or downloaded. Set STORAGE_BACKEND=s3 or =local; see "
+                ".env.example."
+            ),
+        )
+
     structlog.get_logger().info("startup", version=__version__, environment=settings.environment)
     yield
-    await close_drive_client()
+    await close_object_storage()
     await close_suliko_backend()
     await dispose_engine()
 

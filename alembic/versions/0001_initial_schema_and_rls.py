@@ -97,6 +97,8 @@ LATER_REVISION_TABLES = frozenset(
         "portal_account_invites",
         # 0010
         "custom_options",
+        # 0013
+        "order_files",
     }
 )
 

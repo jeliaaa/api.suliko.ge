@@ -46,20 +46,32 @@ value as suliko-front's `SULIKO_PORTAL_SECRET`).
 
 - **Admin** (`/api/v1/portal-admin/*`, suliko.ge admins only): mark a suliko.ge account as a
   translator, link it to any number of bureaus — each link points at that bureau's own
-  `translators` row, existing or new — and record each bureau's Google Shared Drive.
+  `translators` row, existing or new.
 - **Assigned orders**: a document shows up in the translator's Orders tab when staff set its
   `translator_id` to a linked row (`PATCH /api/v1/orders/{id}/documents/{doc_id}`). Translators
   see order id, client name, due date and **only their own documents** — no prices.
-- **Files**: `Suliko Orders/#123 · Client/Document 456 · en → ka/{Source,Translation}` in the
-  bureau's Shared Drive. Staff drop sources straight into Drive; translators upload translations.
+- **Files**: each document's Source and Translation files, stored by Suliko itself (see below).
+  Staff upload sources in the CRM; translators upload translations in the portal.
   Browsers transfer files directly with short-lived tickets, because Vercel caps function bodies
   at 4.5 MB.
 - **Personal orders**: a translator's own orders, visible to no bureau; files in the database.
 
-Drive setup: create a Google service account, download its JSON key, point
-`GOOGLE_SERVICE_ACCOUNT_FILE` at it, and have each bureau add the account's email to a Shared
-Drive as **Content manager**. A service account has no storage quota of its own, so a folder in
-someone's My Drive will not work.
+## Order file storage
+
+Order files are stored by Suliko, not by each bureau: nothing to connect, on any plan. What a
+person sees about a file is a row in `order_files`; the bytes live under
+`tenants/<id>/orders/<id>/documents/<id>/<file id>` in one of two backends
+(`integrations/object_storage.py`):
+
+- `STORAGE_BACKEND=local` — a folder on the API server (`STORAGE_LOCAL_DIR`). Back it up with
+  the database.
+- `STORAGE_BACKEND=s3` — any S3-compatible bucket: AWS, Cloudflare R2, Backblaze B2, Hetzner
+  Object Storage, MinIO.
+
+`python -m suliko.cli check` writes, reads and deletes a test file to prove the configuration.
+Removing a file hides it at once; `python -m suliko.cli purge-files`, scheduled daily, deletes
+the bytes after `FILE_RETENTION_DAYS` (30). Until then support can restore it by clearing
+`deleted_at` on its row.
 
 `portal_translators`, `portal_translator_links` and `personal_*` are deliberately platform-level
 (no RLS): the portal must find a translator's bureaus before any tenant is bound. Everything read

@@ -1089,6 +1089,11 @@ async def delete_order_document(
             "page_count": document.page_count,
         },
     )
+    # The document's files go with it: hidden now, bytes purged after the
+    # retention period. The rows' document id is SET NULL by the delete.
+    from suliko.domain.order_files import remove_files_of_documents
+
+    await remove_files_of_documents(db, [document_id], removed_by=f"user:{session.user_id}")
     await db.delete(document)
     await db.flush()
     return await _load_detail(order_id, db, session)
@@ -1292,6 +1297,15 @@ async def delete_order(
         entity_id=order_id,
         before={"client_id": order.client_id, "order_date": str(order.order_date)},
     )
+    # Their files are marked removed first, so the purge reclaims the bytes.
+    from suliko.domain.order_files import remove_files_of_documents
+
+    document_ids = (
+        (await db.execute(select(OrderDocument.id).where(OrderDocument.order_id == order_id)))
+        .scalars()
+        .all()
+    )
+    await remove_files_of_documents(db, document_ids, removed_by=f"user:{session.user_id}")
     # Documents and status events cascade.
     await db.delete(order)
     await db.flush()

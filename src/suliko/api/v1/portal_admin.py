@@ -10,7 +10,6 @@ What an admin can do here is deliberately narrow:
 
 - mark a suliko.ge account as a translator, or deactivate it;
 - link it to a bureau's directory row — an existing one, or a new one;
-- record which Shared Drive a bureau's order files go to.
 
 An admin cannot read a bureau's orders, clients or money from here. Linking a
 translator exposes only the documents the bureau itself assigns to that
@@ -31,18 +30,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from suliko.api.portal_deps import Drive, PlatformDb, PortalAdmin, PortalIdentity, TenantSessions
-from suliko.core.errors import (
-    NotFoundError,
-    UpstreamUnavailableError,
-    ValidationError,
-)
-from suliko.domain.order_files import (
-    DriveLinkError,
-    get_drive_settings,
-    resolve_shared_drive,
-    save_drive_link,
-)
+from suliko.api.portal_deps import PlatformDb, PortalAdmin, PortalIdentity, TenantSessions
+from suliko.core.errors import NotFoundError
+from suliko.domain.order_files import storage_usage
 from suliko.domain.portal import (
     MatchReason,
     directory_matches,
@@ -79,22 +69,9 @@ class AdminOrganizationOut(BaseModel):
     name: str
     status: TenantStatus
     translator_count: int
-    shared_drive_id: str | None
-    drive_name: str | None
-
-
-class DriveInfoOut(BaseModel):
-    """What the admin panel tells a bureau to share its drive with."""
-
-    configured: bool
-    service_account_email: str | None
-
-
-class DriveLinkIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    #: A Shared Drive id or a pasted Drive link. Null disconnects the drive.
-    shared_drive: str | None = Field(max_length=500)
+    #: Files kept in Suliko's order file storage, and their total size.
+    file_count: int
+    storage_bytes: int
 
 
 class LinkOut(BaseModel):
@@ -261,13 +238,7 @@ async def _translators_out(
     ]
 
 
-# ── Organisations and their drives ──────────────────────────────────────────
-
-
-@router.get("/drive", response_model=DriveInfoOut)
-async def get_drive_info(_: PortalAdmin, drive: Drive) -> DriveInfoOut:
-    email = drive.service_account_email
-    return DriveInfoOut(configured=email is not None, service_account_email=email)
+# ── Organisations ──────────────────────────────────────────
 
 
 @router.get("/organizations", response_model=list[AdminOrganizationOut])
@@ -289,71 +260,18 @@ async def list_organizations(
     result: list[AdminOrganizationOut] = []
     for tenant in tenants_rows:
         async with tenants(tenant.id) as tenant_db:
-            settings = await get_drive_settings(tenant_db)
+            file_count, storage_bytes = await storage_usage(tenant_db)
         result.append(
             AdminOrganizationOut(
                 slug=tenant.slug,
                 name=tenant.display_name,
                 status=tenant.status,
                 translator_count=counts.get(tenant.id, 0),
-                shared_drive_id=settings.shared_drive_id if settings else None,
-                drive_name=settings.drive_name if settings else None,
+                file_count=file_count,
+                storage_bytes=storage_bytes,
             )
         )
     return result
-
-
-@router.put("/organizations/{slug}/drive", response_model=AdminOrganizationOut)
-async def set_organization_drive(
-    slug: SlugPath,
-    payload: DriveLinkIn,
-    identity: PortalAdmin,
-    db: PlatformDb,
-    tenants: TenantSessions,
-    drive: Drive,
-) -> AdminOrganizationOut:
-    """Connect, change or disconnect a bureau's Shared Drive.
-
-    The drive is opened before it is saved, so a typo or a drive that was never
-    shared with Suliko is caught here rather than at a translator's first upload.
-    """
-    tenant = await _tenant(db, slug)
-
-    try:
-        drive_id, drive_name = await resolve_shared_drive(drive, payload.shared_drive)
-    except DriveLinkError as exc:
-        if exc.upstream:
-            log.warning("drive_call_failed", error=str(exc))
-            raise UpstreamUnavailableError(exc.message) from exc
-        raise ValidationError(exc.message) from exc
-
-    async with tenants(tenant.id) as tenant_db:
-        previous = await save_drive_link(tenant_db, drive_id, drive_name)
-
-    await _audit(
-        db,
-        identity,
-        action="portal.organization_drive_changed",
-        entity_type="tenant",
-        entity_id=tenant.id,
-        tenant_id=tenant.id,
-        before={"shared_drive_id": previous},
-        after={"shared_drive_id": drive_id, "drive_name": drive_name},
-    )
-
-    count = await db.scalar(
-        select(func.count())
-        .select_from(PortalTranslatorLink)
-        .where(PortalTranslatorLink.tenant_id == tenant.id)
-    )
-    return AdminOrganizationOut(
-        slug=tenant.slug,
-        name=tenant.display_name,
-        status=tenant.status,
-        translator_count=int(count or 0),
-        shared_drive_id=drive_id,
-        drive_name=drive_name,
-    )
 
 
 # ── Translators ─────────────────────────────────────────────────────────────

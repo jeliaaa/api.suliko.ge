@@ -151,10 +151,10 @@ def test_notifications_are_a_bureau_feature() -> None:
     assert not allows_feature(TenantPlan.FREELANCER, Feature.NOTIFICATIONS)
 
 
-def test_a_freelancer_gets_drive_and_nothing_else() -> None:
-    """The spec's "only Google Drive and Invoices". Invoicing is built in
-    rather than an integration, so Drive is the whole list here."""
-    assert PLAN_PROVIDERS[TenantPlan.FREELANCER] == frozenset({IntegrationProvider.GOOGLE_DRIVE})
+def test_a_freelancer_connects_nothing() -> None:
+    """The spec's "only Google Drive and Invoices". Both are built in now —
+    order files live in Suliko's own storage — so there is nothing to connect."""
+    assert PLAN_PROVIDERS[TenantPlan.FREELANCER] == frozenset()
 
 
 @pytest.mark.parametrize("provider", list(IntegrationProvider))

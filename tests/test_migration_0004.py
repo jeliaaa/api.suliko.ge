@@ -31,8 +31,16 @@ def test_creates_exactly_the_listed_tables(revision: tuple[Any, RecordedOps]) ->
 
 
 def _table_names() -> list[str]:
+    """The tables this revision created that are still modelled.
+
+    Revision 0013 dropped the Drive tables along with their models, so there
+    is nothing left to compare them against.
+    """
+    from migration_recorder import import_revision
+
     module, _ = load_revision(FILENAME)
-    return list(module.NEW_TABLES)
+    dropped = set(import_revision("0013_order_file_storage.py").DROPPED_TABLES)
+    return [t for t in module.NEW_TABLES if t not in dropped]
 
 
 @pytest.mark.parametrize("table_name", _table_names())
@@ -109,6 +117,8 @@ def test_groups_agree_with_the_models(revision: tuple[Any, RecordedOps]) -> None
     module, _ = revision
     by_table = {mapper.local_table.name: mapper.class_ for mapper in Base.registry.mappers}
     for table in module.TENANT_TABLES:
+        if table not in by_table:  # dropped by 0013
+            continue
         assert issubclass(by_table[table], TenantScoped), f"{table} should be TenantScoped"
     for table in module.PLATFORM_TABLES:
         assert not issubclass(by_table[table], TenantScoped), f"{table} should be platform-level"

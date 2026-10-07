@@ -22,7 +22,6 @@ from suliko.models.directory import (
     Translator,
     TranslatorLanguagePair,
 )
-from suliko.models.drive import DriveSettings, OrderDocumentDriveFolder, OrderDriveFolder
 from suliko.models.finance import (
     ClientPayment,
     ClientPaymentAllocation,
@@ -43,6 +42,7 @@ from suliko.models.order import (
     OrderStatusEvent,
     Urgency,
 )
+from suliko.models.order_file import OrderFile
 from suliko.models.portal import (
     FileKind,
     InviteKind,
@@ -91,7 +91,6 @@ __all__ = [
     "CopyType",
     "CustomOption",
     "DocumentType",
-    "DriveSettings",
     "Expense",
     "FileKind",
     "HandoverMethod",
@@ -114,8 +113,7 @@ __all__ = [
     "OrderCommentMention",
     "OrderCommentRead",
     "OrderDocument",
-    "OrderDocumentDriveFolder",
-    "OrderDriveFolder",
+    "OrderFile",
     "OrderStatusEvent",
     "PageStatus",
     "PasswordResetToken",

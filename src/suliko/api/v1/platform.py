@@ -70,8 +70,8 @@ from suliko.db.session import bind_tenant_guc
 from suliko.db.tenancy import bypass_tenant_scope, tenant_scope
 from suliko.domain.accounts import UNUSABLE_PASSWORD_HASH, find_account
 from suliko.domain.plans import TenantPlan, effective_plan
-from suliko.models.drive import DriveSettings
 from suliko.models.order import Order, OrderDocument
+from suliko.models.order_file import OrderFile
 from suliko.models.reference import Language, LanguagePairPrice
 from suliko.models.tenant import Tenant, TenantStatus
 from suliko.models.user import Account, Role, User
@@ -153,16 +153,15 @@ class TenantFigures(BaseModel):
     last_order: date | None
 
 
-class DriveLink(BaseModel):
-    """Read-only here. A bureau connects its drive in Settings → Integrations,
-    where the ownership check lives — the platform console only reports it,
-    which is what support needs when someone says their files are missing."""
+class StorageUsage(BaseModel):
+    """What the bureau keeps in Suliko's order file storage — shown so support
+    can answer "where did our files go" and see who is using how much.
 
-    #: None when the bureau has not linked one.
-    shared_drive_id: str | None
-    #: The name Google reported when it was linked — shown so a mistyped id
-    #: reads as "that isn't their drive" rather than passing unnoticed.
-    drive_name: str | None
+    Removed files still count until `suliko purge-files` deletes their bytes.
+    """
+
+    files: int
+    bytes: int
 
 
 class TenantDetail(BaseModel):
@@ -173,7 +172,7 @@ class TenantDetail(BaseModel):
     languages: list[str]
     pricing: list[PairPrice]
     figures: TenantFigures
-    drive: DriveLink
+    storage: StorageUsage
 
 
 class PlatformUserCreate(BaseModel):
@@ -364,9 +363,13 @@ async def get_tenant(tenant_id: int, db: Db, _: Superuser) -> TenantDetail:
 
         figures = await _figures(db, tenant_id)
 
-        drive_row = (
-            await db.execute(select(DriveSettings).where(DriveSettings.tenant_id == tenant_id))
-        ).scalar_one_or_none()
+        file_count, file_bytes = (
+            await db.execute(
+                select(
+                    func.count(OrderFile.id), func.coalesce(func.sum(OrderFile.size_bytes), 0)
+                ).where(OrderFile.tenant_id == tenant_id)
+            )
+        ).one()
 
     return TenantDetail(
         tenant=_summary(
@@ -387,10 +390,7 @@ async def get_tenant(tenant_id: int, db: Db, _: Superuser) -> TenantDetail:
             for p in pricing
         ],
         figures=figures,
-        drive=DriveLink(
-            shared_drive_id=drive_row.shared_drive_id if drive_row else None,
-            drive_name=drive_row.drive_name if drive_row else None,
-        ),
+        storage=StorageUsage(files=int(file_count), bytes=int(file_bytes)),
     )
 
 

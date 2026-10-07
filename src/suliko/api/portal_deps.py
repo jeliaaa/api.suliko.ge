@@ -33,7 +33,7 @@ from suliko.config import get_settings
 from suliko.core.errors import AuthenticationError, PermissionDeniedError
 from suliko.db.session import session_scope
 from suliko.db.tenancy import TenantContextError, tenant_scope, try_get_current_tenant_id
-from suliko.integrations.google_drive import DriveClient, get_drive_client
+from suliko.integrations.object_storage import ObjectStorage, get_object_storage
 from suliko.security.portal_tokens import PortalTokenError, verify_token
 
 log = structlog.get_logger()
@@ -152,4 +152,4 @@ PortalAdmin = Annotated[PortalIdentity, Depends(require_portal_admin)]
 # Function scope for the same reason as `api.deps.Db`: commit before responding.
 PlatformDb = Annotated[AsyncSession, Depends(get_platform_db, scope="function")]
 TenantSessions = Annotated[TenantSessionFactory, Depends(get_tenant_sessions)]
-Drive = Annotated[DriveClient, Depends(get_drive_client)]
+Storage = Annotated[ObjectStorage, Depends(get_object_storage)]
