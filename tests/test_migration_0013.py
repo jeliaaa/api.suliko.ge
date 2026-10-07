@@ -50,8 +50,12 @@ def test_columns_match_the_model(revision: tuple[Any, RecordedOps]) -> None:
     migrated = ops.tables["order_files"]
     declared = Base.metadata.tables["order_files"]
 
-    assert set(migrated.columns.keys()) == set(declared.columns.keys())
+    # Columns a LATER revision added (0014's working_key) are not 0013's.
+    later = {c.name for _, c in import_revision("0014_order_file_working_copy.py").NEW_COLUMNS}
+    assert set(migrated.columns.keys()) == set(declared.columns.keys()) - later
     for name, column in declared.columns.items():
+        if name in later:
+            continue
         other = migrated.columns[name]
         assert other.nullable == column.nullable, f"order_files.{name}: nullability differs"
         assert str(other.type) == str(column.type), f"order_files.{name}: type differs"

@@ -186,7 +186,25 @@ class Settings(BaseSettings):
     # Suliko stores every bureau's order files itself; see
     # integrations/object_storage.py. Unset: order data still works, file
     # routes report that storage is not configured.
-    storage_backend: Literal["s3", "local"] | None = None
+    storage_backend: Literal["s3", "local", "vault"] | None = None
+    #: STORAGE_BACKEND=vault: the Order Vault's public address (no trailing
+    #: slash) and the shared key it expects (its `Vault:ServiceKey`). Files go
+    #: in encrypted and cannot be read back here — only the vault's team can
+    #: open them, in the vault's own panel.
+    vault_url: str | None = None
+    vault_service_key: SecretStr | None = None
+    #: STORAGE_BACKEND=vault only: ordinary storage (the STORAGE_LOCAL_DIR or
+    #: S3_* settings below) for two things. (1) WORKING COPIES: each file is
+    #: also kept here, unencrypted, so a translator assigned to the order can
+    #: download it from the portal; the copy is deleted when the order is
+    #: delivered, cancelled or rejected, when the file is removed, or after
+    #: `working_copy_max_days`. The vault keeps the encrypted archive. (2) Files
+    #: stored BEFORE the switch, which stay downloadable from here. Unset:
+    #: nothing is copied, and only the vault's team can open files.
+    storage_working_backend: Literal["s3", "local"] | None = None
+    #: A working copy never outlives its file by more than this, even if the
+    #: order is never closed. Enforced by `suliko purge-files`.
+    working_copy_max_days: int = 60
     #: STORAGE_BACKEND=local: the directory files are written under.
     storage_local_dir: str | None = None
     #: STORAGE_BACKEND=s3. Leave the endpoint unset for AWS itself — it

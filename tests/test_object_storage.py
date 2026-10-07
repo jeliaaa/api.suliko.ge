@@ -18,9 +18,11 @@ from suliko.integrations.object_storage import (
     EMPTY_SHA256,
     LocalDiskStorage,
     S3Storage,
+    StorageDownloadUnavailableError,
     StorageError,
     StorageNotConfiguredError,
     UnconfiguredStorage,
+    VaultStorage,
     build_storage,
     sigv4_authorization,
 )
@@ -185,3 +187,186 @@ async def test_unconfigured_storage_refuses_everything() -> None:
 def test_the_drive_era_size_limit_still_applies(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DRIVE_FILE_MAX_BYTES", "1234")
     assert _settings().order_file_max_bytes == 1234
+
+
+# ── The Order Vault ─────────────────────────────────────────────────────────
+
+VAULT_KEY_TEXT = "k" * 40
+FILE_ID = "ab" * 16
+
+
+def _vault(handler: object, **kwargs: object) -> VaultStorage:
+    return VaultStorage(
+        base_url="https://vault.example/",
+        service_key=VAULT_KEY_TEXT,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),  # type: ignore[arg-type]
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+async def test_vault_put_sends_the_key_and_the_file_and_returns_the_vault_key() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"orderNo": 12, "fileId": FILE_ID, "size": 5})
+
+    storage = _vault(handler)
+    stored = await storage.put_file(
+        "tenants/3/orders/77/documents/9/abc",
+        b"%PDF-1",
+        "application/pdf",
+        file_name="ნაკვეთი.pdf",
+        kind="source",
+    )
+
+    assert stored == f"vault/12/{FILE_ID}"
+    (request,) = seen
+    assert request.method == "POST"
+    assert str(request.url) == "https://vault.example/api/service/files"
+    assert request.headers["authorization"] == f"Bearer {VAULT_KEY_TEXT}"
+    assert request.headers["x-vault"] == "1"
+    body = request.read()
+    assert b'name="kind"' in body and b"source" in body
+    # The label names the Suliko order and bureau by number, never a client.
+    assert b"Suliko order 77 (bureau 3)" in body
+    # The name goes both in the multipart header and as a plain UTF-8 field.
+    assert "ნაკვეთი.pdf".encode() in body
+    assert b'name="order"' not in body
+
+
+async def test_vault_put_joins_the_orders_existing_vault_order() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"orderNo": 12, "fileId": FILE_ID, "size": 5})
+
+    await _vault(handler).put_file(
+        "tenants/3/orders/77/documents/9/abc",
+        b"x",
+        "application/pdf",
+        file_name="a.pdf",
+        kind="translation",
+        sibling_key=f"vault/12/{FILE_ID}",
+    )
+    body = seen[0].read()
+    assert b'name="order"' in body and b"\r\n\r\n12\r\n" in body
+    assert b"translation" in body
+
+
+@pytest.mark.parametrize(
+    ("status", "payload"),
+    [(401, None), (503, None), (200, {"unexpected": True}), (200, {"orderNo": "x", "fileId": "y"})],
+)
+async def test_vault_put_failures_are_storage_errors(
+    status: int, payload: dict[str, object] | None
+) -> None:
+    storage = _vault(lambda request: httpx.Response(status, json=payload))
+    with pytest.raises(StorageError) as raised:
+        await storage.put_file("k", b"x", "application/pdf", file_name="a.pdf", kind="source")
+    # The service key never ends up in an error message.
+    assert VAULT_KEY_TEXT not in str(raised.value)
+
+
+async def test_vault_files_cannot_be_read_back() -> None:
+    storage = _vault(lambda request: httpx.Response(500))
+    with pytest.raises(StorageDownloadUnavailableError) as raised:
+        async for _ in storage.iter_get(f"vault/12/{FILE_ID}"):
+            pass
+    assert raised.value.vault_order == 12
+
+
+async def test_vault_delete_shreds_in_the_vault_and_treats_404_as_done() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(404 if len(seen) > 1 else 200)
+
+    storage = _vault(handler)
+    await storage.delete(f"vault/12/{FILE_ID}")
+    await storage.delete(f"vault/12/{FILE_ID}")  # already gone: not an error
+    assert [r.method for r in seen] == ["DELETE", "DELETE"]
+    assert str(seen[0].url) == f"https://vault.example/api/service/orders/12/files/{FILE_ID}"
+    assert seen[0].headers["authorization"] == f"Bearer {VAULT_KEY_TEXT}"
+
+    with pytest.raises(StorageError):
+        await _vault(lambda request: httpx.Response(500)).delete(f"vault/12/{FILE_ID}")
+
+
+async def test_vault_serves_older_files_from_the_legacy_storage(tmp_path: Path) -> None:
+    working = LocalDiskStorage(str(tmp_path))
+    await working.put("tenants/1/orders/2/documents/3/old", b"before the vault", "text/plain")
+    storage = _vault(lambda request: httpx.Response(500), working=working)
+
+    key = "tenants/1/orders/2/documents/3/old"
+    assert b"".join([c async for c in storage.iter_get(key)]) == b"before the vault"
+    await storage.delete(key)
+    with pytest.raises(StorageError) as raised:
+        async for _ in storage.iter_get(key):
+            pass
+    assert raised.value.is_not_found
+
+    # Without a working backend an old key cannot be read or deleted.
+    bare = _vault(lambda request: httpx.Response(500))
+    with pytest.raises(StorageError):
+        await bare.delete(key)
+
+
+def test_vault_needs_its_address_and_key() -> None:
+    assert isinstance(build_storage(_settings(storage_backend="vault")), UnconfiguredStorage)
+    no_key = _settings(storage_backend="vault", vault_url="https://vault.example")
+    assert isinstance(build_storage(no_key), UnconfiguredStorage)
+    bad_url = _settings(
+        storage_backend="vault", vault_url="vault.example", vault_service_key=SecretStr("k")
+    )
+    assert isinstance(build_storage(bad_url), UnconfiguredStorage)
+
+    complete = _settings(
+        storage_backend="vault",
+        vault_url="https://vault.example/",
+        vault_service_key=SecretStr("k"),
+    )
+    storage = build_storage(complete)
+    assert isinstance(storage, VaultStorage)
+    assert "vault.example" in storage.description
+    assert "k" not in storage.description.replace("vault", "").replace("example", "")
+
+
+def test_vault_can_keep_the_old_local_folder_for_earlier_files(tmp_path: Path) -> None:
+    settings = _settings(
+        storage_backend="vault",
+        vault_url="https://vault.example",
+        vault_service_key=SecretStr("k"),
+        storage_working_backend="local",
+        storage_local_dir=str(tmp_path),
+    )
+    storage = build_storage(settings)
+    assert isinstance(storage, VaultStorage)
+    assert "older files in local directory" in storage.description
+
+
+async def test_vault_working_copies_round_trip_in_ordinary_storage(tmp_path: Path) -> None:
+    storage = _vault(lambda request: httpx.Response(500), working=LocalDiskStorage(str(tmp_path)))
+    assert storage.keeps_working_copies
+
+    key = "tenants/1/orders/2/documents/3/abc"
+    await storage.put_working(key, b"plain copy", "application/pdf")
+    assert b"".join([c async for c in storage.iter_working(key)]) == b"plain copy"
+    await storage.delete_working(key)
+    with pytest.raises(StorageError) as raised:
+        async for _ in storage.iter_working(key):
+            pass
+    assert raised.value.is_not_found
+
+
+async def test_vault_without_working_storage_makes_no_copies() -> None:
+    storage = _vault(lambda request: httpx.Response(500))
+    assert not storage.keeps_working_copies
+    with pytest.raises(StorageNotConfiguredError):
+        await storage.put_working("k", b"x", "text/plain")
+    with pytest.raises(StorageNotConfiguredError):
+        storage.iter_working("k")
+    with pytest.raises(StorageNotConfiguredError):
+        await storage.delete_working("k")
