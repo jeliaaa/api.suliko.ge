@@ -52,6 +52,11 @@ class OrderFile(Base, IdMixin, TenantScoped, TimestampMixin):
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     #: Where the bytes are. Built by the server, never from a request.
     storage_key: Mapped[str] = mapped_column(String(500), nullable=False)
+    #: A plain copy kept for the translator while the order is open, set only
+    #: for files whose ``storage_key`` points into the Order Vault (which cannot
+    #: be read back). The copy is in the working storage, under this key.
+    #: NULL: no copy (never made, or already deleted when the order closed).
+    working_key: Mapped[str | None] = mapped_column(String(500), default=None)
     #: ``user:<id>`` for a CRM upload, ``portal:<suliko.ge user id>`` for one
     #: from the translator portal.
     uploaded_by: Mapped[str] = mapped_column(String(500), nullable=False)

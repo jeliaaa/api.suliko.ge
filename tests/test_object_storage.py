@@ -296,9 +296,9 @@ async def test_vault_delete_shreds_in_the_vault_and_treats_404_as_done() -> None
 
 
 async def test_vault_serves_older_files_from_the_legacy_storage(tmp_path: Path) -> None:
-    legacy = LocalDiskStorage(str(tmp_path))
-    await legacy.put("tenants/1/orders/2/documents/3/old", b"before the vault", "text/plain")
-    storage = _vault(lambda request: httpx.Response(500), legacy=legacy)
+    working = LocalDiskStorage(str(tmp_path))
+    await working.put("tenants/1/orders/2/documents/3/old", b"before the vault", "text/plain")
+    storage = _vault(lambda request: httpx.Response(500), working=working)
 
     key = "tenants/1/orders/2/documents/3/old"
     assert b"".join([c async for c in storage.iter_get(key)]) == b"before the vault"
@@ -308,7 +308,7 @@ async def test_vault_serves_older_files_from_the_legacy_storage(tmp_path: Path) 
             pass
     assert raised.value.is_not_found
 
-    # Without a legacy backend an old key cannot be read or deleted.
+    # Without a working backend an old key cannot be read or deleted.
     bare = _vault(lambda request: httpx.Response(500))
     with pytest.raises(StorageError):
         await bare.delete(key)
@@ -339,9 +339,34 @@ def test_vault_can_keep_the_old_local_folder_for_earlier_files(tmp_path: Path) -
         storage_backend="vault",
         vault_url="https://vault.example",
         vault_service_key=SecretStr("k"),
-        storage_legacy_backend="local",
+        storage_working_backend="local",
         storage_local_dir=str(tmp_path),
     )
     storage = build_storage(settings)
     assert isinstance(storage, VaultStorage)
     assert "older files in local directory" in storage.description
+
+
+async def test_vault_working_copies_round_trip_in_ordinary_storage(tmp_path: Path) -> None:
+    storage = _vault(lambda request: httpx.Response(500), working=LocalDiskStorage(str(tmp_path)))
+    assert storage.keeps_working_copies
+
+    key = "tenants/1/orders/2/documents/3/abc"
+    await storage.put_working(key, b"plain copy", "application/pdf")
+    assert b"".join([c async for c in storage.iter_working(key)]) == b"plain copy"
+    await storage.delete_working(key)
+    with pytest.raises(StorageError) as raised:
+        async for _ in storage.iter_working(key):
+            pass
+    assert raised.value.is_not_found
+
+
+async def test_vault_without_working_storage_makes_no_copies() -> None:
+    storage = _vault(lambda request: httpx.Response(500))
+    assert not storage.keeps_working_copies
+    with pytest.raises(StorageNotConfiguredError):
+        await storage.put_working("k", b"x", "text/plain")
+    with pytest.raises(StorageNotConfiguredError):
+        storage.iter_working("k")
+    with pytest.raises(StorageNotConfiguredError):
+        await storage.delete_working("k")

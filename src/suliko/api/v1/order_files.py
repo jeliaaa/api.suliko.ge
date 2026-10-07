@@ -5,8 +5,9 @@ Translators see and add to the same files through the portal
 (``api/v1/portal.py``). Both read the ``order_files`` table; the bytes are in
 Suliko's object storage — or, with ``STORAGE_BACKEND=vault``, in the Order
 Vault, which keeps them encrypted where this API cannot read them back. Those
-files are listed (``in_vault``) but a download answers 409; the team opens
-them in the vault's own panel.
+files are listed (``in_vault``) and download from a plain working copy while the
+order is open (``downloadable``); once it closes the copy is deleted and a
+download answers 409 — the team opens the file in the vault's own panel.
 
 Tenant-scoped through the normal staff session, like every other Suliko Office route.
 """
@@ -30,6 +31,7 @@ from suliko.config import get_settings
 from suliko.core.errors import AppError, ConflictError, NotFoundError, UpstreamUnavailableError
 from suliko.domain.order_files import (
     attachment_headers,
+    downloadable,
     get_document_file,
     list_document_files,
     open_download,
@@ -65,10 +67,13 @@ class StaffFileOut(BaseModel):
     #: `user:<id>` for a Suliko Office upload, `portal:<id>` for a translator's.
     uploaded_by: str | None
     created_at: datetime | None
-    #: Kept in the Order Vault: listed here, opened only in the vault's panel.
+    #: Archived in the Order Vault (encrypted; opened in the vault's panel).
     in_vault: bool = False
     #: The vault's own order number for that file, to find it by.
     vault_order: int | None = None
+    #: Whether a download here will work. False for a vault file once its
+    #: working copy is gone (the order closed): then only the vault has it.
+    downloadable: bool = True
 
 
 def _out(row: OrderFile) -> StaffFileOut:
@@ -83,6 +88,7 @@ def _out(row: OrderFile) -> StaffFileOut:
         created_at=row.created_at,
         in_vault=vault_no is not None,
         vault_order=vault_no,
+        downloadable=downloadable(row),
     )
 
 

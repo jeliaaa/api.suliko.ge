@@ -41,6 +41,8 @@ LATER_REVISIONS = (
     "0012_suliko_accounts.py",
     # order_files in, the Drive tables out — see test_migration_0013.py.
     "0013_order_file_storage.py",
+    # One column on order_files — see test_migration_0014.py.
+    "0014_order_file_working_copy.py",
 )
 
 

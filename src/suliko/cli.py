@@ -492,6 +492,21 @@ async def check() -> int:
                 )
                 await storage.delete(stored)
                 ok("write and delete work (the vault cannot be read back by design)")
+                if storage.keeps_working_copies:
+                    # What translators download from while an order is open.
+                    await storage.put_working(key, b"ok", "text/plain")
+                    copy = b"".join([chunk async for chunk in storage.iter_working(key)])
+                    await storage.delete_working(key)
+                    if copy == b"ok":
+                        ok("working copies: write, read and delete all work")
+                    else:
+                        fail("working copies read back different bytes than were written")
+                        problems += 1
+                else:
+                    say(
+                        "  STORAGE_WORKING_BACKEND is not set: no working copies are made, "
+                        "so translators cannot download files"
+                    )
             else:
                 await storage.put(key, b"ok", "text/plain")
                 body = b"".join([chunk async for chunk in storage.iter_get(key)])
@@ -552,7 +567,7 @@ async def purge_files() -> int:
     applies exactly as it does to a request. Exit code 1 if any object could
     not be deleted — those rows are kept and retried next run.
     """
-    from suliko.domain.order_files import purge_removed_files
+    from suliko.domain.order_files import purge_removed_files, purge_working_copies
 
     settings = get_settings()
     storage = get_object_storage()
@@ -567,21 +582,34 @@ async def purge_files() -> int:
         with bypass_tenant_scope():
             tenants = (await db.execute(select(Tenant.id, Tenant.slug))).all()
 
+    # With the Order Vault: also drop the translators' working copies of orders
+    # that are closed, of removed files, and of anything older than the cap.
+    copies_cutoff = datetime.now(UTC) - timedelta(days=settings.working_copy_max_days)
+
     purged = purged_bytes = failed = 0
+    copies = copy_bytes = 0
     try:
         for tenant_id, slug in tenants:
             with tenant_scope(int(tenant_id)):
                 async with session_scope() as db:
                     result = await purge_removed_files(db, storage, cutoff=cutoff)
-            if result.purged or result.failed:
-                say(f"  {slug}: {result.purged} purged, {result.failed} failed")
+                    gone = await purge_working_copies(db, storage, older_than=copies_cutoff)
+            if result.purged or result.failed or gone.purged or gone.failed:
+                say(
+                    f"  {slug}: {result.purged} purged, {gone.purged} working copies dropped, "
+                    f"{result.failed + gone.failed} failed"
+                )
             purged += result.purged
             purged_bytes += result.purged_bytes
-            failed += result.failed
+            copies += gone.purged
+            copy_bytes += gone.purged_bytes
+            failed += result.failed + gone.failed
     finally:
         await close_object_storage()
 
     ok(f"{purged} file(s) purged, {purged_bytes / (1024 * 1024):.1f} MB reclaimed")
+    if copies:
+        ok(f"{copies} working cop(ies) dropped, {copy_bytes / (1024 * 1024):.1f} MB reclaimed")
     if failed:
         fail(f"{failed} file(s) could not be deleted from storage; they will be retried")
         return 1

@@ -53,6 +53,7 @@ from suliko.core.errors import (
 )
 from suliko.domain.order_files import (
     attachment_headers,
+    downloadable,
     get_document_file,
     list_document_files,
     open_download,
@@ -134,9 +135,12 @@ class OrderFileOut(BaseModel):
     created_at: datetime | None
     #: Only these can be removed from the portal.
     uploaded_by_me: bool
-    #: Kept in the bureau's Order Vault: it cannot be downloaded here, the
-    #: bureau hands it over. (Absent/false for ordinary stored files.)
+    #: Archived in the bureau's Order Vault (encrypted).
     in_vault: bool = False
+    #: Whether a download will work. A vault file can be downloaded only from
+    #: the working copy made for the translator, which goes when the order is
+    #: closed; after that the bureau has to hand the file over.
+    downloadable: bool = True
 
 
 #: ok — listed, and uploads work; unavailable — listed, but file storage is
@@ -307,6 +311,7 @@ def _file_out(row: OrderFile, identity: PortalIdentity) -> OrderFileOut:
         created_at=row.created_at,
         uploaded_by_me=row.uploaded_by == _uploader_tag(identity),
         in_vault=vault_order(row) is not None,
+        downloadable=downloadable(row),
     )
 
 

@@ -411,8 +411,18 @@ class VaultStorage:
     All of one Suliko order's files land in one vault order. The first upload
     creates it; later uploads are told which one through ``sibling_key``.
 
-    ``legacy`` serves keys written before the switch (a local folder or S3),
-    so older files stay downloadable and can still be purged.
+    ``working`` is ordinary storage (a local folder or S3) with two jobs:
+
+    - **Working copies.** The vault is write-only, so a translator assigned to
+      an order could never get its files. The domain code therefore also puts a
+      plain copy here (``put_working``) when a file is uploaded, and removes it
+      (``delete_working``) when the order closes. Translators download from
+      this copy; the vault stays the encrypted archive.
+    - **Older files**, written before the switch, keep working through
+      ``iter_get`` / ``delete`` here.
+
+    Without ``working`` nothing is copied and only the vault's team can open
+    files.
     """
 
     def __init__(
@@ -420,7 +430,7 @@ class VaultStorage:
         *,
         base_url: str,
         service_key: str,
-        legacy: ObjectStorage | None = None,
+        working: ObjectStorage | None = None,
         http: httpx.AsyncClient | None = None,
     ) -> None:
         parts = urlsplit(base_url.rstrip("/"))
@@ -432,7 +442,7 @@ class VaultStorage:
         self._host = parts.netloc
         # X-Vault: 1 is the vault's own guard on every state-changing call.
         self._headers = {"Authorization": f"Bearer {service_key}", "X-Vault": "1"}
-        self._legacy = legacy
+        self._working = working
         self._http = http or httpx.AsyncClient(timeout=METADATA_TIMEOUT)
 
     @property
@@ -441,13 +451,38 @@ class VaultStorage:
 
     @property
     def description(self) -> str:
-        older = f"; older files in {self._legacy.description}" if self._legacy else ""
+        older = (
+            f"; working copies and older files in {self._working.description}"
+            if self._working
+            else ""
+        )
         return f"order vault at {self._host}{older}"
 
     async def aclose(self) -> None:
         await self._http.aclose()
-        if isinstance(self._legacy, S3Storage):
-            await self._legacy.aclose()
+        if isinstance(self._working, S3Storage):
+            await self._working.aclose()
+
+    # ── Working copies ──────────────────────────────────────────────────────
+
+    @property
+    def keeps_working_copies(self) -> bool:
+        return self._working is not None
+
+    async def put_working(self, key: str, content: bytes, content_type: str) -> None:
+        if self._working is None:
+            raise StorageNotConfiguredError("STORAGE_WORKING_BACKEND is not set")
+        await self._working.put(key, content, content_type)
+
+    def iter_working(self, key: str) -> AsyncIterator[bytes]:
+        if self._working is None:
+            raise StorageNotConfiguredError("STORAGE_WORKING_BACKEND is not set")
+        return self._working.iter_get(key)
+
+    async def delete_working(self, key: str) -> None:
+        if self._working is None:
+            raise StorageNotConfiguredError("STORAGE_WORKING_BACKEND is not set")
+        await self._working.delete(key)
 
     async def put_file(
         self,
@@ -500,17 +535,17 @@ class VaultStorage:
             raise StorageDownloadUnavailableError(
                 "files in the order vault cannot be read back by the API", order
             )
-        if self._legacy is None:
+        if self._working is None:
             raise StorageError("no such object", 404)
-        async for chunk in self._legacy.iter_get(key):
+        async for chunk in self._working.iter_get(key):
             yield chunk
 
     async def delete(self, key: str) -> None:
         match = VAULT_KEY.fullmatch(key)
         if match is None:
-            if self._legacy is None:
-                raise StorageError("a file stored before the vault, and no legacy storage is set")
-            await self._legacy.delete(key)
+            if self._working is None:
+                raise StorageError("a file stored before the vault, and no working storage is set")
+            await self._working.delete(key)
             return
         try:
             response = await self._http.delete(
@@ -569,19 +604,19 @@ def build_storage(settings: Settings) -> ObjectStorage:
     backend = settings.storage_backend
     try:
         if backend == "vault":
-            legacy: ObjectStorage | None = None
-            if settings.storage_legacy_backend:
+            working: ObjectStorage | None = None
+            if settings.storage_working_backend:
                 try:
-                    legacy = _build_blob_storage(settings, settings.storage_legacy_backend)
+                    working = _build_blob_storage(settings, settings.storage_working_backend)
                 except StorageNotConfiguredError as exc:
                     # Older files become unreadable; new ones still work.
-                    log.error("legacy_storage_misconfigured", error=str(exc))
+                    log.error("working_storage_misconfigured", error=str(exc))
             key = (
                 settings.vault_service_key.get_secret_value() if settings.vault_service_key else ""
             )
             if not settings.vault_url:
                 raise StorageNotConfiguredError("VAULT_URL is not set")
-            return VaultStorage(base_url=settings.vault_url, service_key=key, legacy=legacy)
+            return VaultStorage(base_url=settings.vault_url, service_key=key, working=working)
         if backend in ("local", "s3"):
             return _build_blob_storage(settings, backend)
     except StorageNotConfiguredError as exc:
