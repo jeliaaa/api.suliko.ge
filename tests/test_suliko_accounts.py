@@ -400,7 +400,7 @@ def test_the_suliko_reset_email_says_where_to_go_and_offers_no_local_link() -> N
     assert "https://suliko.ge/login" in body
     assert "kept on suliko.ge" in body
     # Someone who has not registered there yet is pointed at registration.
-    assert "https://suliko.ge/register" in body
+    assert "https://suliko.ge/sign-in?mode=register" in body
     assert "reset-password" not in body
     assert "Nino" in body and subject
 
@@ -508,7 +508,7 @@ def test_the_invitation_to_a_stranger_says_to_register_first() -> None:
 
     assert "Acme" in subject
     assert "Register on suliko.ge with exactly this email address (new@suliko.ge)" in body
-    assert "https://suliko.ge/register" in body
+    assert "https://suliko.ge/sign-in?mode=register" in body
     assert "accept-invite?token=T" in body
     assert body.index("Register on suliko.ge") < body.index("accept-invite")
     # The one-time-password flow is gone for them.

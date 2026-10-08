@@ -249,11 +249,13 @@ async def search_directory(
     )
 
 
-#: Where suliko.ge itself signs someone up. A bureau's invite that matches no
-#: account links here, next to the address it must be registered with — see
+#: Where suliko.ge itself signs someone up: its sign-in page, opened on the
+#: registration tab. (suliko.ge has no `/register`; links to it were a 404.)
+#: The site adds the locale. A bureau's invite that matches no account links
+#: here, next to the address it must be registered with — see
 #: `registration_url` and the two invite handlers in `api/v1/translators.py`
 #: and `api/v1/users.py`.
-REGISTRATION_PATH = "/register"
+REGISTRATION_PATH = "/sign-in?mode=register"
 
 
 def registration_url() -> str:
