@@ -4,6 +4,7 @@ A person has ONE account (email and password, `models.user.Account`) and a
 membership row in each organisation they belong to. Sign-in follows that:
 
     POST /auth/login          email + password -> a ticket and the choices
+    POST /auth/sso/exchange   a one-time code from suliko.ge -> the same ticket and choices
     POST /auth/login/select   ticket + a choice -> a session for that membership
     POST /auth/mfa/verify     TOTP code -> that same session, MFA satisfied
     POST /auth/switch         signed in -> a session in another of their organisations
@@ -67,6 +68,7 @@ from suliko.integrations.suliko_backend import (
     PasswordOutcome,
     SulikoBackend,
     SulikoUnavailableError,
+    SulikoUser,
     get_suliko_backend,
 )
 from suliko.models.tenant import Tenant
@@ -125,6 +127,17 @@ class LoginRequest(BaseModel):
     @property
     def login(self) -> str:
         return (self.identifier or self.email or "").strip()
+
+
+class SsoExchangeRequest(BaseModel):
+    """What the Office frontend brings back from suliko.ge (see `sso_exchange`)."""
+
+    code: str = Field(min_length=1, max_length=200)
+    #: The PKCE verifier the frontend kept in an HttpOnly cookie while the
+    #: browser was away. RFC 7636 sets the length.
+    code_verifier: str = Field(min_length=43, max_length=128)
+    #: The callback address the code was issued for — suliko.ge checks it.
+    redirect_uri: str = Field(min_length=1, max_length=500)
 
 
 class OrgChoice(BaseModel):
@@ -258,20 +271,24 @@ async def _login_options(db: AsyncSession, account: Account, ticket: str) -> Log
 
 
 async def _account_for_suliko_user(
-    db: AsyncSession, backend: SulikoBackend, suliko_user_id: str
+    db: AsyncSession,
+    backend: SulikoBackend,
+    suliko_user_id: str,
+    person: SulikoUser | None = None,
 ) -> Account:
     """The account of a person suliko.ge has just vouched for, made on first sight.
 
     Found by suliko.ge id; failing that, asked about (the directory says who
-    they are) and put through the one rule in `upsert_from_suliko`. Raises
-    SulikoUnavailableError if suliko.ge cannot say who they are — never a
-    guess.
+    they are) unless suliko.ge already said so in `person`, and put through
+    the one rule in `upsert_from_suliko`. Raises SulikoUnavailableError if
+    suliko.ge cannot say who they are — never a guess.
     """
     account = await find_account_by_suliko_id(db, suliko_user_id)
     if account is not None:
         return account
 
-    person = await backend.get_user(suliko_user_id)
+    if person is None:
+        person = await backend.get_user(suliko_user_id)
     if person is None:
         # It accepted the password a moment ago and now does not know them:
         # not something to turn into a login or a refusal.
@@ -374,6 +391,63 @@ async def login(
 
         await _record_attempt(db, login_key, ip, user_agent, True)
         await limiter.clear_login_failures(account_key)
+        options = await _login_options(
+            db, account, login_tickets.issue(account.id, account.password_hash)
+        )
+        await db.commit()
+    return options
+
+
+@router.post("/sso/exchange", response_model=LoginOptions)
+async def sso_exchange(
+    payload: SsoExchangeRequest,
+    request: Request,
+    limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
+    backend: Annotated[SulikoBackend, Depends(get_suliko_backend)],
+) -> LoginOptions:
+    """Step one, the suliko.ge way: a one-time code instead of a password.
+
+    The person signed in on suliko.ge — with a password, or with Google, which
+    gives them no password Office could check — and suliko.ge sent them back
+    here with a code. suliko.ge alone can say whose it is (see
+    `SulikoBackend.redeem_sso_code`): it is spent on the first try, lives a
+    minute, and is redeemable only with the verifier this frontend kept, so a
+    code lifted from a URL is worth nothing. Office never sees a password.
+
+    What follows is exactly `POST /auth/login`'s: a ticket and the places the
+    person can enter.
+    """
+    ip = get_client_ip(request)
+    user_agent = get_client_user_agent(request)
+
+    # A code is unguessable, so this only bounds someone replaying junk.
+    code_key = f"login:sso:{ip or 'unknown'}"
+    ip_key = f"login:ip:{ip or 'unknown'}"
+    if retry := await limiter.check_login(code_key, ip_key):
+        raise RateLimitedError("Too many attempts. Try again later.", retry_after=retry)
+
+    async with get_sessionmaker()() as db:
+        try:
+            person = await backend.redeem_sso_code(
+                payload.code, payload.code_verifier, payload.redirect_uri
+            )
+            account = (
+                None
+                if person is None
+                else await _account_for_suliko_user(db, backend, person.id, person)
+            )
+        except SulikoUnavailableError:
+            await _record_attempt(db, "suliko.ge", ip, user_agent, False, "upstream_unavailable")
+            await db.commit()
+            raise
+
+        if account is None:
+            await limiter.record_login_failure(code_key, ip_key)
+            await _record_attempt(db, "suliko.ge", ip, user_agent, False, "bad_sso_code")
+            await db.commit()
+            raise AuthenticationError("Your sign-in has expired. Sign in again.")
+
+        await _record_attempt(db, login_name(account), ip, user_agent, True)
         options = await _login_options(
             db, account, login_tickets.issue(account.id, account.password_hash)
         )
@@ -534,9 +608,7 @@ async def _start_session(
             row.permission: row.granted
             for row in (
                 await db.execute(
-                    select(UserPermissionOverride).where(
-                        UserPermissionOverride.user_id == user.id
-                    )
+                    select(UserPermissionOverride).where(UserPermissionOverride.user_id == user.id)
                 )
             ).scalars()
         }
@@ -1112,8 +1184,7 @@ async def resend_verification_email(
     tenant = await db.get(Tenant, user.tenant_id)
     assert tenant is not None
     link = (
-        f"{settings.app_url.rstrip('/')}/{tenant.locale}/verify-email"
-        f"?token={quote(token, safe='')}"
+        f"{settings.app_url.rstrip('/')}/{tenant.locale}/verify-email?token={quote(token, safe='')}"
     )
     subject, body = _verification_email(user, tenant, link, settings.email_verification_ttl_hours)
     # Inline, not backgrounded: this endpoint IS the "send it" action — there
@@ -1423,8 +1494,7 @@ async def accept_invitation(payload: AcceptInvitationRequest) -> AcceptInvitatio
         user = await reset_tokens.consume(db, payload.token, purpose=reset_tokens.INVITATION)
         if user is None:
             raise ValidationError(
-                "This invitation link is no longer valid. Ask the organisation to "
-                "invite you again."
+                "This invitation link is no longer valid. Ask the organisation to invite you again."
             )
         with bypass_tenant_scope():
             user.invitation_pending = False

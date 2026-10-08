@@ -293,6 +293,65 @@ def test_something_that_is_not_a_person_is_refused(data: Any) -> None:
 # ── Not connected ───────────────────────────────────────────────────────────
 
 
+# ── Sign-in on suliko.ge ────────────────────────────────────────────────────
+
+
+async def test_a_code_is_redeemed_with_the_key_for_the_person() -> None:
+    backend, seen = _backend(lambda r: httpx.Response(200, json=_person()))
+
+    found = await backend.redeem_sso_code("the-code", "v" * 43, "https://app.example/cb")
+
+    assert found is not None and found.id == "guid-1"
+    request = seen[0]
+    assert request.method == "POST" and request.url.path == "/api/office/sso/redeem"
+    assert request.headers[KEY_HEADER] == KEY
+    assert json.loads(request.content) == {
+        "code": "the-code",
+        "codeVerifier": "v" * 43,
+        "redirectUri": "https://app.example/cb",
+    }
+
+
+async def test_a_refused_code_is_nobody() -> None:
+    backend, _ = _backend(lambda r: httpx.Response(400, json={"error": "invalid_grant"}))
+
+    assert await backend.redeem_sso_code("used", "v" * 43, "https://app.example/cb") is None
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(400, json={"errors": {"code": ["required"]}}),
+        httpx.Response(401),
+        httpx.Response(404),
+        httpx.Response(500),
+        httpx.Response(200, text="not json"),
+    ],
+)
+async def test_anything_else_from_redeem_is_unavailable(response: httpx.Response) -> None:
+    """A 404 is a suliko.ge without the endpoint yet, a 401 a wrong key: setup
+    problems, never "this person may not sign in"."""
+    backend, _ = _backend(lambda r: response)
+
+    with pytest.raises(SulikoUnavailableError):
+        await backend.redeem_sso_code("c", "v" * 43, "https://app.example/cb")
+
+
+async def test_an_unreachable_suliko_cannot_redeem() -> None:
+    backend, _ = _backend(lambda r: httpx.ConnectError("refused"))
+
+    with pytest.raises(SulikoUnavailableError):
+        await backend.redeem_sso_code("c", "v" * 43, "https://app.example/cb")
+
+
+async def test_without_a_key_no_code_is_sent() -> None:
+    backend, seen = _backend(lambda r: httpx.Response(200, json=_person()), key="")
+
+    with pytest.raises(SulikoUnavailableError):
+        await backend.redeem_sso_code("c", "v" * 43, "https://app.example/cb")
+    assert seen == []
+
+
 async def test_an_unconfigured_backend_vouches_for_nobody() -> None:
     backend = UnconfiguredSulikoBackend()
 
@@ -302,3 +361,5 @@ async def test_an_unconfigured_backend_vouches_for_nobody() -> None:
         await backend.find_user("a@b.ge")
     with pytest.raises(SulikoUnavailableError):
         backend.iter_users()
+    with pytest.raises(SulikoUnavailableError):
+        await backend.redeem_sso_code("c", "v" * 43, "https://app.example/cb")

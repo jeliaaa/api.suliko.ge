@@ -13,6 +13,12 @@ suliko.ge:
   `X-Office-Key`. It says who a person is: their id, the sign-in name they
   proved at registration, and their name. Never a password or a token.
 
+- `redeem_sso_code` trades a one-time code for the person it was issued to:
+  the way in for someone who signs in ON suliko.ge (with Google, say) and is
+  sent on to Office. suliko.ge issued the code to them, signed in, against a
+  challenge only Office's verifier answers (PKCE); see `POST /auth/sso/exchange`.
+  Same key as the directory.
+
 Three outcomes are kept apart on purpose. A wrong password is `REJECTED`. A
 suliko.ge that is down, slow or misconfigured is `UNAVAILABLE` — never a
 rejection, or an outage there would read as "wrong password" to everyone and
@@ -44,6 +50,7 @@ log = structlog.get_logger()
 
 TOKEN_PATH = "/api/Auth/token"  # noqa: S105 -- a URL path, not a secret
 USERS_PATH = "/api/office/users"
+SSO_REDEEM_PATH = "/api/office/sso/redeem"
 KEY_HEADER = "X-Office-Key"
 #: The claim suliko.ge puts the person's id in (see `AuthController.GenerateToken`).
 USER_ID_CLAIM = "UserId"
@@ -119,6 +126,10 @@ class SulikoBackend(Protocol):
 
     def iter_users(self, page_size: int = PAGE_SIZE) -> AsyncIterator[SulikoUser]: ...
 
+    async def redeem_sso_code(
+        self, code: str, code_verifier: str, redirect_uri: str
+    ) -> SulikoUser | None: ...
+
     async def aclose(self) -> None: ...
 
 
@@ -156,12 +167,18 @@ def parse_user(data: Any) -> SulikoUser:
     )
 
 
-def _is_not_found(response: httpx.Response) -> bool:
+def _error_code(response: httpx.Response) -> str | None:
+    """suliko.ge's own `{"error": "..."}`, if that is what the body is."""
     try:
         body = response.json()
     except ValueError:
-        return False
-    return isinstance(body, dict) and body.get("error") == "not_found"
+        return None
+    error = body.get("error") if isinstance(body, dict) else None
+    return error if isinstance(error, str) else None
+
+
+def _is_not_found(response: httpx.Response) -> bool:
+    return _error_code(response) == "not_found"
 
 
 def user_id_from_token(access_token: str) -> str | None:
@@ -293,6 +310,38 @@ class HttpSulikoBackend:
                 return
             page += 1
 
+    # ── Sign-in on suliko.ge ────────────────────────────────────────────────
+
+    async def redeem_sso_code(
+        self, code: str, code_verifier: str, redirect_uri: str
+    ) -> SulikoUser | None:
+        """The person a one-time code was issued to; None for a code suliko.ge
+        refuses (unknown, used, expired, or the wrong verifier — it says only
+        `invalid_grant`); SulikoUnavailableError if suliko.ge cannot be asked.
+        """
+        if not self._api_key:
+            raise SulikoUnavailableError("Office is not set up for sign-in through suliko.ge.")
+        try:
+            response = await self._http.post(
+                SSO_REDEEM_PATH,
+                json={"code": code, "codeVerifier": code_verifier, "redirectUri": redirect_uri},
+                headers={KEY_HEADER: self._api_key},
+            )
+        except httpx.HTTPError as exc:
+            log.error("suliko_backend_unreachable", error=type(exc).__name__)
+            raise SulikoUnavailableError("suliko.ge cannot be reached right now.") from exc
+
+        if response.status_code == 400 and _error_code(response) == "invalid_grant":
+            return None
+        if response.status_code != 200:
+            log.error("suliko_backend_sso_status", status=response.status_code)
+            raise SulikoUnavailableError("suliko.ge cannot be reached right now.")
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise SulikoUnavailableError("suliko.ge sent something Office could not read.") from exc
+        return parse_user(data)
+
 
 class UnconfiguredSulikoBackend:
     """No `SULIKO_API_URL`: Office signs people in on its own passwords alone."""
@@ -315,6 +364,11 @@ class UnconfiguredSulikoBackend:
 
     def iter_users(self, page_size: int = PAGE_SIZE) -> AsyncIterator[SulikoUser]:
         # Raises when asked, not when first iterated, so a caller learns at once.
+        raise SulikoUnavailableError("suliko.ge is not connected to this Office.")
+
+    async def redeem_sso_code(
+        self, code: str, code_verifier: str, redirect_uri: str
+    ) -> SulikoUser | None:
         raise SulikoUnavailableError("suliko.ge is not connected to this Office.")
 
 
