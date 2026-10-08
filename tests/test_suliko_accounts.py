@@ -239,6 +239,18 @@ async def test_a_new_person_cannot_sign_in_while_the_directory_is_down(db: Async
     assert await find_account_by_suliko_id(db, "g1") is None
 
 
+async def test_a_person_suliko_has_already_described_is_not_asked_about_again(
+    db: AsyncSession,
+) -> None:
+    """Sign-in by code: suliko.ge's answer already says who they are."""
+    backend = FakeBackend([person()], directory_down=True)
+
+    account = await auth._account_for_suliko_user(db, backend, "g1", person())
+
+    assert account.suliko_user_id == "g1" and account.email == "nino@suliko.ge"
+    assert backend.directory_calls == 0
+
+
 async def test_a_wrong_suliko_password_signs_nobody_in(db: AsyncSession) -> None:
     await upsert_from_suliko(db, person())
     backend = FakeBackend([person()], {"g1": "suliko-pass"})

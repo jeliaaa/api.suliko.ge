@@ -44,8 +44,11 @@ class FakeBackend:
         enabled: bool = True,
         down: bool = False,
         directory_down: bool = False,
+        codes: dict[str, str] | None = None,
     ) -> None:
         self.people = people or []
+        #: One-time sign-in codes: code -> suliko id. Spent on first use.
+        self.codes = codes or {}
         self.passwords = passwords or {}
         self._enabled = enabled
         self.down = down
@@ -82,6 +85,14 @@ class FakeBackend:
         self._guard()
         for p in self.people:
             yield p
+
+    async def redeem_sso_code(
+        self, code: str, code_verifier: str, redirect_uri: str
+    ) -> SulikoUser | None:
+        if self.down:
+            raise SulikoUnavailableError("down")
+        suliko_id = self.codes.pop(code, None)
+        return next((p for p in self.people if p.id == suliko_id), None)
 
     async def aclose(self) -> None:
         return None
