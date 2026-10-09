@@ -53,3 +53,40 @@ def test_a_change_carries_only_what_was_sent() -> None:
 def test_unknown_fields_are_refused() -> None:
     with pytest.raises(PydanticValidationError):
         OrderSave.model_validate({"remove": [1], "surprise": True})
+
+
+# ── Moving an order to another client ──────────────────────────────────────
+
+
+def _update_source() -> str:
+    return inspect.getsource(orders.update_order)
+
+
+def test_an_order_can_name_another_client() -> None:
+    from suliko.api.v1.orders import OrderUpdate
+
+    assert OrderUpdate.model_validate({"client_id": 5}).model_dump(exclude_unset=True) == {
+        "client_id": 5
+    }
+
+
+def test_the_client_cannot_be_emptied() -> None:
+    assert '"client_id", "order_date"' in _update_source()
+
+
+def test_the_new_client_must_exist() -> None:
+    source = _update_source()
+    assert 'db.get(Client, changes["client_id"])' in source
+
+
+def test_a_paid_order_keeps_its_client() -> None:
+    """A payment settles its own client's orders, never someone else's."""
+    source = _update_source()
+    check = source.index("ClientPaymentAllocation.order_id == order.id")
+    assert source.index("ConflictError(", check) > check
+    # Checked before anything about the order is written.
+    assert check < source.index("setattr(order, field, value)")
+
+
+def test_naming_the_same_client_is_not_a_change() -> None:
+    assert 'if changes.get("client_id") == order.client_id:' in _update_source()
