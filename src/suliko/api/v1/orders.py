@@ -134,6 +134,9 @@ class OrderCreate(BaseModel):
 class OrderUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    #: Moves the order to another client; refused once a payment is
+    #: allocated to it (see `update_order`).
+    client_id: int | None = None
     order_date: date | None = None
     due_date: date | None = None
     contact_info: str | None = Field(default=None, max_length=255)
@@ -834,9 +837,30 @@ async def update_order(
         raise NotFoundError("Order not found.")
 
     changes = payload.model_dump(exclude_unset=True)
-    for key in ("order_date", "urgency", "handover_method", "delivery_cost"):
+    for key in ("client_id", "order_date", "urgency", "handover_method", "delivery_cost"):
         if key in changes and changes[key] is None:
             raise ValidationError(f"{key} cannot be empty.")
+
+    # Another client: an order booked to the wrong person could only be
+    # deleted and typed in again. Allowed while nothing has been paid against
+    # it, because a payment belongs to the client who made it and must never
+    # end up settling someone else's order.
+    if changes.get("client_id") == order.client_id:
+        del changes["client_id"]
+    if "client_id" in changes:
+        if await db.get(Client, changes["client_id"]) is None:
+            raise ValidationError("That client does not exist.")
+        paid = await db.scalar(
+            select(func.count())
+            .select_from(ClientPaymentAllocation)
+            .where(ClientPaymentAllocation.order_id == order.id)
+        )
+        if paid:
+            raise ConflictError(
+                "A payment is recorded against this order, so it cannot move to another "
+                "client. Remove the payment first, then change the client."
+            )
+
     before = {k: getattr(order, k) for k in changes}
 
     old_urgency = order.urgency
