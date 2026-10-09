@@ -923,7 +923,7 @@ def _verification_email(user: User, tenant: Tenant, link: str, ttl_hours: int) -
         f"Welcome to Suliko. Confirm this address to finish setting up "
         f"{tenant.display_name}:\n\n{link}\n\n"
         f"The link works once and expires in {validity}. Nothing about your "
-        f"account is on hold while you do this — it is only so we know this "
+        f"account is on hold while you do this. It is only so we know this "
         f"address is really yours.\n\n"
         f"If you did not sign up for Suliko, you can ignore this email.\n"
     )
@@ -1231,9 +1231,9 @@ def _reset_email(account: Account, link: str, ttl_minutes: int) -> tuple[str, st
         f"({account.email}).\n\n"
         f"Open this link to choose a new one:\n\n{link}\n\n"
         f"The link works once and expires in {validity}. The new password "
-        f"is the one you sign in with everywhere — every organisation you "
+        f"is the one you sign in with everywhere, in every organisation you "
         f"belong to.\n\n"
-        f"If this wasn't you, you can ignore this email — your password has "
+        f"If this wasn't you, you can ignore this email. Your password has "
         f"not changed. Nobody can use this link without opening it.\n"
     )
     return "Reset your Suliko password", body
@@ -1251,7 +1251,7 @@ def _suliko_password_email(account: Account, reset_url: str) -> tuple[str, str]:
         "Then sign in to Suliko Office with the new password.\n\n"
         "No suliko.ge account yet? Register with exactly this email address, "
         f"then sign in here:\n\n{registration_url()}\n\n"
-        "If this wasn't you, you can ignore this email — nothing has changed.\n"
+        "If this wasn't you, you can ignore this email. Nothing has changed.\n"
     )
     return "Reset your Suliko password", body
 

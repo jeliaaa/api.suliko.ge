@@ -278,7 +278,7 @@ async def delete_page(
 
     if row.status is PageStatus.PUBLISHED:
         raise ConflictError(
-            "Unpublish the page before deleting it — a live URL should stop serving "
+            "Unpublish the page before deleting it. A live URL should stop serving "
             "content deliberately, not as a side effect."
         )
 
