@@ -43,6 +43,8 @@ LATER_REVISIONS = (
     "0013_order_file_storage.py",
     # One column on order_files — see test_migration_0014.py.
     "0014_order_file_working_copy.py",
+    # Relaxes one NOT NULL — see test_migration_0015.py.
+    "0015_invite_without_email.py",
 )
 
 

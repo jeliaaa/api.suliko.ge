@@ -112,6 +112,32 @@ class SulikoUser:
         return None if self.signs_in_with_email else self.user_name.strip()
 
 
+@dataclass(frozen=True, slots=True)
+class SulikoContact:
+    """One result of searching suliko.ge for an exact email or phone number.
+
+    Carries the PROFILE email and phone, which a person can edit without any
+    verification — so they are for recognising someone ("which Nino is this?"),
+    never for deciding who someone is. `id` is the identity; a human confirms
+    the match before anything is linked on the strength of it.
+    """
+
+    id: str
+    #: The sign-in name proven at registration (an address or a phone number).
+    user_name: str
+    first_name: str
+    last_name: str
+    user_type: str
+    #: Profile email, unverified. None for a phone sign-up that never set one.
+    email: str | None
+    #: Profile phone number, unverified, as the person typed it.
+    phone: str | None
+
+    @property
+    def full_name(self) -> str:
+        return " ".join(part for part in (self.first_name.strip(), self.last_name.strip()) if part)
+
+
 class SulikoBackend(Protocol):
     """What the rest of Office may ask of suliko.ge. Tests substitute a fake."""
 
@@ -123,6 +149,8 @@ class SulikoBackend(Protocol):
     async def get_user(self, user_id: str) -> SulikoUser | None: ...
 
     async def find_user(self, login: str) -> SulikoUser | None: ...
+
+    async def search_users(self, query: str) -> list[SulikoContact]: ...
 
     def iter_users(self, page_size: int = PAGE_SIZE) -> AsyncIterator[SulikoUser]: ...
 
@@ -164,6 +192,26 @@ def parse_user(data: Any) -> SulikoUser:
         last_name=str(_field(data, "lastName") or ""),
         user_type=str(_field(data, "userType") or "normal").lower(),
         created_at=created,
+    )
+
+
+def parse_contact(data: Any) -> SulikoContact:
+    """A search result, or SulikoUnavailableError if it is not one."""
+    person = parse_user(data)  # the same identity fields, the same refusals
+    assert isinstance(data, dict)  # parse_user raised otherwise
+
+    def text(name: str) -> str | None:
+        value = _field(data, name)
+        return value.strip() or None if isinstance(value, str) else None
+
+    return SulikoContact(
+        id=person.id,
+        user_name=person.user_name,
+        first_name=person.first_name,
+        last_name=person.last_name,
+        user_type=person.user_type,
+        email=text("email"),
+        phone=text("phoneNumber"),
     )
 
 
@@ -293,6 +341,14 @@ class HttpSulikoBackend:
         )
         return None if data is None else parse_user(data)
 
+    async def search_users(self, query: str) -> list[SulikoContact]:
+        """Everyone whose email or phone number equals `query` (profile columns
+        included). An empty list is an answer — nobody has it — not an error."""
+        data = await self._get_json(f"{USERS_PATH}/search", params={"q": query})
+        if not isinstance(data, list):
+            raise SulikoUnavailableError("suliko.ge sent something Office could not read.")
+        return [parse_contact(item) for item in data]
+
     async def iter_users(self, page_size: int = PAGE_SIZE) -> AsyncIterator[SulikoUser]:
         page, seen = 1, 0
         while True:
@@ -360,6 +416,9 @@ class UnconfiguredSulikoBackend:
         raise SulikoUnavailableError("suliko.ge is not connected to this Office.")
 
     async def find_user(self, login: str) -> SulikoUser | None:
+        raise SulikoUnavailableError("suliko.ge is not connected to this Office.")
+
+    async def search_users(self, query: str) -> list[SulikoContact]:
         raise SulikoUnavailableError("suliko.ge is not connected to this Office.")
 
     def iter_users(self, page_size: int = PAGE_SIZE) -> AsyncIterator[SulikoUser]:

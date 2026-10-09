@@ -30,8 +30,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Query
 from fastapi import status as http_status
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, TypeAdapter, model_validator
-from pydantic import ValidationError as PydanticValidationError
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 from sqlalchemy import func, or_, select
 
 from suliko.api.deps import CurrentSession, Db, require
@@ -50,7 +49,6 @@ from suliko.domain.accounts import (
     UNUSABLE_PASSWORD_HASH,
     find_account_by_login,
     find_suliko_person,
-    normalise_email,
     upsert_from_suliko,
     username_for,
     username_for_account,
@@ -62,7 +60,13 @@ from suliko.domain.plans import (
     overridable_for_plan,
     permissions_for_plan,
 )
-from suliko.domain.portal import account_matches, normalize_email, normalize_phone, registration_url
+from suliko.domain.portal import (
+    account_matches,
+    checked_login,
+    normalize_email,
+    normalize_phone,
+    registration_url,
+)
 from suliko.integrations.suliko_backend import SulikoBackend, get_suliko_backend
 from suliko.models.portal import InviteKind, InviteStatus, PortalAccountInvite, PortalTranslator
 from suliko.models.user import Account, Role, User, UserPermissionOverride
@@ -459,25 +463,6 @@ async def list_users(
     )
 
 
-def _checked_login(raw: str | None) -> str:
-    """An email address (lower-cased) or a phone number, or a 422 saying which.
-
-    Shared by the search box and the invite, so both accept exactly the same
-    things.
-    """
-    login = (raw or "").strip()
-    if not login:
-        raise ValidationError("Enter an email address or a phone number.")
-    if "@" in login:
-        try:
-            return normalise_email(str(TypeAdapter(EmailStr).validate_python(login)))
-        except PydanticValidationError:
-            raise ValidationError("Enter a valid email address.") from None
-    if normalize_phone(login) is None:
-        raise ValidationError("Enter a valid email address or phone number.")
-    return login
-
-
 class AccountLookup(BaseModel):
     """What the invite form's search box learns about an address or a phone."""
 
@@ -516,7 +501,7 @@ async def lookup_account(
     than "no account" — an administrator who is told nobody exists would
     invite them to register again.
     """
-    login = _checked_login(identifier or email)
+    login = checked_login(identifier or email)
     account = await find_account_by_login(db, login)
     if account is None:
         if backend.enabled:
@@ -656,7 +641,7 @@ async def invite_user(
     # Who is being invited: by address, or — with no address — by the phone
     # number they sign in to suliko.ge with.
     by_phone = payload.email is None
-    login = _checked_login(phone if by_phone else str(payload.email))
+    login = checked_login(phone if by_phone else str(payload.email))
     account = await find_account_by_login(db, login)
     if account is None and backend.enabled:
         # Registered on suliko.ge, never seen here: make their account now, so

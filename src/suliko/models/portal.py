@@ -193,7 +193,9 @@ class PortalAccountInvite(Base, IdMixin, TimestampMixin):
     )
     full_name: Mapped[str] = mapped_column(String(255), nullable=False)
     #: As the bureau typed it, lowercased. Free text, same as `Translator.email`.
-    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    #: Null for a translator who signs in to suliko.ge with a phone number: the
+    #: bureau picked their account, so there was no address to write down.
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     phone: Mapped[str | None] = mapped_column(String(50), default=None)
 
     #: `domain.portal.normalize_email` / `normalize_phone`, kept in step with

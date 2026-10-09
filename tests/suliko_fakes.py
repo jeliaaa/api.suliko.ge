@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator
 from suliko.integrations.suliko_backend import (
     PasswordCheck,
     PasswordOutcome,
+    SulikoContact,
     SulikoUnavailableError,
     SulikoUser,
 )
@@ -33,6 +34,41 @@ def person(
     )
 
 
+def _digits(raw: str | None) -> str | None:
+    """A phone number as the real search compares it (`UserService.NormalizePhone`
+    on suliko.ge's backend): digits only, no 995 prefix, no leading trunk zero."""
+    if not raw:
+        return None
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if digits.startswith("995") and len(digits) == 12:
+        digits = digits[3:]
+    elif len(digits) == 10 and digits.startswith("05"):
+        digits = digits[1:]
+    return digits if len(digits) >= 6 else None
+
+
+def contact(
+    suliko_id: str = "g1",
+    user_name: str = "nino@suliko.ge",
+    first: str = "Nino",
+    last: str = "Beridze",
+    *,
+    email: str | None = None,
+    phone: str | None = None,
+) -> SulikoContact:
+    """A search result: the profile email and phone are given separately from the
+    sign-in name, as they are on suliko.ge."""
+    return SulikoContact(
+        id=suliko_id,
+        user_name=user_name,
+        first_name=first,
+        last_name=last,
+        user_type="normal",
+        email=email,
+        phone=phone,
+    )
+
+
 class FakeBackend:
     """suliko.ge, from a dict. `passwords` maps a suliko id to its password."""
 
@@ -45,8 +81,12 @@ class FakeBackend:
         down: bool = False,
         directory_down: bool = False,
         codes: dict[str, str] | None = None,
+        contacts: list[SulikoContact] | None = None,
     ) -> None:
         self.people = people or []
+        #: What a search can find (profile email/phone kept apart from the sign-in name).
+        self.contacts = contacts or []
+        self.searches: list[str] = []
         #: One-time sign-in codes: code -> suliko id. Spent on first use.
         self.codes = codes or {}
         self.passwords = passwords or {}
@@ -80,6 +120,23 @@ class FakeBackend:
     async def find_user(self, login: str) -> SulikoUser | None:
         self._guard()
         return next((p for p in self.people if p.user_name.lower() == login.strip().lower()), None)
+
+    async def search_users(self, query: str) -> list[SulikoContact]:
+        """Equality on the email or the number, as the real search does."""
+        self._guard()
+        self.searches.append(query)
+        wanted = query.strip().lower()
+        digits = _digits(query) if "@" not in query else None
+        found = []
+        for c in self.contacts:
+            by_email = wanted in {(c.email or "").lower(), c.user_name.lower()}
+            by_phone = digits is not None and digits in {
+                _digits(c.phone),
+                _digits(c.user_name if "@" not in c.user_name else None),
+            }
+            if by_email or by_phone:
+                found.append(c)
+        return found
 
     async def iter_users(self, page_size: int = 200) -> AsyncIterator[SulikoUser]:
         self._guard()

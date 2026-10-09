@@ -13,10 +13,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import Literal
 
+from pydantic import EmailStr, TypeAdapter
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from suliko.core.errors import ConflictError, NotFoundError
+from suliko.core.errors import ConflictError, NotFoundError, ValidationError
 from suliko.models.audit import ActorType
 from suliko.models.directory import Client, Translator
 from suliko.models.order import Order, OrderDocument
@@ -138,6 +140,27 @@ def normalize_phone(phone: str | None) -> str | None:
 def normalize_email(email: str | None) -> str | None:
     value = (email or "").strip().lower()
     return value or None
+
+
+def checked_login(raw: str | None) -> str:
+    """An email address (lower-cased) or a phone number, or a 422 saying which.
+
+    What the invite searches and the invites themselves accept, so they all
+    take exactly the same things. A phone number is returned as typed: how it
+    is stored varies, and matching copes (`domain.accounts.phone_variants`).
+    """
+    login = (raw or "").strip()
+    if not login:
+        raise ValidationError("Enter an email address or a phone number.")
+    if "@" in login:
+        try:
+            checked = str(TypeAdapter(EmailStr).validate_python(login))
+        except PydanticValidationError:
+            raise ValidationError("Enter a valid email address.") from None
+        return normalize_email(checked) or checked
+    if normalize_phone(login) is None:
+        raise ValidationError("Enter a valid email address or phone number.")
+    return login
 
 
 def contact_match(

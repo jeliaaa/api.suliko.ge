@@ -39,6 +39,7 @@ from suliko.domain.accounts import (
     upsert_from_suliko,
     username_for_account,
 )
+from suliko.domain.portal import checked_login
 from suliko.domain.suliko_import import import_users, link_by_hand
 from suliko.integrations.suliko_backend import SulikoUnavailableError, SulikoUser
 from suliko.models.reference import DocumentType, Language, LanguagePairPrice, TenantSettings
@@ -822,13 +823,13 @@ async def test_an_address_is_one_question_to_suliko() -> None:
     ],
 )
 def test_the_search_and_the_invite_accept_an_address_or_a_number(raw: str, expected: str) -> None:
-    assert users._checked_login(raw) == expected
+    assert checked_login(raw) == expected
 
 
 @pytest.mark.parametrize("raw", [None, "", "   ", "not-an-email@", "a@b", "12345", "abc"])
 def test_anything_else_is_refused_with_a_422(raw: str | None) -> None:
     with pytest.raises(ValidationError):
-        users._checked_login(raw)
+        checked_login(raw)
 
 
 def test_an_invite_needs_an_address_or_a_phone_number() -> None:

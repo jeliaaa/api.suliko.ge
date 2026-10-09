@@ -1148,7 +1148,10 @@ async def _invite_translator(
     email: str,
     phone: str | None = None,
     translator_id: int | None = None,
+    backend: Any = None,
 ) -> Any:
+    """Invite by address. `backend` is suliko.ge's directory: by default there is
+    none connected, which is how an address-only invite worked before it."""
     from suliko.api.v1 import translators as translators_api
 
     payload = translators_api.TranslatorInvite(
@@ -1157,7 +1160,12 @@ async def _invite_translator(
     with tenant_scope(tenant_id):
         async with maker() as db:
             result = await translators_api.invite_translator(
-                payload, db, session, session, RateLimiter(None)
+                payload,
+                db,
+                session,
+                session,
+                RateLimiter(None),
+                backend if backend is not None else UnconfiguredSulikoBackend(),
             )
             await db.commit()
     return result
@@ -1629,3 +1637,391 @@ async def test_a_phone_invite_to_someone_who_also_has_an_address_is_emailed(
     assert not result.invited_by_phone and result.email_sent
     assert result.user.email == "owner@office.ge"
     assert [m["to"] for m in sent_mail] == ["owner@office.ge"]
+
+
+# ── Inviting a translator by picking a suliko.ge account ────────────────────
+#
+# The bureau types an address or a phone number, sees EVERY suliko.ge account
+# that matches (not just one), and picks the right person. The pick links at
+# once, makes them a translator, and needs no email address: a translator who
+# signs in with a phone number simply finds the bureau in their Orders tab.
+
+G2 = "aaaaaaaa-0000-4000-8000-000000000002"
+G3 = "aaaaaaaa-0000-4000-8000-000000000003"
+
+
+async def _pick_translator(
+    maker: async_sessionmaker[AsyncSession],
+    backend: Any,
+    suliko_user_id: str,
+    *,
+    tenant_id: int = ACME,
+    full_name: str = "Gela Beridze",
+    email: str | None = None,
+    phone: str | None = None,
+    translator_id: int | None = None,
+) -> Any:
+    from suliko.api.v1 import translators as translators_api
+
+    payload = translators_api.TranslatorInvite(
+        full_name=full_name,
+        email=email,
+        phone=phone,
+        translator_id=translator_id,
+        suliko_user_id=suliko_user_id,
+    )
+    session = _manager_session(tenant_id)
+    with tenant_scope(tenant_id):
+        async with maker() as db:
+            result = await translators_api.invite_translator(
+                payload, db, session, session, RateLimiter(None), backend
+            )
+            await db.commit()
+    return result
+
+
+async def _candidates(
+    maker: async_sessionmaker[AsyncSession], backend: Any, q: str, *, tenant_id: int = ACME
+) -> Any:
+    from suliko.api.v1 import translators as translators_api
+
+    session = _manager_session(tenant_id)
+    with tenant_scope(tenant_id):
+        async with maker() as db:
+            return await translators_api.translator_invite_candidates(
+                db, session, session, backend, q
+            )
+
+
+async def _directory_count(maker: async_sessionmaker[AsyncSession], tenant_id: int = ACME) -> int:
+    from sqlalchemy import func
+
+    with tenant_scope(tenant_id):
+        async with maker() as db:
+            return int(await db.scalar(select(func.count()).select_from(Translator)) or 0)
+
+
+def _two_gelas() -> Any:
+    from suliko_fakes import FakeBackend, contact, person
+
+    return FakeBackend(
+        people=[
+            person(G2, "599123456", "Gela", "Beridze"),
+            person(G3, "gela.b@suliko.ge", "Gela", "Beridze"),
+        ],
+        contacts=[
+            contact(G2, "599123456", "Gela", "Beridze", phone="599123456"),
+            contact(
+                G3,
+                "gela.b@suliko.ge",
+                "Gela",
+                "Beridze",
+                email="gela.b@suliko.ge",
+                phone="0599123456",
+            ),
+        ],
+    )
+
+
+async def test_a_search_lists_every_account_that_matches(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    backend = _two_gelas()
+
+    found = await _candidates(maker, backend, "+995 599 12 34 56")
+
+    assert [c.suliko_user_id for c in found] == [G2, G3]
+    # The number that was searched is shown as it is; the other contact is not.
+    assert found[0].phone == "599123456" and found[0].email is None
+    assert found[1].phone == "0599123456" and found[1].email == "g***@suliko.ge"
+    assert all(c.full_name == "Gela Beridze" and not c.already_linked for c in found)
+    assert backend.searches == ["+995 599 12 34 56"]
+
+
+async def test_a_search_by_address_works_the_same_way(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    found = await _candidates(maker, _two_gelas(), "  Gela.B@Suliko.GE ")
+
+    assert [c.suliko_user_id for c in found] == [G3]
+
+
+async def test_a_search_that_finds_nobody_is_an_empty_list(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    assert await _candidates(maker, _two_gelas(), "599000000") == []
+
+
+async def test_a_search_is_empty_when_suliko_is_not_connected(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    assert await _candidates(maker, UnconfiguredSulikoBackend(), "599123456") == []
+
+
+@pytest.mark.parametrize("q", ["abc", "12", "a@b", "   "])
+async def test_a_search_that_is_neither_an_address_nor_a_number_is_refused(
+    maker: async_sessionmaker[AsyncSession], q: str
+) -> None:
+    backend = _two_gelas()
+
+    with pytest.raises(ValidationError):
+        await _candidates(maker, backend, q)
+    assert backend.searches == []
+
+
+async def test_a_search_while_suliko_is_down_fails_rather_than_finding_nobody(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    from suliko.integrations.suliko_backend import SulikoUnavailableError
+    from suliko_fakes import FakeBackend
+
+    with pytest.raises(SulikoUnavailableError):
+        await _candidates(maker, FakeBackend(directory_down=True), "599123456")
+
+
+async def test_picking_a_phone_only_account_links_at_once_and_emails_nobody(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
+) -> None:
+    result = await _pick_translator(maker, _two_gelas(), G2)
+
+    assert result.invite_status == "linked"
+    assert result.matched_display_name == "Gela Beridze"
+    # No address to write to: nothing is sent, and nothing needs retrying.
+    assert result.no_email and not result.email_sent
+    assert sent_mail == []
+
+    async with maker() as db:
+        portal = (
+            await db.execute(
+                select(PortalTranslator).where(PortalTranslator.external_user_id == G2)
+            )
+        ).scalar_one()
+        link = (await db.execute(select(PortalTranslatorLink))).scalar_one()
+        invite = (await db.execute(select(PortalAccountInvite))).scalar_one()
+    assert link.portal_translator_id == portal.id and link.tenant_id == ACME
+    assert link.translator_id == result.translator.id
+    assert invite.email is None and invite.status is InviteStatus.LINKED
+    assert invite.portal_translator_id == portal.id
+
+
+async def test_picking_makes_them_a_translator_from_what_suliko_says_not_the_profile(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    from suliko_fakes import FakeBackend, contact, person
+
+    backend = FakeBackend(
+        people=[person(G2, "599123456", "Gela", "Beridze")],
+        # The profile claims an address this person never proved.
+        contacts=[contact(G2, "599123456", email="ceo@bank.example", phone="599123456")],
+    )
+
+    await _pick_translator(maker, backend, G2, email=None)
+
+    async with maker() as db:
+        portal = (await db.execute(select(PortalTranslator))).scalar_one()
+    assert (portal.display_name, portal.phone, portal.email) == ("Gela Beridze", "599123456", None)
+    assert portal.is_active
+
+
+async def test_picking_someone_who_signs_in_with_an_address_emails_that_address(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
+) -> None:
+    result = await _pick_translator(maker, _two_gelas(), G3)
+
+    assert result.invite_status == "linked" and result.email_sent and not result.no_email
+    assert [m["to"] for m in sent_mail] == ["gela.b@suliko.ge"]
+    assert "already have a suliko.ge account" in sent_mail[0]["body"]
+
+
+async def test_an_address_the_bureau_typed_is_where_the_email_goes(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
+) -> None:
+    result = await _pick_translator(maker, _two_gelas(), G2, email="Gela@Work.example")
+
+    assert result.email_sent
+    assert [m["to"] for m in sent_mail] == ["gela@work.example"]
+
+
+async def test_picking_reuses_the_account_an_admin_already_marked(
+    client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    await add_translator(
+        client, user_id=G2, display_name="Name The Admin Typed", phone="599123456", email=None
+    )
+
+    await _pick_translator(maker, _two_gelas(), G2)
+
+    async with maker() as db:
+        rows = (await db.execute(select(PortalTranslator))).scalars().all()
+    assert [(r.external_user_id, r.display_name) for r in rows] == [(G2, "Name The Admin Typed")]
+
+
+async def test_picking_an_account_that_no_longer_exists_writes_nothing(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    from suliko_fakes import FakeBackend
+
+    before = await _directory_count(maker)
+
+    with pytest.raises(NotFoundError):
+        await _pick_translator(maker, FakeBackend(), G2)
+
+    assert await _directory_count(maker) == before
+
+
+async def test_picking_while_suliko_is_down_writes_nothing(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    from suliko.integrations.suliko_backend import SulikoUnavailableError
+    from suliko_fakes import FakeBackend, person
+
+    backend = FakeBackend([person(G2, "599123456")], directory_down=True)
+    before = await _directory_count(maker)
+
+    with pytest.raises(SulikoUnavailableError):
+        await _pick_translator(maker, backend, G2)
+
+    assert await _directory_count(maker) == before
+
+
+async def test_the_search_says_who_is_already_one_of_this_bureaus_translators(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    backend = _two_gelas()
+    first = await _pick_translator(maker, backend, G2, full_name="Gela From Tbilisi")
+
+    here = await _candidates(maker, backend, "599123456")
+    elsewhere = await _candidates(maker, backend, "599123456", tenant_id=GLOBEX)
+
+    by_id = {c.suliko_user_id: c for c in here}
+    assert by_id[G2].already_linked and by_id[G2].linked_translator_name == "Gela From Tbilisi"
+    assert not by_id[G3].already_linked
+    # Another bureau's directory is another bureau's business.
+    assert not any(c.already_linked for c in elsewhere)
+    assert first.translator.name == "Gela From Tbilisi"
+
+
+async def test_picking_someone_already_linked_here_does_not_move_them(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    backend = _two_gelas()
+    first = await _pick_translator(maker, backend, G2, full_name="Original Record")
+    after_first = await _directory_count(maker)
+
+    with pytest.raises(ConflictError, match="already linked to another translator record"):
+        await _pick_translator(maker, backend, G2, full_name="A Second Record")
+
+    async with maker() as db:
+        link = (await db.execute(select(PortalTranslatorLink))).scalar_one()
+    assert link.translator_id == first.translator.id
+    # The refused invite left no second record behind.
+    assert await _directory_count(maker) == after_first
+
+
+async def test_picking_the_same_person_for_the_same_record_again_is_harmless(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    backend = _two_gelas()
+    first = await _pick_translator(maker, backend, G2)
+
+    again = await _pick_translator(maker, backend, G2, translator_id=first.translator.id)
+
+    assert again.invite_status == "linked" and again.translator.id == first.translator.id
+    async with maker() as db:
+        assert len((await db.execute(select(PortalTranslatorLink))).scalars().all()) == 1
+        assert len((await db.execute(select(PortalAccountInvite))).scalars().all()) == 1
+
+
+async def test_an_invite_for_an_existing_record_can_be_a_picked_account(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    with tenant_scope(ACME):
+        async with maker() as db:
+            row = Translator(name="Existing Record", phone="599123456", is_active=True)
+            db.add(row)
+            await db.flush()
+            record_id = row.id
+            await db.commit()
+
+    before = await _directory_count(maker)
+
+    result = await _pick_translator(maker, _two_gelas(), G2, translator_id=record_id)
+
+    assert result.translator.id == record_id
+    # Attached to the existing record: no new one.
+    assert await _directory_count(maker) == before
+
+
+async def test_picked_invites_appear_in_the_invite_list_without_an_address(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    from suliko.api.v1 import translators as translators_api
+
+    await _pick_translator(maker, _two_gelas(), G2)
+
+    session = _manager_session(ACME)
+    with tenant_scope(ACME):
+        async with maker() as db:
+            listed = await translators_api.list_translator_invites(db, session, session)
+
+    assert [(i.full_name, i.email, i.status) for i in listed] == [
+        ("Gela Beridze", None, InviteStatus.LINKED)
+    ]
+
+
+def test_an_invite_needs_an_address_or_a_picked_account() -> None:
+    from suliko.api.v1 import translators as translators_api
+
+    translators_api.TranslatorInvite(full_name="A", email="a@b.ge")
+    translators_api.TranslatorInvite(full_name="A", suliko_user_id=G2)
+    translators_api.TranslatorInvite(full_name="A", email="a@b.ge", suliko_user_id=G2)
+    with pytest.raises(ValueError, match=r"email address or a chosen suliko\.ge account"):
+        translators_api.TranslatorInvite(full_name="A")
+    with pytest.raises(ValueError, match=r"email address or a chosen suliko\.ge account"):
+        translators_api.TranslatorInvite(full_name="A", phone="599123456")
+
+
+async def test_a_search_by_address_hides_the_phone_number_it_finds(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Otherwise anyone who knows an address could read its owner's number."""
+    found = await _candidates(maker, _two_gelas(), "gela.b@suliko.ge")
+
+    assert [(c.email, c.phone) for c in found] == [("gela.b@suliko.ge", "059***456")]
+
+
+@pytest.mark.parametrize(
+    ("contact_email", "contact_phone", "searched", "expected"),
+    [
+        # The searched contact is shown whole, the other one partly hidden.
+        ("gela@x.ge", "599123456", "gela@x.ge", ("gela@x.ge", "599***456")),
+        ("gela@x.ge", "599123456", "GELA@X.GE", ("gela@x.ge", "599***456")),
+        ("gela@x.ge", "599123456", "+995 599 12 34 56", ("g***@x.ge", "599123456")),
+        ("gela@x.ge", "0599123456", "599123456", ("g***@x.ge", "0599123456")),
+        # Neither matches the profile columns (found by sign-in name): both hidden.
+        ("other@x.ge", "577000111", "gela@x.ge", ("o***@x.ge", "577***111")),
+        ("other@x.ge", "577000111", "599123456", ("o***@x.ge", "577***111")),
+        # Nothing to show stays nothing.
+        (None, None, "gela@x.ge", (None, None)),
+        (None, "599123456", "599123456", (None, "599123456")),
+    ],
+)
+def test_only_the_contact_that_was_searched_is_shown_whole(
+    contact_email: str | None,
+    contact_phone: str | None,
+    searched: str,
+    expected: tuple[str | None, str | None],
+) -> None:
+    from suliko.api.v1.translators import _candidate_contacts
+
+    assert _candidate_contacts(contact_email, contact_phone, searched) == expected
+
+
+def test_a_short_value_is_hidden_without_giving_away_its_length() -> None:
+    from suliko.api.v1.translators import _mask_email, _mask_phone
+
+    assert _mask_phone("12345") == "1***"
+    assert _mask_phone("  599123456 ") == "599***456"
+    assert _mask_phone("") is None and _mask_phone(None) is None
+    assert _mask_email("a@b.ge") == "a***@b.ge"
+    assert _mask_email("") is None and _mask_email(None) is None

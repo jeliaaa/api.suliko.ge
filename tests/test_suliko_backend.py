@@ -363,3 +363,90 @@ async def test_an_unconfigured_backend_vouches_for_nobody() -> None:
         backend.iter_users()
     with pytest.raises(SulikoUnavailableError):
         await backend.redeem_sso_code("c", "v" * 43, "https://app.example/cb")
+
+
+# ── Searching for an exact email or phone number ────────────────────────────
+
+
+def _contact_row(**extra: Any) -> dict[str, Any]:
+    return {
+        "id": "g1",
+        "userName": "599123456",
+        "firstName": "Gela",
+        "lastName": "Beridze",
+        "userType": "normal",
+        "email": "gela@suliko.ge",
+        "phoneNumber": "599123456",
+        **extra,
+    }
+
+
+async def test_a_search_asks_for_the_exact_value_with_the_key() -> None:
+    backend, seen = _backend(lambda r: httpx.Response(200, json=[_contact_row()]))
+
+    found = await backend.search_users("+995 599 12 34 56")
+
+    assert seen[0].url.path == "/api/office/users/search"
+    assert seen[0].url.params["q"] == "+995 599 12 34 56"
+    assert seen[0].headers[KEY_HEADER] == KEY
+    assert [c.id for c in found] == ["g1"]
+
+
+async def test_a_search_returns_every_match_with_the_profile_contacts() -> None:
+    rows = [
+        _contact_row(id="a", email="gela@suliko.ge", phoneNumber="599123456"),
+        _contact_row(id="b", email=None, phoneNumber="0599123456", firstName="", lastName=""),
+    ]
+    backend, _ = _backend(lambda r: httpx.Response(200, json=rows))
+
+    first, second = await backend.search_users("599123456")
+
+    assert (first.email, first.phone, first.full_name) == (
+        "gela@suliko.ge",
+        "599123456",
+        "Gela Beridze",
+    )
+    assert (second.email, second.phone, second.full_name) == (None, "0599123456", "")
+
+
+async def test_nobody_matching_is_an_empty_list_not_an_error() -> None:
+    backend, _ = _backend(lambda r: httpx.Response(200, json=[]))
+
+    assert await backend.search_users("nobody@suliko.ge") == []
+
+
+@pytest.mark.parametrize("body", [{"items": []}, "text", 7, None])
+async def test_a_search_answer_that_is_not_a_list_is_unavailable(body: Any) -> None:
+    backend, _ = _backend(lambda r: httpx.Response(200, json=body))
+
+    with pytest.raises(SulikoUnavailableError):
+        await backend.search_users("a@b.ge")
+
+
+async def test_a_bare_404_on_search_is_a_setup_problem() -> None:
+    """Never "nobody": an unconfigured suliko.ge answers 404 to every route, and
+    an empty result must not be mistaken for it."""
+    backend, _ = _backend(lambda r: httpx.Response(404))
+
+    with pytest.raises(SulikoUnavailableError):
+        await backend.search_users("a@b.ge")
+
+
+@pytest.mark.parametrize("status", [401, 500, 503])
+async def test_a_failing_search_is_unavailable(status: int) -> None:
+    backend, _ = _backend(lambda r: httpx.Response(status))
+
+    with pytest.raises(SulikoUnavailableError):
+        await backend.search_users("a@b.ge")
+
+
+async def test_a_search_result_without_an_id_is_refused() -> None:
+    backend, _ = _backend(lambda r: httpx.Response(200, json=[_contact_row(id="")]))
+
+    with pytest.raises(SulikoUnavailableError):
+        await backend.search_users("599123456")
+
+
+async def test_an_unconfigured_backend_cannot_search() -> None:
+    with pytest.raises(SulikoUnavailableError):
+        await UnconfiguredSulikoBackend().search_users("a@b.ge")
