@@ -116,8 +116,8 @@ HEADERS: dict[str, dict[Lang, list[str]]] = {
     },
     "orders_profit": {"en": ["Profit"], "ka": ["მოგება"]},
     "clients": {
-        "en": ["ID", "Name", "Type", "Email", "Phone", "ID number"],
-        "ka": ["ID", "სახელი", "ტიპი", "ელფოსტა", "ტელეფონი", "პირადი ნომერი"],
+        "en": ["Number", "Name", "Type", "Email", "Phone", "ID number"],
+        "ka": ["ნომერი", "სახელი", "ტიპი", "ელფოსტა", "ტელეფონი", "პირადი ნომერი"],
     },
     "payments": {
         "en": ["ID", "Date", "Client", "Method", "Amount", "Unallocated", "Orders", "Notes"],
@@ -232,7 +232,7 @@ async def export_orders(
         )
         for order in page.items:
             row: list[Any] = [
-                order.id,
+                order.number,
                 order.order_date,
                 order.due_date,
                 order.client_name,
@@ -282,7 +282,7 @@ async def export_clients(
         for client in page.items:
             rows.append(
                 [
-                    client.id,
+                    client.number,
                     client.name,
                     _label(KA_CLIENT_TYPE, client.client_type.value, lang),
                     client.email,
@@ -333,7 +333,7 @@ async def export_payments(
                     _label(KA_METHOD, payment.method.value, lang),
                     payment.amount,
                     payment.unallocated,
-                    ", ".join(f"#{a.order_id}" for a in payment.allocations),
+                    ", ".join(f"#{a.order_number or a.order_id}" for a in payment.allocations),
                     payment.notes,
                 ]
             )
@@ -375,7 +375,7 @@ async def export_expenses(
                     expense.expense_date,
                     _label(KA_CATEGORY, expense.category, lang),
                     expense.description,
-                    f"#{expense.order_id}" if expense.order_id else "",
+                    f"#{expense.order_number or expense.order_id}" if expense.order_id else "",
                     expense.amount,
                 ]
             )

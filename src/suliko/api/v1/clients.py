@@ -80,6 +80,8 @@ class ClientSummary(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    #: What people see: 1, 2, 3 within the bureau. `id` is for links only.
+    number: int
     name: str
     client_type: ClientType
     email: str | None
@@ -91,6 +93,7 @@ class ClientDetail(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    number: int
     name: str
     client_type: ClientType
     email: str | None
@@ -117,6 +120,7 @@ class ClientPage(BaseModel):
 def _to_summary(client: Client) -> ClientSummary:
     return ClientSummary(
         id=client.id,
+        number=client.number,
         name=client.name,
         client_type=client.client_type,
         email=client.email,
@@ -128,6 +132,7 @@ def _to_summary(client: Client) -> ClientSummary:
 def _to_detail(client: Client) -> ClientDetail:
     return ClientDetail(
         id=client.id,
+        number=client.number,
         name=client.name,
         client_type=client.client_type,
         email=client.email,
@@ -166,6 +171,9 @@ async def list_clients(
         digits = digits_of(search)
         if len(digits) >= 4:
             conditions.append(phone_digits(Client.phone).like(f"%{digits}%"))
+        # A bare number is also the client's number in the bureau, as shown.
+        if search.strip().isdigit() and len(search.strip()) <= 9:
+            conditions.append(Client.number == int(search.strip()))
         stmt = stmt.where(or_(*conditions))
 
     if client_type is not None:
@@ -192,6 +200,7 @@ async def list_clients(
 
 class PossibleDuplicate(BaseModel):
     id: int
+    number: int
     name: str
     client_type: ClientType
     #: Which of the submitted details matched: "phone", "email", "personal_number".
@@ -243,7 +252,11 @@ async def possible_duplicates(
             matched.append("personal_number")
         out.append(
             PossibleDuplicate(
-                id=row.id, name=row.name, client_type=row.client_type, matched_on=matched
+                id=row.id,
+                number=row.number,
+                name=row.name,
+                client_type=row.client_type,
+                matched_on=matched,
             )
         )
     return out

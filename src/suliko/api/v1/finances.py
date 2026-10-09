@@ -38,6 +38,7 @@ notary.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Annotated, Any, Literal
@@ -631,8 +632,31 @@ class ExpenseOut(BaseModel):
     description: str
     amount: Decimal
     order_id: int | None
+    order_number: int | None = None
     recorded_by_user_id: int | None
     created_at: datetime
+
+
+async def order_numbers(db: AsyncSession, order_ids: set[int]) -> dict[int, int]:
+    """Each order id's number in the bureau, for showing an order beside money."""
+    if not order_ids:
+        return {}
+    return {
+        int(order_id): int(number)
+        for order_id, number in (
+            await db.execute(select(Order.id, Order.number).where(Order.id.in_(order_ids)))
+        ).all()
+    }
+
+
+async def _expenses_out(db: AsyncSession, rows: Sequence[Expense]) -> list[ExpenseOut]:
+    numbers = await order_numbers(db, {r.order_id for r in rows if r.order_id is not None})
+    out = []
+    for row in rows:
+        item = ExpenseOut.model_validate(row, from_attributes=True)
+        item.order_number = numbers.get(row.order_id) if row.order_id is not None else None
+        out.append(item)
+    return out
 
 
 class ExpensePage(BaseModel):
@@ -701,7 +725,7 @@ async def list_expenses(
     rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
 
     return ExpensePage(
-        items=[ExpenseOut.model_validate(r, from_attributes=True) for r in rows],
+        items=await _expenses_out(db, rows),
         meta=PageMeta(total=int(counts[0] or 0), limit=limit, offset=offset),
         total_amount=_money(counts[1]),
     )
@@ -732,7 +756,7 @@ async def create_expense(
         entity_id=row.id,
         after=payload.model_dump(mode="json"),
     )
-    return ExpenseOut.model_validate(row, from_attributes=True)
+    return (await _expenses_out(db, [row]))[0]
 
 
 @router.delete("/expenses/{expense_id}", status_code=http_status.HTTP_204_NO_CONTENT)
@@ -839,6 +863,8 @@ class PaymentIn(BaseModel):
 
 class AllocationOut(BaseModel):
     order_id: int
+    #: The order's number in the bureau, which is what is shown.
+    order_number: int | None = None
     amount_allocated: Decimal
 
 
@@ -888,6 +914,10 @@ async def _payments_out(db: AsyncSession, rows: list[ClientPayment]) -> list[Pay
         ).all()
     }
 
+    numbers = await order_numbers(
+        db, {a.order_id for found in allocations.values() for a in found}
+    )
+
     out: list[PaymentOut] = []
     for row in rows:
         mine = allocations.get(row.id, [])
@@ -903,7 +933,11 @@ async def _payments_out(db: AsyncSession, rows: list[ClientPayment]) -> list[Pay
                 notes=row.notes,
                 recorded_by_user_id=row.recorded_by_user_id,
                 allocations=[
-                    AllocationOut(order_id=a.order_id, amount_allocated=a.amount_allocated)
+                    AllocationOut(
+                        order_id=a.order_id,
+                        order_number=numbers.get(a.order_id),
+                        amount_allocated=a.amount_allocated,
+                    )
                     for a in mine
                 ],
                 unallocated=row.amount - allocated,
@@ -1194,6 +1228,7 @@ class TranslatorPayoutOut(PayoutOut):
 class NotaryPayoutAllocationOut(BaseModel):
     order_document_id: int
     order_id: int | None
+    order_number: int | None = None
     notary_id: int | None
     notary_name: str | None
     amount_allocated: Decimal
@@ -1277,6 +1312,9 @@ async def _translator_payouts_out(
             )
         ).all()
     }
+    numbers = await order_numbers(
+        db, {a.order_id for found in allocations.values() for a in found}
+    )
     return [
         TranslatorPayoutOut(
             id=row.id,
@@ -1287,7 +1325,11 @@ async def _translator_payouts_out(
             method=row.method,
             notes=row.notes,
             allocations=[
-                AllocationOut(order_id=a.order_id, amount_allocated=a.amount_allocated)
+                AllocationOut(
+                    order_id=a.order_id,
+                    order_number=numbers.get(a.order_id),
+                    amount_allocated=a.amount_allocated,
+                )
                 for a in allocations.get(row.id, [])
             ],
             unallocated=row.amount
@@ -1481,15 +1523,17 @@ async def _notary_payouts_out(
         return []
     ids = [row.id for row in rows]
     allocations: dict[int, list[NotaryPayoutAllocationOut]] = {}
-    for allocation, order_id, notary_id, notary_name in (
+    for allocation, order_id, order_number, notary_id, notary_name in (
         await db.execute(
             select(
                 NotaryPaymentAllocation,
                 OrderDocument.order_id,
+                Order.number,
                 OrderDocument.notary_id,
                 Notary.name,
             )
             .join(OrderDocument, OrderDocument.id == NotaryPaymentAllocation.order_document_id)
+            .join(Order, Order.id == OrderDocument.order_id)
             .outerjoin(Notary, Notary.id == OrderDocument.notary_id)
             .where(NotaryPaymentAllocation.payment_id.in_(ids))
             .order_by(NotaryPaymentAllocation.id)
@@ -1499,6 +1543,7 @@ async def _notary_payouts_out(
             NotaryPayoutAllocationOut(
                 order_document_id=allocation.order_document_id,
                 order_id=order_id,
+                order_number=order_number,
                 notary_id=notary_id,
                 notary_name=notary_name,
                 amount_allocated=allocation.amount_allocated,

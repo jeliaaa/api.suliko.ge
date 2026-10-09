@@ -12,16 +12,19 @@ from sqlalchemy import (
     Date,
     DateTime,
     Enum,
+    FetchedValue,
     ForeignKey,
     Index,
     Integer,
     Numeric,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from suliko.db.base import Base, IdMixin, TenantScoped, TimestampMixin, enum_values
+from suliko.db.numbering import numbered_per_tenant
 
 if TYPE_CHECKING:
     from suliko.models.directory import Client, Notary, Translator
@@ -56,6 +59,7 @@ class CopyType(enum.StrEnum):
         )
 
 
+@numbered_per_tenant
 class Order(Base, IdMixin, TenantScoped, TimestampMixin):
     """A customer order, split into one or more documents.
 
@@ -74,8 +78,12 @@ class Order(Base, IdMixin, TenantScoped, TimestampMixin):
         Index("ix_orders_tenant_date", "tenant_id", "order_date"),
         Index("ix_orders_tenant_client", "tenant_id", "client_id"),
         Index("ix_orders_tenant_due", "tenant_id", "due_date"),
+        UniqueConstraint("tenant_id", "number", name="uq_orders_tenant_number"),
     )
-
+    #: Its number in its own bureau: 1, 2, 3, drawn on insert (see
+    #: suliko.db.numbering). The id stays the key in URLs and foreign keys;
+    #: this is what people see.
+    number: Mapped[int] = mapped_column(Integer, server_default=FetchedValue(), nullable=False)
     client_id: Mapped[int] = mapped_column(
         ForeignKey("clients.id", ondelete="RESTRICT"), nullable=False
     )

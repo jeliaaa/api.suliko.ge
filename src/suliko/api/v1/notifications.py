@@ -270,7 +270,7 @@ async def _order_or_404(db: Db, order_id: int) -> Order:
 async def _subject_label(db: Db, order: Order) -> str:
     """`{client} #{order}` — the line under a feed entry."""
     client = await db.get(Client, order.client_id)
-    return f"{client.name if client else 'Unknown'} #{order.id}"
+    return f"{client.name if client else 'Unknown'} #{order.number}"
 
 
 @comments_router.get("/{order_id}/comments", response_model=list[CommentOut])
