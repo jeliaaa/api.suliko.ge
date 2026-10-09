@@ -230,7 +230,7 @@ def _translator_invite_email(
             f"{tenant_name} has invited you to translate for them on Suliko, and "
             f"it looks like you already have a suliko.ge account under this "
             f"address{matched}.\n\n"
-            "Sign in to suliko.ge and open the Orders tab — the bureau is "
+            "Sign in to suliko.ge and open the Orders tab. The bureau is "
             "already waiting for you there.\n"
         )
         return f"{tenant_name} has invited you on Suliko", body
@@ -243,7 +243,7 @@ def _translator_invite_email(
         f"  {email}\n\n"
         f"If you don't have one yet, register here: {url}\n\n"
         "If you already have a suliko.ge account, make sure it uses this exact "
-        "email address — or the matching phone number. The moment it does, "
+        "email address, or the matching phone number. The moment it does, "
         f"{tenant_name} will appear in your Orders tab automatically, with "
         "nothing further for you to do.\n"
     )

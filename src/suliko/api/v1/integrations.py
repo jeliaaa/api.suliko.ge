@@ -116,14 +116,14 @@ PROVIDERS: dict[IntegrationProvider, ProviderSpec] = {
                 label="Service account JSON",
                 secret=True,
                 multiline=True,
-                help="The whole key file. It contains a private key — it is "
+                help="The whole key file. It contains a private key, so it is "
                 "encrypted on save and never shown again.",
             ),
         ),
     ),
     IntegrationProvider.BOG_ECOMMERCE: ProviderSpec(
         provider=IntegrationProvider.BOG_ECOMMERCE,
-        name="Bank of Georgia — e-commerce",
+        name="Bank of Georgia: e-commerce",
         summary="Client payment links, status polling and refunds.",
         enables="Generating a payment link on an order, and recording the result.",
         fields=(
@@ -141,7 +141,7 @@ PROVIDERS: dict[IntegrationProvider, ProviderSpec] = {
     ),
     IntegrationProvider.BOG_BUSINESS: ProviderSpec(
         provider=IntegrationProvider.BOG_BUSINESS,
-        name="Bank of Georgia — Business Online",
+        name="Bank of Georgia: Business Online",
         summary="Outbound transfers to translators and notaries.",
         enables="Paying a translator or notary directly from a payout.",
         fields=(
@@ -202,7 +202,7 @@ PROVIDERS: dict[IntegrationProvider, ProviderSpec] = {
             FieldSpec(
                 key="site_key",
                 label="Site key",
-                help="Public by design — it is rendered into the page.",
+                help="Public by design. It is rendered into the page.",
             ),
             FieldSpec(key="secret_key", label="Secret key", secret=True),
         ),

@@ -146,7 +146,7 @@ def migrate() -> None:
         check=False,
     )
     if result.returncode != 0:
-        raise SystemExit("alembic upgrade failed — see the output above")
+        raise SystemExit("alembic upgrade failed: see the output above")
     ok("migrations applied")
 
 
@@ -309,7 +309,7 @@ async def create_superuser(
         say(f"    secret : {secret}")
         say(f"    uri    : {uri}")
         say("")
-        say("  Recovery codes — each works once. Store them somewhere safe;")
+        say("  Recovery codes: each works once. Store them somewhere safe;")
         say("  they are shown now and never again:")
         for code in recovery_codes:
             say(f"    {code}")
@@ -349,7 +349,7 @@ async def import_suliko_users(dry_run: bool) -> None:
     finally:
         await close_suliko_backend()
 
-    heading("DRY RUN — nothing was written" if dry_run else "Import finished")
+    heading("DRY RUN: nothing was written" if dry_run else "Import finished")
     verb = "would be created" if dry_run else "created"
     say(f"  people on suliko.ge     : {report.seen}")
     say(f"  already in Office       : {report.already_linked}")
@@ -441,13 +441,13 @@ async def check() -> int:
     # or misspelled variable in .env is dropped in silence. Without this line,
     # "I set MFA_ENFORCED=false and nothing happened" has no cheap answer.
     if not settings.mfa_enforced:
-        warn("MFA is DISABLED — every account signs in with a password alone")
+        warn("MFA is DISABLED: every account signs in with a password alone")
     elif settings.mfa_require_enrolment:
         ok("MFA is ENFORCED, and enrolment is required of privileged roles")
     else:
-        ok("MFA is ENFORCED — anyone with a factor is challenged for it")
+        ok("MFA is ENFORCED: anyone with a factor is challenged for it")
         warn(
-            "MFA_REQUIRE_ENROLMENT is false — owners/admins with no factor "
+            "MFA_REQUIRE_ENROLMENT is false: owners/admins with no factor "
             "sign in on their password alone. Turn it on once enrolment ships."
         )
 
@@ -470,7 +470,7 @@ async def check() -> int:
     heading("Order file storage")
     storage = get_object_storage()
     if not storage.configured:
-        fail("STORAGE_BACKEND is not set or incomplete — order files cannot be stored")
+        fail("STORAGE_BACKEND is not set or incomplete: order files cannot be stored")
         problems += 1
     else:
         say(f"  backend     : {storage.description}")
@@ -533,7 +533,7 @@ async def check() -> int:
                 if tenants:
                     ok(f"{len(tenants)} tenant(s): {', '.join(t.slug for t in tenants)}")
                 else:
-                    warn("no tenants yet — run create-tenant")
+                    warn("no tenants yet: run create-tenant")
 
                 supers = (
                     (await db.execute(select(User).where(User.role == Role.SUPERUSER)))
@@ -543,7 +543,7 @@ async def check() -> int:
                 if supers:
                     ok(f"{len(supers)} superuser(s)")
                 else:
-                    warn("no superuser yet — run create-superuser")
+                    warn("no superuser yet: run create-superuser")
     except Exception as exc:  # a CLI should report, not traceback
         fail(f"cannot reach the database: {type(exc).__name__}: {exc}")
         problems += 1
@@ -572,7 +572,7 @@ async def purge_files() -> int:
     settings = get_settings()
     storage = get_object_storage()
     if not storage.configured:
-        fail("STORAGE_BACKEND is not set — nothing to purge from")
+        fail("STORAGE_BACKEND is not set: nothing to purge from")
         return 1
 
     cutoff = datetime.now(UTC) - timedelta(days=settings.file_retention_days)

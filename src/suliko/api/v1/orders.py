@@ -1283,7 +1283,7 @@ async def delete_order(
     if recorded:
         raise ConflictError(
             f"This order has {', '.join(recorded)} recorded against it, so it cannot be "
-            "deleted. Set its status to Cancelled instead — that keeps it out of every "
+            "deleted. Set its status to Cancelled instead. That keeps it out of every "
             "figure and keeps the record."
         )
 

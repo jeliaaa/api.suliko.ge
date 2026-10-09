@@ -433,7 +433,7 @@ async def invoice_readiness(
     if legal is not None:
         accounts = await _accounts(db, legal.id)
         if not accounts:
-            problems.append("Add a bank account — an invoice needs one to be payable.")
+            problems.append("Add a bank account. An invoice needs one to be payable.")
         elif not any(a.is_primary for a in accounts):
             problems.append("Mark one bank account as primary.")
         elif not next(a.bank_iban for a in accounts if a.is_primary).strip():

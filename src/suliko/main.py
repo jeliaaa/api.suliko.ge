@@ -110,7 +110,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "from anyone who has one enrolled, but owners, admins and "
                 "superusers with no factor sign in on their password alone. "
                 "Set MFA_REQUIRE_ENROLMENT=true once the enrolment screen "
-                "exists — until then it locks those accounts out instead."
+                "exists. Until then it locks those accounts out instead."
             ),
         )
 
