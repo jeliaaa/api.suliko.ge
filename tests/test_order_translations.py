@@ -33,6 +33,7 @@ from suliko.api.v1.order_translations import (
     LanguageNotAvailableError,
     SaveContentIn,
     TranslateIn,
+    html_document,
     match_language,
 )
 from suliko.config import Settings
@@ -82,7 +83,8 @@ class FakeSuliko:
     pages: int = 3
     offered: list[SulikoLanguage] = field(default_factory=lambda: [GEORGIAN, ENGLISH])
     state: JobStatus = field(default_factory=lambda: JobStatus("processing", 40))
-    html: bytes = b"<html><body><p>Hello</p></body></html>"
+    # What suliko.ge really sends: a fragment, in UTF-8, saying nothing of it.
+    html: bytes = '<div style="padding: 4px"><p>გამარჯობა, Hello</p></div>'.encode()
     calls: list[tuple[Any, ...]] = field(default_factory=list)
     down: bool = False
 
@@ -459,7 +461,15 @@ async def test_looking_reports_progress_and_files_the_result_once(
             storage,
             None,  # type: ignore[arg-type]
         )
-        assert b"".join([chunk async for chunk in response.body_iterator]) == suliko.html
+        # Kept as a whole document that says which character set it is in:
+        # the file is downloaded and emailed, and opened with nothing else to
+        # go by.
+        kept = b"".join([chunk async for chunk in response.body_iterator])
+        assert kept.decode("utf-8") == (
+            '<!doctype html>\n<html><head><meta charset="utf-8"></head><body>\n'
+            '<div style="padding: 4px"><p>გამარჯობა, Hello</p></div>\n'
+            "</body></html>"
+        )
     assert len(suliko.named("result")) == 1
 
 
@@ -533,7 +543,10 @@ async def test_saving_a_correction_replaces_the_file_and_keeps_the_record(
             ORDER,
             DOCUMENT,
             done.result_file_id,
-            SaveContentIn(html="<p>Hello, corrected</p>"),
+            # What the page sends: the frame's document, its head empty.
+            SaveContentIn(
+                html="<!doctype html>\n<html><head></head><body><p>გასწორებული</p></body></html>"
+            ),
             db,
             Staff(),  # type: ignore[arg-type]
             storage,
@@ -541,6 +554,18 @@ async def test_saving_a_correction_replaces_the_file_and_keeps_the_record(
         )
         assert saved.id != done.result_file_id
         assert (saved.name, saved.uploaded_by) == ("passport scan (EN).html", f"user:{NINO}")
+        response = await order_files.download_file(
+            ORDER,
+            DOCUMENT,
+            saved.id,
+            db,
+            storage,
+            None,  # type: ignore[arg-type]
+        )
+        assert b"".join([chunk async for chunk in response.body_iterator]).decode("utf-8") == (
+            '<!doctype html>\n<html><head><meta charset="utf-8"></head>'
+            "<body><p>გასწორებული</p></body></html>"
+        )
 
         files = await order_files.list_files(ORDER, DOCUMENT, db, None)  # type: ignore[arg-type]
         assert [f.id for f in files if f.kind is FileKind.TRANSLATION] == [saved.id]
@@ -578,6 +603,66 @@ async def test_only_a_translation_made_here_can_be_saved_over(
                     storage,
                     None,  # type: ignore[arg-type]
                 )
+
+
+# ── The file that is kept ───────────────────────────────────────────────────
+
+META = '<meta charset="utf-8">'
+
+
+@pytest.mark.parametrize(
+    ("given", "kept"),
+    [
+        # A fragment, as suliko.ge sends it: wrapped whole.
+        (
+            "<div><p>ცნობა</p></div>",
+            f"<!doctype html>\n<html><head>{META}</head><body>\n"
+            "<div><p>ცნობა</p></div>\n</body></html>",
+        ),
+        # The page's own document, head empty: the head is filled.
+        (
+            "<!doctype html>\n<html><head></head><body><p>x</p></body></html>",
+            f"<!doctype html>\n<html><head>{META}</head><body><p>x</p></body></html>",
+        ),
+        # A head with something in it keeps it, after the declaration.
+        (
+            "<html lang='ka'><head><title>T</title></head><body>x</body></html>",
+            f"<!doctype html>\n<html lang='ka'><head>{META}<title>T</title></head>"
+            "<body>x</body></html>",
+        ),
+        # No head at all: one is made.
+        (
+            "<HTML><BODY>x</BODY></HTML>",
+            f"<!doctype html>\n<HTML><head>{META}</head><BODY>x</BODY></HTML>",
+        ),
+        # Another character set declared, either way HTML has: no longer true
+        # of a file stored as UTF-8, so it goes.
+        (
+            '<html><head><meta charset="windows-1251"><meta http-equiv="Content-Type" '
+            'content="text/html; charset=iso-8859-1"></head><body>x</body></html>',
+            f"<!doctype html>\n<html><head>{META}</head><body>x</body></html>",
+        ),
+        # A byte-order mark is not part of the text.
+        ("﻿<p>x</p>", f"<!doctype html>\n<html><head>{META}</head><body>\n<p>x</p>\n</body></html>"),
+        # <header> is not <head>.
+        (
+            "<header>Top</header><p>x</p>",
+            f"<!doctype html>\n<html><head>{META}</head><body>\n"
+            "<header>Top</header><p>x</p>\n</body></html>",
+        ),
+        # Other meta tags are left alone.
+        (
+            '<html><head><meta name="author" content="A"></head><body>x</body></html>',
+            f'<!doctype html>\n<html><head>{META}<meta name="author" content="A"></head>'
+            "<body>x</body></html>",
+        ),
+    ],
+)
+def test_a_translation_is_kept_as_a_document_that_says_it_is_utf8(given: str, kept: str) -> None:
+    assert html_document(given) == kept
+    # Saving what was saved changes nothing: one declaration, one doctype.
+    assert html_document(kept) == kept
+    assert kept.count("charset") == 1 and kept.lower().count("<!doctype") == 1
 
 
 # ── Which language ──────────────────────────────────────────────────────────
