@@ -15,6 +15,7 @@ from suliko.api.v1 import (
     notifications,
     options,
     order_files,
+    order_mail,
     orders,
     platform,
     portal,
@@ -38,6 +39,7 @@ api_router.include_router(translators.router)
 api_router.include_router(notaries.router)
 api_router.include_router(orders.router)
 api_router.include_router(order_files.router)
+api_router.include_router(order_mail.router)
 api_router.include_router(calculator.router)
 api_router.include_router(reports.router)
 api_router.include_router(users.router)

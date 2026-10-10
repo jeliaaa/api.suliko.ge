@@ -94,6 +94,15 @@ class Settings(BaseSettings):
     #: so an unthrottled invite form is a way to use us to spam or phish.
     invite_max_per_tenant: int = 30
     invite_window_seconds: int = 86400  # 1 day
+
+    #: Emails with an order's files (to a client or a translator) per TENANT
+    #: per window. A busy bureau sends a few dozen a day; a compromised
+    #: account trying to use our address as a mailer hits this first.
+    document_mail_max_per_tenant: int = 200
+    document_mail_window_seconds: int = 86400  # 1 day
+    #: The most the files of one such email may weigh together. Attachments
+    #: grow by a third when encoded, and most mail servers stop at 25 MB.
+    document_mail_max_bytes: int = 15 * 1024 * 1024
     #: How long an invitation's set-your-password link stays usable.
     invite_link_ttl_hours: int = 168  # 7 days
 
