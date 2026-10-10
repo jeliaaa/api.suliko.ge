@@ -32,10 +32,10 @@ from suliko.core.ratelimit import RateLimiter, get_rate_limiter
 from suliko.domain.portal import (
     account_matches,
     checked_login,
-    find_portal_translator,
     link_account_to_directory_row,
     normalize_email,
     normalize_phone,
+    portal_translator_for,
     registration_url,
 )
 from suliko.integrations.suliko_backend import SulikoBackend, SulikoUser, get_suliko_backend
@@ -292,31 +292,6 @@ def _translator_invite_email(
     return f"{tenant_name} has invited you on Suliko", body
 
 
-async def _portal_translator_for(db: AsyncSession, person: SulikoUser) -> PortalTranslator:
-    """The portal account of a suliko.ge person, made on first pick.
-
-    Normally a suliko.ge admin marks someone a translator before any bureau can
-    link them. Picking an account from the search is the bureau doing that for
-    its own purposes, so the row is made here, from what suliko.ge itself says
-    about them: the sign-in name (an address or a number, both proven at
-    registration), never the editable profile contacts.
-    """
-    row = await find_portal_translator(db, person.id)
-    if row is not None:
-        # Whatever the admin recorded stays as it is, including a deactivation.
-        return row
-    row = PortalTranslator(
-        external_user_id=person.id,
-        display_name=(person.full_name or person.user_name)[:255],
-        email=person.email,
-        phone=person.phone,
-        is_active=True,
-    )
-    db.add(row)
-    await db.flush()
-    return row
-
-
 async def _refuse_if_linked_elsewhere(
     db: AsyncSession, account: PortalTranslator, tenant_id: int, translator_id: int
 ) -> None:
@@ -357,17 +332,18 @@ async def invite_translator(
     - **Pick an account** (`suliko_user_id`, from `GET /invite/candidates`).
       The person is linked at once. suliko.ge is asked about them here, so the
       request carries nothing but the id; they need not have been marked a
-      translator by an admin first (`_portal_translator_for`). With no address
-      to write to, nothing is emailed: they see the bureau in their Orders tab
-      the next time they open suliko.ge.
+      translator by an admin first (`domain.portal.portal_translator_for`).
+      With no address to write to, nothing is emailed: they see the bureau in
+      their Orders tab the next time they open suliko.ge.
     - **An address** (`email`). `domain.portal.account_matches` looks for
-      suliko.ge accounts an admin has marked as translators. Exactly one match
+      suliko.ge accounts that already are translators. Exactly one match
       links immediately, through the same `link_account_to_directory_row` the
       suliko.ge admin's manual link uses. Zero or several leave the invite
       `pending`: it is not an error — the invitee is emailed the suliko.ge
-      registration link and told exactly which address to use, and
-      `resolve_pending_invites` finishes the job the moment a matching account
-      exists (see that function's docstring for the two moments that happens).
+      registration link and told exactly which address to use, and the invite
+      is linked the next time whoever signs in with that address opens
+      suliko.ge (`domain.portal.claim_invited_account`, then
+      `resolve_pending_invites`), or when an admin marks them a translator.
 
     `db` doubles as the platform session here: `portal_translators` and
     `portal_account_invites` carry no row-level security and are not
@@ -416,7 +392,7 @@ async def invite_translator(
     chosen: PortalTranslator | None = None
     matches: list[tuple[PortalTranslator, str]] = []
     if person is not None:
-        chosen = await _portal_translator_for(db, person)
+        chosen = await portal_translator_for(db, person)
         await _refuse_if_linked_elsewhere(db, chosen, session.tenant_id, directory_row.id)
     elif email is not None:
         matches = list(await account_matches(db, phone=phone, email=email))

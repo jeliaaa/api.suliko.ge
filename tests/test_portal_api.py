@@ -41,11 +41,12 @@ from suliko.integrations.object_storage import (
     StorageNotConfiguredError,
     get_object_storage,
 )
-from suliko.integrations.suliko_backend import UnconfiguredSulikoBackend
+from suliko.integrations.suliko_backend import UnconfiguredSulikoBackend, get_suliko_backend
 from suliko.models.directory import Client, ClientType, Translator
 from suliko.models.order import CopyType, Order, OrderDocument, Urgency
 from suliko.models.order_file import OrderFile
 from suliko.models.portal import (
+    InviteKind,
     InviteStatus,
     PersonalOrder,
     PersonalOrderFile,
@@ -66,6 +67,7 @@ from suliko.models.user import (
 from suliko.security.permissions import permissions_for_role
 from suliko.security.portal_tokens import sign_token
 from suliko.security.sessions import AuthenticatedSession
+from suliko_fakes import FakeBackend, person
 
 SECRET = "portal-secret-for-tests-0123456789abcdef"
 
@@ -324,9 +326,16 @@ def storage() -> FakeStorage:
     return FakeStorage()
 
 
+@pytest.fixture
+def suliko() -> FakeBackend:
+    """suliko.ge as the portal asks it who someone is: connected, and knowing
+    nobody until a test says who."""
+    return FakeBackend()
+
+
 @pytest_asyncio.fixture
 async def client(
-    maker: async_sessionmaker[AsyncSession], storage: FakeStorage
+    maker: async_sessionmaker[AsyncSession], storage: FakeStorage, suliko: FakeBackend
 ) -> AsyncIterator[httpx.AsyncClient]:
     from suliko.main import create_app
 
@@ -355,6 +364,7 @@ async def client(
     app.dependency_overrides[get_platform_db] = platform_db
     app.dependency_overrides[get_tenant_sessions] = lambda: tenant_session
     app.dependency_overrides[get_object_storage] = lambda: storage
+    app.dependency_overrides[get_suliko_backend] = lambda: suliko
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -1377,6 +1387,224 @@ async def test_cancelling_a_translator_invite_stops_it_resolving(
 
     me = (await client.get(f"{API}/portal/me", headers=as_user(NINO))).json()
     assert me["organizations"] == []
+
+
+# ── An invite by address, to someone nobody has marked a translator ─────────
+#
+# The common case, and the one that used to go nowhere: the bureau types the
+# address of an ordinary suliko.ge account. Nothing matches at invite time, so
+# the invite is pending; it must be linked when that person next opens
+# suliko.ge, on the strength of the address they sign in with.
+
+MISHKA = "44444444-4444-4444-8444-444444444444"
+
+
+async def _assign(
+    maker: async_sessionmaker[AsyncSession], document_id: int, translator_id: int
+) -> None:
+    with tenant_scope(ACME):
+        async with maker() as db:
+            document = await db.get(OrderDocument, document_id)
+            assert document is not None
+            document.translator_id = translator_id
+            await db.commit()
+
+
+async def _invite_status(maker: async_sessionmaker[AsyncSession], email: str) -> InviteStatus:
+    async with maker() as db:
+        return (
+            await db.execute(
+                select(PortalAccountInvite.status).where(PortalAccountInvite.email == email)
+            )
+        ).scalar_one()
+
+
+async def test_an_invited_address_is_linked_when_its_owner_opens_their_orders(
+    client: httpx.AsyncClient,
+    maker: async_sessionmaker[AsyncSession],
+    suliko: FakeBackend,
+    audit: list[dict[str, Any]],
+) -> None:
+    suliko.people.append(person(MISHKA, "Mishka@Example.com", "Mishka", "T."))
+
+    result = await _invite_translator(
+        maker, ACME, _manager_session(ACME), full_name="Mishka", email="mishka@example.com"
+    )
+    assert result.invite_status == "pending"
+    await _assign(maker, 1004, result.translator.id)
+
+    # The orders page itself, with `/me` never asked first.
+    response = await client.get(f"{API}/portal/assignments", headers=as_user(MISHKA))
+    assert response.status_code == 200, response.text
+    assert [(o["order_id"], [d["id"] for d in o["documents"]]) for o in response.json()] == [
+        (102, [1004])
+    ]
+
+    me = (await client.get(f"{API}/portal/me", headers=as_user(MISHKA))).json()
+    assert me == {
+        "is_translator": True,
+        "display_name": "Mishka T.",
+        "organizations": [{"slug": "acme", "name": "Acme Translations"}],
+    }
+    assert await _invite_status(maker, "mishka@example.com") is InviteStatus.LINKED
+    assert "portal.translator_claimed" in [entry["action"] for entry in audit]
+
+    # Made from the address suliko.ge says they sign in with.
+    async with maker() as db:
+        account = (
+            await db.execute(
+                select(PortalTranslator).where(PortalTranslator.external_user_id == MISHKA)
+            )
+        ).scalar_one()
+    assert (account.email, account.phone, account.is_active) == ("mishka@example.com", None, True)
+
+
+async def test_an_invited_phone_number_is_linked_the_same_way(
+    client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession], suliko: FakeBackend
+) -> None:
+    suliko.people.append(person(MISHKA, "555777666", "Mishka", "T."))
+
+    result = await _invite_translator(
+        maker,
+        ACME,
+        _manager_session(ACME),
+        full_name="Mishka",
+        email="somewhere-else@example.com",
+        phone="+995 555 77-76-66",
+    )
+    assert result.invite_status == "pending"
+
+    me = (await client.get(f"{API}/portal/me", headers=as_user(MISHKA))).json()
+    assert me["organizations"] == [{"slug": "acme", "name": "Acme Translations"}]
+
+
+async def test_someone_elses_invite_makes_nobody_a_translator(
+    client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession], suliko: FakeBackend
+) -> None:
+    suliko.people.append(person(MISHKA, "mishka@example.com", "Mishka", "T."))
+    suliko.people.append(person(STRANGER, "stranger@example.com", "A", "Stranger"))
+    await _invite_translator(
+        maker, ACME, _manager_session(ACME), full_name="Mishka", email="mishka@example.com"
+    )
+
+    me = (await client.get(f"{API}/portal/me", headers=as_user(STRANGER))).json()
+    assert me == {"is_translator": False, "display_name": None, "organizations": []}
+    response = await client.get(f"{API}/portal/assignments", headers=as_user(STRANGER))
+    assert response.status_code == 403
+
+    async with maker() as db:
+        assert (await db.execute(select(PortalTranslator))).scalars().all() == []
+    assert await _invite_status(maker, "mishka@example.com") is InviteStatus.PENDING
+
+
+async def test_suliko_is_not_asked_while_no_invite_is_waiting(
+    client: httpx.AsyncClient, suliko: FakeBackend
+) -> None:
+    suliko.people.append(person(MISHKA, "mishka@example.com", "Mishka", "T."))
+
+    me = (await client.get(f"{API}/portal/me", headers=as_user(MISHKA))).json()
+
+    assert me["is_translator"] is False
+    assert suliko.directory_calls == 0
+
+
+async def test_a_staff_invite_does_not_make_a_translator(
+    client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession], suliko: FakeBackend
+) -> None:
+    """Being invited to work IN a bureau's Office is not being one of its translators."""
+    suliko.people.append(person(MISHKA, "mishka@example.com", "Mishka", "T."))
+    async with maker() as db:
+        db.add(
+            PortalAccountInvite(
+                tenant_id=ACME,
+                kind=InviteKind.STAFF,
+                full_name="Mishka",
+                email="mishka@example.com",
+                normalized_email="mishka@example.com",
+                status=InviteStatus.PENDING,
+            )
+        )
+        await db.commit()
+
+    me = (await client.get(f"{API}/portal/me", headers=as_user(MISHKA))).json()
+
+    assert me["is_translator"] is False
+    assert await _invite_status(maker, "mishka@example.com") is InviteStatus.PENDING
+
+
+async def test_an_invite_waits_while_suliko_cannot_be_asked(
+    client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession], suliko: FakeBackend
+) -> None:
+    suliko.people.append(person(MISHKA, "mishka@example.com", "Mishka", "T."))
+    await _invite_translator(
+        maker, ACME, _manager_session(ACME), full_name="Mishka", email="mishka@example.com"
+    )
+
+    suliko.directory_down = True
+    response = await client.get(f"{API}/portal/me", headers=as_user(MISHKA))
+    assert response.status_code == 200
+    assert response.json()["is_translator"] is False
+
+    suliko.directory_down = False
+    me = (await client.get(f"{API}/portal/me", headers=as_user(MISHKA))).json()
+    assert me["organizations"] == [{"slug": "acme", "name": "Acme Translations"}]
+
+
+async def test_a_cancelled_invite_is_not_claimed(
+    client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession], suliko: FakeBackend
+) -> None:
+    from suliko.api.v1 import translators as translators_api
+
+    suliko.people.append(person(MISHKA, "mishka@example.com", "Mishka", "T."))
+    await _invite_translator(
+        maker, ACME, _manager_session(ACME), full_name="Mishka", email="mishka@example.com"
+    )
+    with tenant_scope(ACME):
+        async with maker() as db:
+            session = _manager_session(ACME)
+            invites = await translators_api.list_translator_invites(db, session, session)
+            await translators_api.cancel_translator_invite(invites[0].id, db, session, session)
+            await db.commit()
+
+    me = (await client.get(f"{API}/portal/me", headers=as_user(MISHKA))).json()
+    assert me["is_translator"] is False
+
+
+async def test_two_requests_finding_the_same_invite_both_answer(
+    client: httpx.AsyncClient,
+    maker: async_sessionmaker[AsyncSession],
+    suliko: FakeBackend,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Orders page asks `/me` and `/assignments` at once. The slower of the
+    two finds the account already made, by the time the database says so."""
+    suliko.people.append(person(MISHKA, "mishka@example.com", "Mishka", "T."))
+    await _invite_translator(
+        maker, ACME, _manager_session(ACME), full_name="Mishka", email="mishka@example.com"
+    )
+    asked = suliko.get_user
+
+    async def other_request_gets_there_first(user_id: str) -> Any:
+        async with maker() as db:
+            db.add(
+                PortalTranslator(
+                    external_user_id=user_id,
+                    display_name="Mishka T.",
+                    email="mishka@example.com",
+                    is_active=True,
+                )
+            )
+            await db.commit()
+        return await asked(user_id)
+
+    monkeypatch.setattr(suliko, "get_user", other_request_gets_there_first)
+
+    response = await client.get(f"{API}/portal/me", headers=as_user(MISHKA))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["is_translator"] is True
+    async with maker() as db:
+        assert len((await db.execute(select(PortalTranslator))).scalars().all()) == 1
 
 
 # ── A bureau invites a staff member, matched against suliko.ge ──────────────
