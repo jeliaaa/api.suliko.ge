@@ -22,6 +22,7 @@ from suliko.db.session import dispose_engine
 from suliko.db.tenancy import install_tenant_filter
 from suliko.integrations.object_storage import close_object_storage, get_object_storage
 from suliko.integrations.suliko_backend import close_suliko_backend
+from suliko.integrations.suliko_translate import close_suliko_translator
 
 
 def migration_head() -> str:
@@ -133,6 +134,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
     await close_object_storage()
     await close_suliko_backend()
+    await close_suliko_translator()
     await dispose_engine()
 
 

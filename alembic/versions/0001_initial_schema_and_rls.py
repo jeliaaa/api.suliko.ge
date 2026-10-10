@@ -99,6 +99,8 @@ LATER_REVISION_TABLES = frozenset(
         "custom_options",
         # 0013
         "order_files",
+        # 0017
+        "document_translations",
     }
 )
 

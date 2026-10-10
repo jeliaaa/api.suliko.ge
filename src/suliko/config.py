@@ -275,6 +275,15 @@ class Settings(BaseSettings):
     #: its user-directory endpoints. A password check needs none.
     suliko_api_key: SecretStr = SecretStr("")
     suliko_api_timeout_seconds: float = 10.0
+    #: Suliko Translate from an order (`integrations/suliko_translate.py`).
+    #: Handing a file over uploads it twice, to suliko.ge and from there to the
+    #: model's file store, so these calls get far longer than a directory read.
+    suliko_translate_timeout_seconds: float = 120.0
+    #: suliko.ge takes files up to 20 MB; a larger one is refused here, before
+    #: the upload, with a message that says so.
+    suliko_translate_max_bytes: int = 20 * 1024 * 1024
+    #: The most an edited translation may weigh when it is saved back.
+    translation_html_max_bytes: int = 5 * 1024 * 1024
     #: Where a person resets a suliko.ge password — sent to those who ask to
     #: reset it here, since Office does not hold it.
     suliko_password_reset_url: str = "https://suliko.ge/login"  # noqa: S105 -- a URL

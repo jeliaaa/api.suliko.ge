@@ -47,6 +47,8 @@ LATER_REVISIONS = (
     "0015_invite_without_email.py",
     # A per-tenant number on orders and clients — see test_migration_0016.py.
     "0016_per_tenant_numbers.py",
+    # document_translations — see test_migration_0017.py.
+    "0017_document_translations.py",
 )
 
 
