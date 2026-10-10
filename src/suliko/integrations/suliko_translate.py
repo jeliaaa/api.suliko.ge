@@ -221,7 +221,10 @@ class HttpSulikoTranslator:
         except httpx.HTTPError as exc:
             log.error("suliko_translate_unreachable", error=type(exc).__name__, path=LANGUAGES_PATH)
             raise SulikoUnavailableError("Suliko Translate cannot be reached right now.") from exc
-        data = _json(response)
+        # suliko.ge wraps the list: {"languages": [...], "count": n, "message": ...}.
+        # A bare list is read too, should it ever drop the wrapper.
+        body = _json(response)
+        data = _field(body, "languages") if isinstance(body, dict) else body
         if response.status_code != 200 or not isinstance(data, list):
             raise self._unexpected(response, LANGUAGES_PATH)
         found = [

@@ -154,42 +154,61 @@ def match_language(
 
     suliko.ge knows a language by a number and two names; Office by a code and
     two names of the bureau's choosing. The names are what the two share, so
-    they are compared, English first, without regard to case or spacing.
+    they are compared, English first, without regard to case or spacing, and
+    without the word suliko.ge adds to most of its own ("English Language",
+    "პოლონური ენა").
     """
 
     def norm(value: str | None) -> str:
-        return " ".join((value or "").split()).casefold()
+        words = (value or "").casefold().split()
+        while words and words[-1] in _NAME_SUFFIXES:
+            words.pop()
+        return " ".join(words)
 
-    wanted = {norm(name_en), norm(name_ka), norm(_CODE_NAMES.get(code.lower()))} - {""}
+    wanted = {norm(name_en), norm(name_ka)}
+    wanted.update(norm(name) for name in _CODE_NAMES.get(code.lower(), ()))
+    wanted.discard("")
     for language in offered:
         if norm(language.name) in wanted or norm(language.name_geo) in wanted:
             return language
     return None
 
 
+#: What suliko.ge appends to a language's name, in either script.
+_NAME_SUFFIXES = frozenset({"language", "ენა"})
+
 #: What a code is called on suliko.ge, for a bureau that renamed its language
-#: ("Georgian (formal)") or wrote it in another script.
-_CODE_NAMES = {
-    "ka": "Georgian",
-    "en": "English",
-    "ru": "Russian",
-    "de": "German",
-    "fr": "French",
-    "es": "Spanish",
-    "it": "Italian",
-    "nl": "Dutch",
-    "pl": "Polish",
-    "pt": "Portuguese",
-    "tr": "Turkish",
-    "ar": "Arabic",
-    "uk": "Ukrainian",
-    "hy": "Armenian",
-    "az": "Azerbaijani",
-    "zh": "Chinese",
-    "he": "Hebrew",
-    "fa": "Persian",
-    "el": "Greek",
-    "ja": "Japanese",
+#: ("Georgian (formal)") or wrote it in another script. More than one name
+#: where suliko.ge spells it its own way ("Finish Language").
+_CODE_NAMES: dict[str, tuple[str, ...]] = {
+    "ka": ("Georgian",),
+    "en": ("English",),
+    "ru": ("Russian",),
+    "de": ("German",),
+    "fr": ("French",),
+    "es": ("Spanish",),
+    "it": ("Italian",),
+    "nl": ("Dutch",),
+    "pl": ("Polish",),
+    "pt": ("Portuguese",),
+    "tr": ("Turkish",),
+    "ar": ("Arabic",),
+    "uk": ("Ukrainian",),
+    "hy": ("Armenian",),
+    "az": ("Azerbaijani",),
+    "zh": ("Chinese",),
+    "he": ("Hebrew",),
+    "fa": ("Persian",),
+    "el": ("Greek",),
+    "ja": ("Japanese",),
+    "lv": ("Latvian",),
+    "sl": ("Slovenian",),
+    "sk": ("Slovak",),
+    "sr": ("Serbian",),
+    "ur": ("Urdu",),
+    "fi": ("Finnish", "Finish"),
+    "la": ("Latin",),
+    "ro": ("Romanian",),
 }
 
 
