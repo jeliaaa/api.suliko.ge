@@ -76,10 +76,10 @@ def test_an_override_cannot_exceed_the_plan() -> None:
     freelancer. The override rows survive, and must stop meaning anything.
     """
     effective = effective_permissions(
-        Role.STAFF, TenantPlan.FREELANCER, {"users.manage": True, "finance.read": True}
+        Role.STAFF, TenantPlan.FREELANCER, {"users.manage": True, "finance.transfer": True}
     )
     assert P.USERS_MANAGE not in effective
-    assert P.FINANCE_READ not in effective
+    assert P.FINANCE_TRANSFER not in effective
 
 
 @pytest.mark.parametrize("plan", list(TenantPlan))
