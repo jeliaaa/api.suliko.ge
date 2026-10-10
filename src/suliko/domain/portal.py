@@ -15,10 +15,11 @@ from typing import Literal
 
 from pydantic import EmailStr, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
-from sqlalchemy import or_, select
+from sqlalchemy import Select, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from suliko.core.errors import ConflictError, NotFoundError, ValidationError
+from suliko.integrations.suliko_backend import SulikoBackend, SulikoUnavailableError, SulikoUser
 from suliko.models.audit import ActorType
 from suliko.models.directory import Client, Translator
 from suliko.models.order import Order, OrderDocument
@@ -83,6 +84,32 @@ async def find_portal_translator(
             select(PortalTranslator).where(PortalTranslator.external_user_id == external_user_id)
         )
     ).scalar_one_or_none()
+
+
+async def portal_translator_for(platform_db: AsyncSession, person: SulikoUser) -> PortalTranslator:
+    """The portal account of a suliko.ge person, made the first time one is needed.
+
+    Normally a suliko.ge admin marks someone a translator before any bureau can
+    link them. A bureau that picks the account from the search, or invites the
+    address the person signs in with (`claim_invited_account`), is doing that
+    for its own purposes, so the row is made here, from what suliko.ge itself
+    says about them: the sign-in name (an address or a number, both proven at
+    registration), never the editable profile contacts.
+    """
+    row = await find_portal_translator(platform_db, person.id)
+    if row is not None:
+        # Whatever the admin recorded stays as it is, including a deactivation.
+        return row
+    row = PortalTranslator(
+        external_user_id=person.id,
+        display_name=(person.full_name or person.user_name)[:255],
+        email=person.email,
+        phone=person.phone,
+        is_active=True,
+    )
+    platform_db.add(row)
+    await platform_db.flush()
+    return row
 
 
 async def linked_organizations(
@@ -398,14 +425,15 @@ async def resolve_pending_invites(
 ) -> list[PortalAccountInvite]:
     """Link every pending invite that now matches this suliko.ge account.
 
-    Called from the two moments a match can newly come to exist:
+    Called from the moments a match can newly come to exist:
 
     - a suliko.ge admin marks an account a translator
       (`portal_admin.upsert_translator`) — every bureau that invited this
       address before the account existed is served at once;
-    - the translator opens their own portal (`portal.get_me`) — catches an
-      invite written AFTER the account already existed, which the admin path
-      above never sees.
+    - the translator opens their own portal (`portal.get_me`, or the list of
+      their orders) — catches an invite written AFTER the account already
+      existed, which the admin path above never sees. For someone nobody has
+      marked a translator, `claim_invited_account` makes the account first.
 
     Both read `normalized_email` / `normalized_phone`, which are indexed,
     rather than scanning in Python like `account_matches` — that one runs once
@@ -489,6 +517,67 @@ async def resolve_pending_invites(
 
     await platform_db.flush()
     return resolved
+
+
+def _a_pending_translator_invite() -> Select[tuple[int]]:
+    return (
+        select(PortalAccountInvite.id)
+        .where(
+            PortalAccountInvite.status == InviteStatus.PENDING,
+            PortalAccountInvite.kind == InviteKind.TRANSLATOR,
+        )
+        .limit(1)
+    )
+
+
+async def claim_invited_account(
+    platform_db: AsyncSession, backend: SulikoBackend, external_user_id: str
+) -> PortalTranslator | None:
+    """The portal account of someone a bureau invited before anyone had marked
+    them a translator, made now that they are here. None when no invite waits.
+
+    An invite by address links at once only to an account that already is a
+    translator. For anyone else it used to wait for a suliko.ge admin to mark
+    the account, which nobody knew to do: the invite stayed pending and the
+    person's Orders tab stayed empty, whatever the invite email had promised.
+
+    The bureau asked for this person by the address or the number they sign in
+    with, so that is what is compared. suliko.ge is asked who is calling, and
+    the sign-in name it answers with was proven at registration; the editable
+    profile contacts are never looked at.
+
+    Only a pending TRANSLATOR invite makes someone a translator: a staff invite
+    is for Suliko Office, not for the portal. Linking is left to
+    `resolve_pending_invites`, which the caller runs next, as it does for any
+    translator who shows up.
+
+    suliko.ge is asked only while some bureau has an invite waiting. If it
+    cannot be asked, the answer is "nobody" for now: the next visit asks again.
+    """
+    if not backend.enabled:
+        return None
+    if (await platform_db.execute(_a_pending_translator_invite())).first() is None:
+        return None
+
+    try:
+        person = await backend.get_user(external_user_id)
+    except SulikoUnavailableError:
+        return None
+    if person is None:
+        return None
+
+    conditions = []
+    if (email := normalize_email(person.email)) is not None:
+        conditions.append(PortalAccountInvite.normalized_email == email)
+    if (phone := normalize_phone(person.phone)) is not None:
+        conditions.append(PortalAccountInvite.normalized_phone == phone)
+    if not conditions:
+        return None
+    waiting = await platform_db.execute(_a_pending_translator_invite().where(or_(*conditions)))
+    if waiting.first() is None:
+        return None
+
+    return await portal_translator_for(platform_db, person)
 
 
 # ── Assignments inside one bureau ───────────────────────────────────────────

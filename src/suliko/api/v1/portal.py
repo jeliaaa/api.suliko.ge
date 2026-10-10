@@ -27,11 +27,12 @@ from datetime import date, datetime
 from typing import Annotated, Literal
 
 import structlog
-from fastapi import APIRouter, File, Path, UploadFile
+from fastapi import APIRouter, Depends, File, Path, UploadFile
 from fastapi import status as http_status
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import undefer
 
@@ -41,6 +42,7 @@ from suliko.api.portal_deps import (
     PortalFileCaller,
     PortalIdentity,
     Storage,
+    TenantSessionFactory,
     TenantSessions,
 )
 from suliko.api.v1._files import read_upload
@@ -68,11 +70,13 @@ from suliko.domain.portal import (
     AssignedOrder,
     LinkedOrganization,
     assigned_orders,
+    claim_invited_account,
     find_portal_translator,
     linked_organizations,
     resolve_pending_invites,
 )
 from suliko.integrations.object_storage import StorageError
+from suliko.integrations.suliko_backend import SulikoBackend, get_suliko_backend
 from suliko.models.audit import ActorType
 from suliko.models.order_file import OrderFile
 from suliko.models.portal import (
@@ -91,6 +95,8 @@ SlugPath = Annotated[str, Path(pattern=r"^[a-z0-9][a-z0-9-]{1,62}$")]
 FileIdPath = Annotated[str, Path(pattern=r"^[A-Za-z0-9_-]{8,100}$")]
 
 MAX_LANGUAGE_PAIRS = 20
+
+Suliko = Annotated[SulikoBackend, Depends(get_suliko_backend)]
 
 
 # ── Schemas ─────────────────────────────────────────────────────────────────
@@ -322,21 +328,51 @@ def _file_out(row: OrderFile, identity: PortalIdentity) -> OrderFileOut:
 # ── Who am I ────────────────────────────────────────────────────────────────
 
 
-@router.get("/me", response_model=PortalMe)
-async def get_me(identity: PortalCaller, db: PlatformDb, tenants: TenantSessions) -> PortalMe:
-    """Never 403: a user who is not a translator simply gets no Orders tab.
+async def _translator_here(
+    db: AsyncSession,
+    tenants: TenantSessionFactory,
+    backend: SulikoBackend,
+    identity: PortalIdentity,
+) -> PortalTranslator | None:
+    """The caller's active portal account, with every invite that was waiting
+    for them linked. None for someone who is not a translator.
 
-    Also where a bureau's invite catches up with an account that already
-    existed when the invite was written — `resolve_pending_invites` runs here
-    because this is the one moment we know a translator is present and active.
-    A GET that can write is unusual; it is idempotent, it is one indexed
-    SELECT on the common case of nothing pending, and there is no other signal
-    to hang this on short of a scheduler.
+    Where a bureau's invite catches up with the person it was written for:
+    `claim_invited_account` for someone nobody had marked a translator yet,
+    `resolve_pending_invites` for an invite written after the account existed.
+    Both run here because this is the one moment we know the person is
+    present. A GET that can write is unusual; it is idempotent, it is one
+    indexed SELECT on the common case of nothing pending, and there is no
+    other signal to hang this on short of a scheduler.
     """
-    translator = await find_portal_translator(db, identity.user_id)
-    if translator is None or not translator.is_active:
+    try:
+        translator = await find_portal_translator(db, identity.user_id)
+        if translator is None:
+            translator = await claim_invited_account(db, backend, identity.user_id)
+        if translator is None or not translator.is_active:
+            return None
+        await resolve_pending_invites(
+            db, tenants, translator, actor_type=ActorType.PORTAL_TRANSLATOR
+        )
+        return translator
+    except IntegrityError:
+        # The Orders page asks `/me` and `/assignments` at once, so two requests
+        # can find the same invite waiting. The database lets one of them write
+        # and refuses the other only after the first has committed: what this
+        # request wanted is already there to be read.
+        await db.rollback()
+        translator = await find_portal_translator(db, identity.user_id)
+        return translator if translator is not None and translator.is_active else None
+
+
+@router.get("/me", response_model=PortalMe)
+async def get_me(
+    identity: PortalCaller, db: PlatformDb, tenants: TenantSessions, backend: Suliko
+) -> PortalMe:
+    """Never 403: a user who is not a translator simply gets no orders."""
+    translator = await _translator_here(db, tenants, backend, identity)
+    if translator is None:
         return PortalMe(is_translator=False)
-    await resolve_pending_invites(db, tenants, translator, actor_type=ActorType.PORTAL_TRANSLATOR)
     organizations = await linked_organizations(db, translator.id)
     return PortalMe(
         is_translator=True,
@@ -350,9 +386,18 @@ async def get_me(identity: PortalCaller, db: PlatformDb, tenants: TenantSessions
 
 @router.get("/assignments", response_model=list[AssignedOrderOut])
 async def list_assignments(
-    identity: PortalCaller, db: PlatformDb, tenants: TenantSessions
+    identity: PortalCaller, db: PlatformDb, tenants: TenantSessions, backend: Suliko
 ) -> list[AssignedOrderOut]:
-    translator = await _active_translator(db, identity)
+    """Everything bureaus have assigned to the caller.
+
+    Looks for waiting invites itself (`_translator_here`) rather than counting
+    on `/me` having been asked first: this is the page a just-invited
+    translator opens, and it must not say "nobody has added you" on the first
+    visit and list the orders on the second.
+    """
+    translator = await _translator_here(db, tenants, backend, identity)
+    if translator is None:
+        raise PermissionDeniedError("Your account is not set up as a translator.")
     result: list[AssignedOrderOut] = []
 
     for organization in await linked_organizations(db, translator.id):
