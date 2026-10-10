@@ -64,6 +64,7 @@ from suliko.models.reference import (
     TenantSettings,
 )
 from suliko.models.tenant import Tenant, TenantStatus
+from suliko.models.translation import DocumentTranslation, TranslationStatus
 from suliko.models.user import (
     Account,
     LoginAttempt,
@@ -90,6 +91,7 @@ __all__ = [
     "CompanyBankAccount",
     "CopyType",
     "CustomOption",
+    "DocumentTranslation",
     "DocumentType",
     "Expense",
     "FileKind",
@@ -130,6 +132,7 @@ __all__ = [
     "Tenant",
     "TenantSettings",
     "TenantStatus",
+    "TranslationStatus",
     "Translator",
     "TranslatorLanguagePair",
     "TranslatorPayment",
