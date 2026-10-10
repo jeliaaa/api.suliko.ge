@@ -20,6 +20,7 @@ can still restore for the retention period.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import PurePosixPath
@@ -369,6 +370,42 @@ async def translate_file(
 # ── Following them ──────────────────────────────────────────────────────────
 
 
+# ── The file that is kept ───────────────────────────────────────────────────
+
+UTF8_META = '<meta charset="utf-8">'
+
+#: Any declaration of a character set, in either of the two ways HTML has.
+_CHARSET_META = re.compile(r"<meta\b[^>]*\bcharset\s*=[^>]*>", re.IGNORECASE)
+_DOCTYPE = re.compile(r"\s*<!doctype\b", re.IGNORECASE)
+_HTML_OPEN = re.compile(r"<html\b[^>]*>", re.IGNORECASE)
+_HEAD_OPEN = re.compile(r"<head\b[^>]*>", re.IGNORECASE)
+_BOM = "﻿"
+
+
+def html_document(html: str) -> str:
+    """The translation as a whole HTML document that says it is UTF-8.
+
+    suliko.ge sends a fragment (a `<div>` and what is in it) and the page that
+    corrects it sends a document with an empty head. Neither says which
+    character set it is in. Shown from Office that does not matter, the
+    response says so; but the file is also downloaded and emailed to clients,
+    and opened from a disk or a mail preview with nothing to go by, Georgian
+    comes out as garbage in a viewer that does not guess.
+
+    The file is always stored as UTF-8, so a declaration of anything else is
+    wrong by now and is replaced. Running this on its own output changes
+    nothing.
+    """
+    text = _CHARSET_META.sub("", html.lstrip(_BOM))
+    if head := _HEAD_OPEN.search(text):
+        text = text[: head.end()] + UTF8_META + text[head.end() :]
+    elif root := _HTML_OPEN.search(text):
+        text = f"{text[: root.end()]}<head>{UTF8_META}</head>{text[root.end() :]}"
+    else:
+        text = f"<html><head>{UTF8_META}</head><body>\n{text.strip()}\n</body></html>"
+    return text if _DOCTYPE.match(text) else f"<!doctype html>\n{text}"
+
+
 def _result_name(source_name: str | None, target_language: str) -> str:
     stem = PurePosixPath(source_name or "translation").stem or "translation"
     return f"{stem[:180]} ({target_language.upper()}).html"
@@ -413,8 +450,11 @@ async def _collect(
             document=document,
             kind=FileKind.TRANSLATION,
             file_name=_result_name(source.file_name if source else None, row.target_language),
-            content=result.content,
-            # Whatever suliko.ge labels it, what it sends is the HTML it built.
+            # Whatever suliko.ge labels it, what it sends is the HTML it built,
+            # in UTF-8. Kept as a document that says so.
+            content=html_document(result.content.decode("utf-8-sig", errors="replace")).encode(
+                "utf-8"
+            ),
             content_type=HTML,
             uploaded_by=f"suliko:{row.requested_by_user_id or 0}",
         )
@@ -523,7 +563,7 @@ async def save_translation(
     if current.kind is not FileKind.TRANSLATION or current.content_type != HTML:
         raise ConflictError("Only a translation made here can be edited here.")
 
-    content = payload.html.encode("utf-8")
+    content = html_document(payload.html).encode("utf-8")
     if len(content) > get_settings().translation_html_max_bytes:
         raise PayloadTooLargeError("This translation is too large to save.")
 
