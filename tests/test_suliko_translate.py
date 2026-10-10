@@ -229,18 +229,50 @@ async def test_a_result_that_is_not_ready_is_not_a_file() -> None:
 
 
 async def test_languages_are_read_once_and_remembered() -> None:
+    # The shape suliko.ge really answers with (read off the live endpoint on
+    # 2026-10-10): the list sits inside an object, and the names carry a word
+    # of their own and the odd stray space.
     client, seen = _client(
         lambda _: _json(
-            200, [{"id": 1, "name": "Georgian", "nameGeo": "ქართული"}, {"Id": 2, "Name": "English"}]
+            200,
+            {
+                "languages": [
+                    {"id": 1, "name": "Georgian Language", "nameGeo": "ქართული"},
+                    {"id": 22, "name": " Hebrew Language", "nameGeo": "ივრითი"},
+                    {"Id": 2, "Name": "English Language"},
+                    {"id": "x", "name": "No number, so not a language"},
+                ],
+                "count": 3,
+                "message": "Available language IDs for translation requests",
+            },
         )
     )
     first = await client.languages()
-    assert first == [SulikoLanguage(1, "Georgian", "ქართული"), SulikoLanguage(2, "English", "")]
+    assert first == [
+        SulikoLanguage(1, "Georgian Language", "ქართული"),
+        SulikoLanguage(22, "Hebrew Language", "ივრითი"),
+        SulikoLanguage(2, "English Language", ""),
+    ]
     assert await client.languages() == first
     assert len(seen) == 1
     # The public list: no key is needed, so none is sent.
     assert seen[0].url.path == "/api/Language/public"
     assert KEY_HEADER not in seen[0].headers
+
+
+async def test_a_bare_list_of_languages_is_read_too() -> None:
+    client, _ = _client(lambda _: _json(200, [{"id": 1, "name": "Georgian", "nameGeo": "ქართული"}]))
+    assert await client.languages() == [SulikoLanguage(1, "Georgian", "ქართული")]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{"error": "boom"}, {"languages": "none"}, "nonsense", None],
+)
+async def test_languages_in_no_shape_we_know_are_an_outage(body: Any) -> None:
+    client, _ = _client(lambda _: _json(200, body))
+    with pytest.raises(SulikoUnavailableError):
+        await client.languages()
 
 
 async def test_unconfigured_says_so_for_every_call() -> None:

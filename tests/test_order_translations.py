@@ -601,6 +601,100 @@ def test_languages_are_matched_by_name_then_code(
     assert match_language(code, name_en, name_ka, [GEORGIAN, ENGLISH]) == expected
 
 
+#: suliko.ge's languages as its public list gave them on 2026-10-10, spelling
+#: and all: most names end in "Language", two Georgian ones in "ენა", Finnish
+#: is "Finish", and Hebrew and Slovenian are written differently from Office.
+SULIKO_GE_LANGUAGES = [
+    SulikoLanguage(1, "Georgian Language", "ქართული"),
+    SulikoLanguage(2, "English Language", "ინგლისური"),
+    SulikoLanguage(4, "Latvian Language", "ლატვიური"),
+    SulikoLanguage(5, "Slovenian Language", "სლოვენიური"),
+    SulikoLanguage(6, "Azerbaijani Language", "აზერბაიჯანული"),
+    SulikoLanguage(7, "Turkish Language", "თურქული"),
+    SulikoLanguage(8, "German Language", "გერმანული"),
+    SulikoLanguage(9, "Armenian Language", "სომხური"),
+    SulikoLanguage(13, "Italian Language", "იტალიური"),
+    SulikoLanguage(12, "French Language", "ფრანგული"),
+    SulikoLanguage(15, "Latin", "ლათინური"),
+    SulikoLanguage(17, "Japanese", "იაპონური"),
+    SulikoLanguage(18, "Chinese", "ჩინური"),
+    SulikoLanguage(19, "Serbian language", "სერბული"),
+    SulikoLanguage(20, "Urdu Language", "ურდუ"),
+    SulikoLanguage(21, "Spanish Language", "ესპანური"),
+    SulikoLanguage(3, "Greek Language", "ბერძნული"),
+    SulikoLanguage(11, "Slovak Language", "სლოვაკური"),
+    SulikoLanguage(16, "Russian Language", "რუსული"),
+    SulikoLanguage(22, "Hebrew Language", "ივრითი"),
+    SulikoLanguage(23, "Portuguese Language", "პორტუგალიური"),
+    SulikoLanguage(24, "Finish Language", "ფინური"),
+    SulikoLanguage(31, "Ukrainian Language", "უკრაინული"),
+    SulikoLanguage(32, "Polish Language", "პოლონური ენა"),
+    SulikoLanguage(33, "Arabic Language", "არაბული ენა"),
+    SulikoLanguage(34, "Romanian Language", "რუმინული"),
+]
+
+#: Which of them each language Office ships with is.
+SEEDED_TO_SULIKO_GE = {
+    "ka": 1,
+    "en": 2,
+    "ru": 16,
+    "de": 8,
+    "fr": 12,
+    "it": 13,
+    "es": 21,
+    "pt": 23,
+    "tr": 7,
+    "az": 6,
+    "hy": 9,
+    "uk": 31,
+    "pl": 32,
+    "ar": 33,
+    "he": 22,
+    "zh": 18,
+    "ja": 17,
+    "el": 3,
+    "lv": 4,
+    "sl": 5,
+    "sk": 11,
+    "sr": 19,
+    "ur": 20,
+    "fi": 24,
+    "la": 15,
+}
+
+
+def test_every_language_office_ships_with_finds_its_own_on_suliko_ge() -> None:
+    from suliko.domain.reference_seed import LANGUAGES
+
+    assert {code for code, _, _ in LANGUAGES} == set(SEEDED_TO_SULIKO_GE)
+    for code, name_en, name_ka in LANGUAGES:
+        found = match_language(code, name_en, name_ka, SULIKO_GE_LANGUAGES)
+        assert found is not None, code
+        assert found.id == SEEDED_TO_SULIKO_GE[code], code
+
+
+@pytest.mark.parametrize(
+    ("code", "name_en", "name_ka", "expected_id"),
+    [
+        # By the English name alone, with suliko.ge's "Language" set aside.
+        ("zz", "Polish", "", 32),
+        # By the Georgian name alone, with its "ენა" set aside.
+        ("zz", "", "არაბული", 33),
+        # A renamed language, by its code. suliko.ge's own spelling of Finnish.
+        ("fi", "Suomi", "", 24),
+        ("ro", "Rumanian", "", 34),
+        # A word that only looks like the suffix is not dropped from the middle.
+        ("zz", "Language", "", None),
+        ("xx", "Klingon", "კლინგონური", None),
+    ],
+)
+def test_names_are_matched_as_suliko_ge_really_writes_them(
+    code: str, name_en: str, name_ka: str, expected_id: int | None
+) -> None:
+    found = match_language(code, name_en, name_ka, SULIKO_GE_LANGUAGES)
+    assert (found.id if found else None) == expected_id
+
+
 def test_the_unsupported_file_error_is_one_the_form_can_tell_apart() -> None:
     assert UnsupportedFileError("x").error_code == "unsupported_file"
     assert InsufficientBalanceError("x").status_code == 402
