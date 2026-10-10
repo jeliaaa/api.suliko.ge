@@ -184,6 +184,115 @@ async def test_upload_list_download_remove(
         assert on_disk.exists()
 
 
+async def test_a_file_moves_to_the_other_side_and_takes_a_new_name(
+    db: AsyncSession, tmp_path: Path, audit: list[dict[str, Any]]
+) -> None:
+    storage = LocalDiskStorage(str(tmp_path))
+    staff = Staff(user_id=7, tenant_id=ACME)
+    scan = b"%PDF-1.7 scan"
+
+    with tenant_scope(ACME):
+        out = await order_files.upload_file(
+            100,
+            1000,
+            _upload("scan.pdf", scan),
+            db,
+            staff,
+            storage,
+            None,  # type: ignore[arg-type]
+            kind=FileKind.SOURCE,
+        )
+        on_disk = tmp_path / f"tenants/{ACME}/orders/100/documents/1000/{out.id}"
+
+        moved = await order_files.update_file(
+            100,
+            1000,
+            out.id,
+            order_files.FileChange(kind=FileKind.TRANSLATION),
+            db,
+            staff,
+            None,  # type: ignore[arg-type]
+        )
+        assert moved.kind is FileKind.TRANSLATION
+        assert moved.name == "scan.pdf"
+
+        # The extension stays, whatever is typed; a path does not get in.
+        renamed = await order_files.update_file(
+            100,
+            1000,
+            out.id,
+            order_files.FileChange(name="..\\..\\passport, signed"),
+            db,
+            staff,
+            None,  # type: ignore[arg-type]
+        )
+        assert renamed.name == "passport, signed.pdf"
+        assert renamed.kind is FileKind.TRANSLATION
+
+        # Same id, same bytes, same place on disk: only the row changed.
+        listed = await order_files.list_files(100, 1000, db, None)  # type: ignore[arg-type]
+        assert [(f.id, f.kind, f.name) for f in listed] == [
+            (out.id, FileKind.TRANSLATION, "passport, signed.pdf")
+        ]
+        assert on_disk.read_bytes() == scan
+
+        assert [e["action"] for e in audit] == [
+            "order.file_uploaded",
+            "order.file_changed",
+            "order.file_changed",
+        ]
+        assert audit[1]["before"]["kind"] == "source"
+        assert audit[1]["after"]["kind"] == "translation"
+
+        # Asking for what is already so writes no audit line.
+        await order_files.update_file(
+            100,
+            1000,
+            out.id,
+            order_files.FileChange(kind=FileKind.TRANSLATION),
+            db,
+            staff,
+            None,  # type: ignore[arg-type]
+        )
+        assert len(audit) == 3
+
+
+def test_a_file_change_must_change_something() -> None:
+    with pytest.raises(ValueError, match="Nothing to change"):
+        order_files.FileChange()
+
+
+async def test_another_bureau_cannot_change_the_file(db: AsyncSession, tmp_path: Path) -> None:
+    storage = LocalDiskStorage(str(tmp_path))
+    with tenant_scope(ACME):
+        out = await order_files.upload_file(
+            100,
+            1000,
+            _upload("a.pdf", b"acme"),
+            db,
+            Staff(1, ACME),
+            storage,
+            None,  # type: ignore[arg-type]
+        )
+
+    with tenant_scope(GLOBEX):
+        for order_id, document_id in ((200, 2000), (100, 1000)):
+            with pytest.raises(NotFoundError):
+                await order_files.update_file(
+                    order_id,
+                    document_id,
+                    out.id,
+                    order_files.FileChange(name="theirs.pdf"),
+                    db,
+                    Staff(2, GLOBEX),
+                    None,  # type: ignore[arg-type]
+                )
+
+    with tenant_scope(ACME):
+        listed = await order_files.list_files(100, 1000, db, None)  # type: ignore[arg-type]
+        assert [f.name for f in listed] == ["a.pdf"]
+
+
 async def test_another_bureau_cannot_reach_the_file(db: AsyncSession, tmp_path: Path) -> None:
     storage = LocalDiskStorage(str(tmp_path))
     with tenant_scope(ACME):

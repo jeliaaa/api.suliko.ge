@@ -15,13 +15,14 @@ Tenant-scoped through the normal staff session, like every other Suliko Office r
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import PurePosixPath
 from typing import Annotated
 
 import structlog
 from fastapi import APIRouter, Depends, File, Path, UploadFile
 from fastapi import status as http_status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from suliko.api.deps import CurrentSession, Db, require
@@ -203,6 +204,85 @@ async def download_file(
         media_type=safe_content_type(row.content_type),
         headers={**attachment_headers(row.file_name), "Content-Length": str(row.size_bytes)},
     )
+
+
+class FileChange(BaseModel):
+    """What staff may change about a stored file: its side, and its name."""
+
+    kind: FileKind | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+
+    @model_validator(mode="after")
+    def _something_to_change(self) -> FileChange:
+        if self.kind is None and self.name is None:
+            raise ValueError("Nothing to change: give a kind, a name, or both.")
+        return self
+
+
+def _renamed(current: str, wanted: str) -> str:
+    """`wanted` as a safe name that keeps the extension `current` has.
+
+    The extension is how the person downloading it knows what opens the file,
+    and the bytes have not changed: "passport.pdf" renamed to "client scan"
+    stays a ".pdf".
+    """
+    name = safe_file_name(wanted)
+    suffix = PurePosixPath(current).suffix
+    if suffix and not name.lower().endswith(suffix.lower()):
+        name = safe_file_name(f"{name[: 200 - len(suffix)]}{suffix}")
+    return name
+
+
+@router.patch(
+    "/{order_id}/documents/{document_id}/files/{file_id}",
+    response_model=StaffFileOut,
+)
+async def update_file(
+    order_id: int,
+    document_id: int,
+    file_id: FileIdPath,
+    payload: FileChange,
+    db: Db,
+    session: CurrentSession,
+    _: Annotated[object, Depends(require(Permission.ORDERS_WRITE))],
+) -> StaffFileOut:
+    """Move a file between Source and Translation, or rename it.
+
+    A file dropped in the wrong column used to have one remedy: delete it and
+    upload it again. Neither change touches the bytes or where they are kept
+    (the storage key names the document and the file, not the side), so this
+    is a row update and nothing else.
+
+    A file kept in the Order Vault is left as it was filed: the vault holds
+    its own record of the name and the side, and this API cannot rewrite it.
+    """
+    await _document(db, order_id, document_id)
+    row = await get_document_file(db, document_id, file_id)
+    if vault_order(row) is not None:
+        raise ConflictError("This file is kept in the Order Vault, where it stays as it was filed.")
+
+    before = {"document_id": document_id, "kind": row.kind.value, "file_name": row.file_name}
+    if payload.kind is not None:
+        row.kind = payload.kind
+    if payload.name is not None:
+        row.file_name = _renamed(row.file_name, payload.name)
+    after = {"document_id": document_id, "kind": row.kind.value, "file_name": row.file_name}
+    if after == before:
+        return _out(row)
+    await db.flush()
+
+    from suliko.core.audit import record
+
+    await record(
+        db,
+        session,
+        action="order.file_changed",
+        entity_type="order",
+        entity_id=order_id,
+        before=before,
+        after=after,
+    )
+    return _out(row)
 
 
 @router.delete(

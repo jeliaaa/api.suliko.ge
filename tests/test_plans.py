@@ -61,12 +61,8 @@ def test_freelancer_is_a_strict_subset_of_bureau() -> None:
     [
         # No employees: nobody to invite, nobody to manage.
         P.USERS_MANAGE,
-        # No payroll and no bureau books.
-        P.FINANCE_READ,
-        P.FINANCE_RECORD_PAYMENT,
-        P.FINANCE_REFUND,
+        # No bank connection to send a transfer through.
         P.FINANCE_TRANSFER,
-        P.FINANCE_EXPENSES,
         # A freelancer IS the translator; there is no roster to keep.
         P.TRANSLATORS_READ,
         P.TRANSLATORS_WRITE,
@@ -90,6 +86,11 @@ def test_the_freelancer_plan_withholds(permission: Permission) -> None:
         P.NOTARIES_WRITE,
         P.REPORTS_READ,
         P.REPORTS_PROFIT,
+        # A sole trader is paid too: they record it, and undo their own typo.
+        P.FINANCE_READ,
+        P.FINANCE_RECORD_PAYMENT,
+        P.FINANCE_REFUND,
+        P.FINANCE_EXPENSES,
         P.SETTINGS_MANAGE,
         # They own their own tenant, so they can upgrade without support.
         P.TENANT_MANAGE,
@@ -98,7 +99,7 @@ def test_the_freelancer_plan_withholds(permission: Permission) -> None:
 )
 def test_the_freelancer_plan_grants(permission: Permission) -> None:
     """The tabs from the spec: Dashboard, Translations, Clients, Notaries,
-    Calculator, Reports, Settings."""
+    Calculator, Reports, Finances, Settings."""
     assert permission in permissions_for_plan(TenantPlan.FREELANCER)
 
 

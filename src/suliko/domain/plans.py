@@ -21,15 +21,25 @@ grants; the plan is what withholds `users.manage`.
 ## Freelancer
 
 One person, no employees, no payroll. The tabs are Dashboard, Translations,
-Clients, Notaries, Calculator, Reports and Settings; they connect no external
-services (order file storage is built in, for every plan). They are still the
-OWNER of their tenant — they can change their own settings and their own
-billing — they simply have nobody to manage and nobody to pay.
+Clients, Notaries, Calculator, Reports, Finances and Settings; they connect no
+external services (order file storage is built in, for every plan). They are
+still the OWNER of their tenant — they can change their own settings and
+their own billing — they simply have nobody to manage.
 
-Note what this deliberately withholds: `finance.*`. A freelancer invoices
-through the Translations screen and the invoice document; the Finances screen
-is about paying translators and reconciling a bureau's books, which is not a
-thing a sole trader does here. If that turns out to be wrong it is one line.
+They do take money and they do have costs, so they may record both:
+`finance.read`, `finance.record_payment`, `finance.refund` and
+`finance.expenses`. This plan used to withhold all of `finance.*`, on the
+reasoning that a freelancer invoices and nothing more. That left a sole trader
+with an invoice button and no way to say "this client paid me": every order
+stayed unpaid for ever, and the dashboard's "awaiting payment" only ever
+grew. Refund comes with it because a freelancer has no admin to ask when they
+type 1000 for 100; here it only ever means deleting a record made in error.
+Expenses come with it because their profit report already subtracts them: a
+courier or a bank fee that cannot be entered makes that figure too kind.
+
+Still withheld: `finance.transfer` (an outbound bank transfer needs a bank
+connection this plan cannot make). Paying a translator needs no withholding
+of its own: with no `translators.*` there is nobody on an order to pay.
 
 ## A null plan
 
@@ -78,6 +88,13 @@ _FREELANCER: frozenset[Permission] = frozenset(
         P.NOTARIES_WRITE,
         P.REPORTS_READ,
         P.REPORTS_PROFIT,
+        # What a client paid them, and the notary's fee they paid out of it.
+        P.FINANCE_READ,
+        P.FINANCE_RECORD_PAYMENT,
+        # Undoing their own mistake: there is no admin above them to do it.
+        P.FINANCE_REFUND,
+        # A courier, a bank fee: what the profit figure is already net of.
+        P.FINANCE_EXPENSES,
         P.SETTINGS_MANAGE,
         # They own the tenant even though they are its only member.
         P.TENANT_MANAGE,
