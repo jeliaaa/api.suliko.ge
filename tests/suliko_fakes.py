@@ -153,3 +153,55 @@ class FakeBackend:
 
     async def aclose(self) -> None:
         return None
+
+
+# ── Suliko Translate ────────────────────────────────────────────────────────
+
+
+class FakeTranslator:
+    """suliko.ge's translator, as the translation routes see it. It records
+    what it was asked and answers from what a test sets on it."""
+
+    enabled = True
+
+    def __init__(self, *, balance: str | None = "10", pages: int = 3) -> None:
+        from decimal import Decimal
+
+        from suliko.integrations.suliko_translate import JobStatus, SulikoLanguage
+
+        self.balance = Decimal(balance) if balance is not None else None
+        self.pages = pages
+        self.offered = [
+            SulikoLanguage(1, "Georgian", "ქართული"),
+            SulikoLanguage(2, "English", "ინგლისური"),
+        ]
+        self.state = JobStatus("processing", 40)
+        self.html = "<div><p>გამარჯობა</p></div>".encode()
+        self.prepared: list[tuple[str, str, bytes]] = []
+        self.started: list[tuple[str, dict[str, object]]] = []
+
+    async def aclose(self) -> None:
+        return None
+
+    async def languages(self) -> list[object]:
+        return list(self.offered)
+
+    async def prepare(
+        self, user_id: str, *, file_name: str, content_type: str, content: bytes
+    ) -> object:
+        from suliko.integrations.suliko_translate import PreparedFile
+
+        self.prepared.append((user_id, file_name, content))
+        return PreparedFile("files/abc", "application/pdf", self.pages, self.balance)
+
+    async def start(self, user_id: str, prepared: object, **asked: object) -> str:
+        self.started.append((user_id, asked))
+        return f"job-{len(self.started)}"
+
+    async def status(self, job_id: str) -> object:
+        return self.state
+
+    async def result(self, job_id: str) -> object:
+        from suliko.integrations.suliko_translate import TranslatedFile
+
+        return TranslatedFile(self.html, "text/html", "translated.html")

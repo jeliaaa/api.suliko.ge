@@ -1,6 +1,9 @@
 """Suliko Translate from an order: a document's source file in, its translation out.
 
 One click on a source file starts it (`POST .../files/{file_id}/translate`).
+The translator a document is assigned to can do the same from suliko.ge's
+Orders tab (`api/v1/portal.py`), with what is here: `start_translation`,
+`refresh_translation` and the request and answer shapes.
 The work is done on suliko.ge and paid for there, from the page balance of the
 person who clicked: Office names them by the suliko.ge account they sign in
 with, so there is nothing to set up and nobody else is charged. A person whose
@@ -21,15 +24,17 @@ can still restore for the retention period.
 from __future__ import annotations
 
 import re
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import PurePosixPath
-from typing import Annotated
+from typing import Annotated, Literal
 
 import structlog
 from fastapi import APIRouter, Depends
 from fastapi import status as http_status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,6 +55,7 @@ from suliko.integrations.object_storage import ObjectStorage, StorageError
 from suliko.integrations.suliko_backend import SulikoUnavailableError
 from suliko.integrations.suliko_translate import (
     InsufficientBalanceError,
+    NameSpelling,
     SulikoAccountMissingError,
     SulikoLanguage,
     SulikoTranslator,
@@ -79,9 +85,46 @@ class LanguageNotAvailableError(ValidationError):
     error_code = "language_not_available"
 
 
+#: suliko.ge's own limit on the notes (`DocumentController.MaxInstructionsLength`).
+MAX_INSTRUCTIONS = 4000
+MAX_NAMES = 100
+
+
+class NameIn(BaseModel):
+    """How one proper name is to be written in the translation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    original: str = Field(min_length=1, max_length=200)
+    translation: str = Field(min_length=1, max_length=200)
+    type: Literal["Person", "Organization"] = "Person"
+
+
 class TranslateIn(BaseModel):
     #: Ask the model to rebuild tables, colours and emphasis. Slower.
     rich: bool = False
+    #: The person's own notes for this translation: terms, tone, what to leave
+    #: as it is. suliko.ge adds them to its prompt after its own requirements.
+    instructions: str | None = Field(default=None, max_length=MAX_INSTRUCTIONS)
+    #: Spellings fixed for names, so the model does not choose its own.
+    names: list[NameIn] = Field(default_factory=list, max_length=MAX_NAMES)
+
+    @field_validator("instructions")
+    @classmethod
+    def _no_blank_notes(cls, value: str | None) -> str | None:
+        return (value or "").strip() or None
+
+    @field_validator("names")
+    @classmethod
+    def _no_blank_names(cls, value: list[NameIn]) -> list[NameIn]:
+        """A row of the form left half filled in is dropped, not refused."""
+        return [
+            name.model_copy(
+                update={"original": name.original.strip(), "translation": name.translation.strip()}
+            )
+            for name in value
+            if name.original.strip() and name.translation.strip()
+        ]
 
 
 class SaveContentIn(BaseModel):
@@ -108,7 +151,7 @@ class TranslationOut(BaseModel):
     balance: Decimal | None = None
 
 
-async def _public_ids(db: AsyncSession, rows: list[DocumentTranslation]) -> dict[int, str]:
+async def public_file_ids(db: AsyncSession, rows: list[DocumentTranslation]) -> dict[int, str]:
     ids = {i for row in rows for i in (row.source_file_id, row.result_file_id) if i is not None}
     if not ids:
         return {}
@@ -122,7 +165,7 @@ async def _public_ids(db: AsyncSession, rows: list[DocumentTranslation]) -> dict
     return {row[0]: row[1] for row in found}
 
 
-def _translation_out(
+def translation_out(
     row: DocumentTranslation,
     files: dict[int, str],
     *,
@@ -235,25 +278,43 @@ async def _suliko_user_id(db: AsyncSession, session: AuthenticatedSession) -> st
 # ── Starting one ────────────────────────────────────────────────────────────
 
 
-@router.post(
-    "/{order_id}/documents/{document_id}/files/{file_id}/translate",
-    response_model=TranslationOut,
-    status_code=http_status.HTTP_201_CREATED,
-)
-async def translate_file(
-    order_id: int,
-    document_id: int,
-    file_id: FileIdPath,
-    payload: TranslateIn,
-    db: Db,
-    session: CurrentSession,
-    storage: Storage,
-    translator: Translator,
-    _: Annotated[object, Depends(require(Permission.ORDERS_WRITE))],
-) -> TranslationOut:
-    _order, document = await _document(db, order_id, document_id)
-    source = await get_document_file(db, document_id, file_id)
+@dataclass(frozen=True, slots=True)
+class Started:
+    row: DocumentTranslation
+    out: TranslationOut
+    #: False when the click found the same file already being translated.
+    is_new: bool
 
+    def audit(self, document_id: int, source: OrderFile) -> dict[str, object]:
+        return {
+            "document_id": document_id,
+            "file_name": source.file_name,
+            "pages": self.row.page_count,
+            "target_language": self.row.target_language,
+        }
+
+
+async def start_translation(
+    db: AsyncSession,
+    storage: ObjectStorage,
+    translator: SulikoTranslator,
+    *,
+    document: OrderDocument,
+    source: OrderFile,
+    payload: TranslateIn,
+    suliko_user_id: Callable[[], Awaitable[str]],
+    requested_by_user_id: int | None = None,
+    requested_by_portal_user_id: str | None = None,
+) -> Started:
+    """Hand one file of a document to Suliko Translate, for whoever asked.
+
+    Shared by Office (`translate_file`) and the translator portal
+    (`portal.translate_assigned_file`): the caller has already established
+    that the person may touch this document, and says whose suliko.ge balance
+    pays. `suliko_user_id` is asked for only once the file is known to be
+    worth sending, so a person without an account is not told so about a file
+    that could not have been translated anyway.
+    """
     # A second click while the first is still running gets the same job, not
     # a second charge.
     running = (
@@ -269,7 +330,8 @@ async def translate_file(
         .first()
     )
     if running is not None:
-        return _translation_out(running, await _public_ids(db, [running]))
+        out = translation_out(running, await public_file_ids(db, [running]))
+        return Started(running, out, is_new=False)
 
     settings = get_settings()
     if not downloadable(source):
@@ -282,7 +344,7 @@ async def translate_file(
             f"Suliko Translate takes files up to {limit_mb} MB. This one is larger."
         )
 
-    suliko_user_id = await _suliko_user_id(db, session)
+    payer = await suliko_user_id()
 
     offered = await translator.languages()
     target = await _suliko_language(db, document.target_language, offered)
@@ -309,7 +371,7 @@ async def translate_file(
         raise storage_failure(exc) from exc
 
     prepared = await translator.prepare(
-        suliko_user_id,
+        payer,
         file_name=source.file_name,
         content_type=source.content_type,
         content=content,
@@ -321,13 +383,15 @@ async def translate_file(
             balance=str(prepared.balance),
         )
     job_id = await translator.start(
-        suliko_user_id,
+        payer,
         prepared,
         file_name=source.file_name,
         target_language_id=target.id,
         source_language_id=source_language.id if source_language else None,
         output_language_id=(reader or target).id,
         rich=payload.rich,
+        instructions=payload.instructions,
+        names=[NameSpelling(n.original, n.translation, n.type) for n in payload.names],
     )
 
     row = DocumentTranslation(
@@ -336,35 +400,63 @@ async def translate_file(
         source_file_id=source.id,
         status=TranslationStatus.PROCESSING,
         suliko_job_id=job_id,
-        suliko_user_id=suliko_user_id,
-        requested_by_user_id=session.user_id,
+        suliko_user_id=payer,
+        requested_by_user_id=requested_by_user_id,
+        requested_by_portal_user_id=requested_by_portal_user_id,
         target_language=document.target_language,
         page_count=prepared.page_count,
     )
     db.add(row)
     await db.flush()
-
-    from suliko.core.audit import record
-
-    await record(
-        db,
-        session,
-        action="order.translation_started",
-        entity_type="order",
-        entity_id=order_id,
-        after={
-            "document_id": document_id,
-            "file_name": source.file_name,
-            "pages": prepared.page_count,
-            "target_language": document.target_language,
-        },
-    )
-    return _translation_out(
+    out = translation_out(
         row,
-        await _public_ids(db, [row]),
+        await public_file_ids(db, [row]),
         progress=0,
         balance=prepared.balance - prepared.page_count if prepared.balance is not None else None,
     )
+    return Started(row, out, is_new=True)
+
+
+@router.post(
+    "/{order_id}/documents/{document_id}/files/{file_id}/translate",
+    response_model=TranslationOut,
+    status_code=http_status.HTTP_201_CREATED,
+)
+async def translate_file(
+    order_id: int,
+    document_id: int,
+    file_id: FileIdPath,
+    payload: TranslateIn,
+    db: Db,
+    session: CurrentSession,
+    storage: Storage,
+    translator: Translator,
+    _: Annotated[object, Depends(require(Permission.ORDERS_WRITE))],
+) -> TranslationOut:
+    _order, document = await _document(db, order_id, document_id)
+    source = await get_document_file(db, document_id, file_id)
+    started = await start_translation(
+        db,
+        storage,
+        translator,
+        document=document,
+        source=source,
+        payload=payload,
+        suliko_user_id=lambda: _suliko_user_id(db, session),
+        requested_by_user_id=session.user_id,
+    )
+    if started.is_new:
+        from suliko.core.audit import record
+
+        await record(
+            db,
+            session,
+            action="order.translation_started",
+            entity_type="order",
+            entity_id=order_id,
+            after=started.audit(document_id, source),
+        )
+    return started.out
 
 
 # ── Following them ──────────────────────────────────────────────────────────
@@ -409,6 +501,18 @@ def html_document(html: str) -> str:
 def _result_name(source_name: str | None, target_language: str) -> str:
     stem = PurePosixPath(source_name or "translation").stem or "translation"
     return f"{stem[:180]} ({target_language.upper()}).html"
+
+
+def result_uploader(row: DocumentTranslation) -> str:
+    """Whose file a finished translation is.
+
+    One a translator started from the portal is theirs, tagged the way their
+    own uploads are, so they see it as such and can remove it. One started in
+    Office is Suliko Translate's, on behalf of the person who clicked.
+    """
+    if row.requested_by_portal_user_id:
+        return f"portal:{row.requested_by_portal_user_id}"
+    return f"suliko:{row.requested_by_user_id or 0}"
 
 
 async def _collect(
@@ -456,7 +560,7 @@ async def _collect(
                 "utf-8"
             ),
             content_type=HTML,
-            uploaded_by=f"suliko:{row.requested_by_user_id or 0}",
+            uploaded_by=result_uploader(row),
         )
     except StorageError as exc:
         raise storage_failure(exc) from exc
@@ -466,7 +570,7 @@ async def _collect(
     await db.flush()
 
 
-async def _refresh(
+async def refresh_translation(
     db: AsyncSession,
     storage: ObjectStorage,
     translator: SulikoTranslator,
@@ -529,10 +633,11 @@ async def list_translations(
         .all()
     )
     progress = {
-        row.id: await _refresh(db, storage, translator, row, order, document) for row in rows
+        row.id: await refresh_translation(db, storage, translator, row, order, document)
+        for row in rows
     }
-    files = await _public_ids(db, rows)
-    return [_translation_out(row, files, progress=progress[row.id]) for row in rows]
+    files = await public_file_ids(db, rows)
+    return [translation_out(row, files, progress=progress[row.id]) for row in rows]
 
 
 # ── Correcting one ──────────────────────────────────────────────────────────
