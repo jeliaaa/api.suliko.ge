@@ -174,6 +174,20 @@ class RateLimiter:
     async def record_email_verification_resend(self, account_key: str) -> None:
         await self._hit_count(account_key, get_settings().email_verification_resend_window_seconds)
 
+    # ── Document mail ───────────────────────────────────────────────────────
+
+    async def check_document_mail(self, tenant_key: str) -> int | None:
+        """Seconds to wait, or None. Keyed on the TENANT, as invitations are:
+        what is bounded is how much mail one bureau sends through us."""
+        settings = get_settings()
+        window = settings.document_mail_window_seconds
+        if await self._current(tenant_key, window) >= settings.document_mail_max_per_tenant:
+            return window
+        return None
+
+    async def record_document_mail(self, tenant_key: str) -> None:
+        await self._hit_count(tenant_key, get_settings().document_mail_window_seconds)
+
     # ── Generic writes ──────────────────────────────────────────────────────
 
     async def check_write(self, key: str) -> int | None:
