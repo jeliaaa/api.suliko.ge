@@ -6,10 +6,23 @@ import enum
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, Date, DateTime, Enum, Index, Numeric, String, Text
+from sqlalchemy import (
+    Boolean,
+    Date,
+    DateTime,
+    Enum,
+    FetchedValue,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from suliko.db.base import Base, IdMixin, TenantScoped, TimestampMixin, enum_values
+from suliko.db.numbering import numbered_per_tenant
 
 
 class ClientType(enum.StrEnum):
@@ -17,14 +30,19 @@ class ClientType(enum.StrEnum):
     B2C = "B2C"
 
 
+@numbered_per_tenant
 class Client(Base, IdMixin, TenantScoped, TimestampMixin):
     __tablename__ = "clients"
     __table_args__ = (
         Index("ix_clients_tenant_name", "tenant_id", "name"),
         Index("ix_clients_tenant_type", "tenant_id", "client_type"),
         Index("ix_clients_tenant_email", "tenant_id", "email"),
+        UniqueConstraint("tenant_id", "number", name="uq_clients_tenant_number"),
     )
-
+    #: Its number in its own bureau: 1, 2, 3, drawn on insert (see
+    #: suliko.db.numbering). The id stays the key in URLs and foreign keys;
+    #: this is what people see.
+    number: Mapped[int] = mapped_column(Integer, server_default=FetchedValue(), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     client_type: Mapped[ClientType] = mapped_column(
         Enum(

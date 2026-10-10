@@ -107,6 +107,7 @@ def _row(
 ) -> tuple[Any, ...]:
     order = SimpleNamespace(
         id=1,
+        number=1,
         order_date=date(2026, 9, 1),
         due_date=due,
         client_id=1,

@@ -159,6 +159,8 @@ class InvoiceOut(BaseModel):
     bank: InvoiceBank | None
 
     order_id: int
+    #: The order's number in the bureau, which the invoice prints.
+    order_number: int
     order_date: date
     due_date: date | None
 
@@ -587,9 +589,10 @@ async def order_invoice(
             )
 
     return InvoiceOut(
-        # Provisional: derived from the order id, not allocated from a
-        # sequence. See the module docstring before treating it as legal.
-        number=f"{order.id}",
+        # Provisional: derived from the order's number in the bureau, not
+        # allocated from a sequence. See the module docstring before treating
+        # it as legal.
+        number=f"{order.number}",
         is_provisional=True,
         issued_on=today_in(session.timezone),
         locale=locale,
@@ -615,6 +618,7 @@ async def order_invoice(
             account_name=primary.account_name,
         ),
         order_id=order.id,
+        order_number=order.number,
         order_date=order.order_date,
         due_date=order.due_date,
         lines=lines,

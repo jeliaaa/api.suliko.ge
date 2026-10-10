@@ -120,6 +120,8 @@ class AssignedDocumentOut(BaseModel):
 class AssignedOrderOut(BaseModel):
     organization: OrganizationOut
     order_id: int
+    #: The order's number in its bureau: what the bureau calls it.
+    order_number: int
     client_name: str
     order_date: date
     due_date: date | None
@@ -158,6 +160,8 @@ class AssignedDocumentDetail(AssignedDocumentOut):
 class AssignedOrderDetail(BaseModel):
     organization: OrganizationOut
     order_id: int
+    #: The order's number in its bureau: what the bureau calls it.
+    order_number: int
     client_name: str
     order_date: date
     due_date: date | None
@@ -358,6 +362,7 @@ async def list_assignments(
             AssignedOrderOut(
                 organization=_organization_out(organization),
                 order_id=order.order.id,
+                order_number=order.order.number,
                 client_name=order.client_name,
                 order_date=order.order.order_date,
                 due_date=order.order.due_date,
@@ -405,6 +410,7 @@ async def get_assigned_order(
     return AssignedOrderDetail(
         organization=_organization_out(organization),
         order_id=order.order.id,
+        order_number=order.order.number,
         client_name=order.client_name,
         order_date=order.order.order_date,
         due_date=order.order.due_date,

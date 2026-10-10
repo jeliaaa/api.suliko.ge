@@ -225,6 +225,8 @@ class OrderDocumentOut(BaseModel):
 
 class OrderSummary(BaseModel):
     id: int
+    #: What people see: 1, 2, 3 within the bureau. `id` is for links only.
+    number: int
     order_date: date
     due_date: date | None
     client_id: int
@@ -331,6 +333,7 @@ def _summary_from_row(row: Row[Any], *, today: date, show_costs: bool) -> OrderS
 
     return OrderSummary(
         id=order.id,
+        number=order.number,
         order_date=order.order_date,
         due_date=order.due_date,
         client_id=order.client_id,
@@ -502,8 +505,9 @@ async def list_orders(
         if len(digits) >= 4:
             conditions.append(phone_digits(Client.phone).like(f"%{digits}%"))
         # A bare number is almost always an order id, so match it as one too.
+        # A bare number is the bureau's own order number, as shown everywhere.
         if search.strip().isdigit():
-            conditions.append(Order.id == int(search.strip()))
+            conditions.append(Order.number == int(search.strip()))
         stmt = stmt.where(or_(*conditions))
 
     if client_type is not None:
@@ -809,7 +813,7 @@ async def create_order(payload: OrderCreate, db: Db, session: OrdersWriter) -> O
         actor_user_id=session.user_id,
         actor_name=session.full_name or session.username,
         order_id=order.id,
-        subject_label=f"{client.name} #{order.id}",
+        subject_label=f"{client.name} #{order.number}",
     )
     await db.flush()
 
@@ -1257,7 +1261,7 @@ async def change_status(
         actor_user_id=session.user_id,
         actor_name=session.full_name or session.username,
         order_id=order_id,
-        subject_label=f"{client.name if client else 'Unknown'} #{order_id}",
+        subject_label=f"{client.name if client else 'Unknown'} #{order.number}",
     )
     await db.flush()
 

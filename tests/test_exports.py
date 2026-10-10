@@ -78,6 +78,7 @@ def test_every_status_and_enum_has_a_georgian_label() -> None:
 def _order(**overrides: Any) -> orders_api.OrderSummary:
     values: dict[str, Any] = {
         "id": 7,
+        "number": 3,
         "order_date": date(2026, 9, 1),
         "due_date": date(2026, 9, 5),
         "client_id": 1,
@@ -130,6 +131,8 @@ async def test_orders_export_matches_the_list_and_translates(
     assert "ka→en" in row and "Nino" in row
     assert ",40.00," in row  # balance = total - paid
     assert row.endswith(",25.00")
+    # The bureau's own order number, not the database id (7).
+    assert row.startswith("3,")
     # The filters reach the list call unchanged, one page at a time.
     assert one_order_page[0]["limit"] == exports.PAGE
     assert one_order_page[0]["offset"] == 0

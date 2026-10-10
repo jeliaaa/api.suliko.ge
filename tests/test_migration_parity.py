@@ -45,6 +45,8 @@ LATER_REVISIONS = (
     "0014_order_file_working_copy.py",
     # Relaxes one NOT NULL — see test_migration_0015.py.
     "0015_invite_without_email.py",
+    # A per-tenant number on orders and clients — see test_migration_0016.py.
+    "0016_per_tenant_numbers.py",
 )
 
 
