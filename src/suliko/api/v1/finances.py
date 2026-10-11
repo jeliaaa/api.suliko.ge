@@ -914,7 +914,9 @@ async def _payments_out(db: AsyncSession, rows: list[ClientPayment]) -> list[Pay
         ).all()
     }
 
-    numbers = await order_numbers(db, {a.order_id for found in allocations.values() for a in found})
+    numbers = await order_numbers(
+        db, {a.order_id for found in allocations.values() for a in found}
+    )
 
     out: list[PaymentOut] = []
     for row in rows:
@@ -1310,7 +1312,9 @@ async def _translator_payouts_out(
             )
         ).all()
     }
-    numbers = await order_numbers(db, {a.order_id for found in allocations.values() for a in found})
+    numbers = await order_numbers(
+        db, {a.order_id for found in allocations.values() for a in found}
+    )
     return [
         TranslatorPayoutOut(
             id=row.id,
@@ -1433,7 +1437,9 @@ async def pay_translator(
     return (await _translator_payouts_out(db, [payout]))[0]
 
 
-@router.delete("/translator-payouts/{payout_id}", status_code=http_status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/translator-payouts/{payout_id}", status_code=http_status.HTTP_204_NO_CONTENT
+)
 async def delete_translator_payout(payout_id: int, db: Db, session: MoneyUndoer) -> None:
     row = await db.get(TranslatorPayment, payout_id)
     if row is None:
@@ -1510,7 +1516,9 @@ async def _check_notary_allocations(db: AsyncSession, payload: NotaryPayoutIn) -
             )
 
 
-async def _notary_payouts_out(db: AsyncSession, rows: list[NotaryPayment]) -> list[NotaryPayoutOut]:
+async def _notary_payouts_out(
+    db: AsyncSession, rows: list[NotaryPayment]
+) -> list[NotaryPayoutOut]:
     if not rows:
         return []
     ids = [row.id for row in rows]

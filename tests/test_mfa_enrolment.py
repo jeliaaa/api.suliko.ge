@@ -132,23 +132,17 @@ async def test_enrol_confirm_gives_recovery_codes_and_satisfies_the_session(
     assert started.qr_svg.startswith("<svg")
 
     # Not on until proven: an abandoned enrolment must never lock anyone out.
-    assert (
-        await db.scalar(
-            select(func.count()).select_from(MfaMethod).where(MfaMethod.confirmed_at.is_not(None))
-        )
-        == 0
-    )
+    assert await db.scalar(
+        select(func.count()).select_from(MfaMethod).where(MfaMethod.confirmed_at.is_not(None))
+    ) == 0
 
     code = pyotp.TOTP(started.secret).now()
     out = await mfa.confirm(mfa.CodeIn(code=code), _session(), RateLimiter(None))
 
     assert len(out.recovery_codes) == 10
-    assert (
-        await db.scalar(
-            select(func.count()).select_from(MfaMethod).where(MfaMethod.confirmed_at.is_not(None))
-        )
-        == 1
-    )
+    assert await db.scalar(
+        select(func.count()).select_from(MfaMethod).where(MfaMethod.confirmed_at.is_not(None))
+    ) == 1
     assert db.info["satisfied"] == [42]
 
 
@@ -168,7 +162,9 @@ async def test_a_session_pending_only_for_enrolment_may_enrol() -> None:
 async def test_a_pending_challenge_cannot_be_bypassed_by_enrolling_again(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(mfa, "get_settings", lambda: type("S", (), {"mfa_enforced": True})())
+    monkeypatch.setattr(
+        mfa, "get_settings", lambda: type("S", (), {"mfa_enforced": True})()
+    )
     with pytest.raises(MfaRequiredError):
         await mfa._enrolling_session(_session(mfa_satisfied_at=None, has_mfa=True))
 

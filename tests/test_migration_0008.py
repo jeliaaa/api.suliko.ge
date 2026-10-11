@@ -69,7 +69,9 @@ def test_the_guard_skips_columns_a_fresh_database_already_has() -> None:
     assert recorder.added_columns == []
 
 
-@pytest.mark.parametrize("table", ["client_payments", "translator_payments", "notary_payments"])
+@pytest.mark.parametrize(
+    "table", ["client_payments", "translator_payments", "notary_payments"]
+)
 def test_each_payment_ledger_gets_a_unique_idempotency_index(
     revision: tuple[Any, RecordedOps], table: str
 ) -> None:

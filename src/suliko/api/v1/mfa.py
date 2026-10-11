@@ -252,7 +252,9 @@ async def enrol(session: Enrolling) -> EnrolmentOut:
             )
         )
 
-    uri = totp_service.provisioning_uri(secret, f"{session.username}@{session.tenant_slug}", ISSUER)
+    uri = totp_service.provisioning_uri(
+        secret, f"{session.username}@{session.tenant_slug}", ISSUER
+    )
     svg = qrcode.make(uri, image_factory=qrcode.image.svg.SvgPathImage).to_string(
         encoding="unicode"
     )
