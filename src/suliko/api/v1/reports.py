@@ -152,9 +152,9 @@ def _per_order(start: date | None = None, end: date | None = None) -> Select[Any
             Order.order_date.label("order_date"),
             Order.client_id.label("client_id"),
             (func.coalesce(docs.c.documents_total, 0) + Order.delivery_cost).label("revenue"),
-            (
-                func.coalesce(docs.c.gross_profit, 0) - func.coalesce(expenses.c.expenses, 0)
-            ).label("profit"),
+            (func.coalesce(docs.c.gross_profit, 0) - func.coalesce(expenses.c.expenses, 0)).label(
+                "profit"
+            ),
             func.coalesce(docs.c.translator_total, 0).label("translator"),
             func.coalesce(docs.c.notary_total, 0).label("notary"),
             Order.delivery_cost.label("delivery"),

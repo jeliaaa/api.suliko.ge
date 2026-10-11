@@ -262,9 +262,7 @@ async def test_an_allocation_cannot_exceed_what_the_order_owes(db: AsyncSession)
 async def test_a_cancelled_order_cannot_be_allocated_to(db: AsyncSession) -> None:
     with pytest.raises(ValidationError, match="cancelled or rejected"):
         await finances.record_payment(
-            _payment(
-                allocations=[finances.Allocation(order_id=2, amount_allocated=Decimal("10"))]
-            ),
+            _payment(allocations=[finances.Allocation(order_id=2, amount_allocated=Decimal("10"))]),
             db,
             _session(),
         )

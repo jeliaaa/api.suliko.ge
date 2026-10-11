@@ -246,9 +246,7 @@ def _choice(membership: Membership) -> OrgChoice:
     )
 
 
-async def _choices(
-    db: AsyncSession, account_id: int
-) -> tuple[list[OrgChoice], OrgChoice | None]:
+async def _choices(db: AsyncSession, account_id: int) -> tuple[list[OrgChoice], OrgChoice | None]:
     """Organisations first, the personal workspace apart — the chooser shows
     it separately, and offers to create it when it does not exist."""
     options = await memberships(db, account_id)
