@@ -49,6 +49,8 @@ LATER_REVISIONS = (
     "0016_per_tenant_numbers.py",
     # document_translations — see test_migration_0017.py.
     "0017_document_translations.py",
+    # One column on document_translations — see test_migration_0018.py.
+    "0018_translation_from_portal.py",
 )
 
 

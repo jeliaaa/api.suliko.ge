@@ -1,8 +1,10 @@
 """Machine translations of an order's documents, done by Suliko Translate.
 
-One row per translation someone started from Suliko Office. The work happens on
-suliko.ge (``integrations/suliko_translate.py``), which charges the pages to the
-person who pressed the button; this row is what Office remembers about it:
+One row per translation someone started: bureau staff from Suliko Office, or the
+translator a document is assigned to, from suliko.ge's Orders tab. The work
+happens on suliko.ge (``integrations/suliko_translate.py``), which charges the
+pages to the person who pressed the button; this row is what Office remembers
+about it:
 which source file went in, the job to ask suliko.ge about, how many pages it
 cost and whom, and, once it is done, the translation file that came back.
 
@@ -63,6 +65,10 @@ class DocumentTranslation(Base, IdMixin, TenantScoped, TimestampMixin):
     requested_by_user_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), default=None
     )
+    #: Set instead when a translator started it from suliko.ge's Orders tab:
+    #: their suliko.ge account. NULL for one started in Office. The result is
+    #: then filed as theirs, so they can remove it like any file they uploaded.
+    requested_by_portal_user_id: Mapped[str | None] = mapped_column(String(450), default=None)
     #: The Office language code translated into, as the document had it then.
     target_language: Mapped[str] = mapped_column(String(5), nullable=False)
     #: The pages suliko.ge measured, which is what it charged.

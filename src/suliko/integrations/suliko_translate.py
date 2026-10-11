@@ -11,7 +11,8 @@ The flow is the site's:
   it will charge) and uploads it where the model can read it.
 - ``start`` begins the translation of a prepared file and reserves the pages.
   A balance that does not cover them is `InsufficientBalanceError`, and
-  nothing has been charged.
+  nothing has been charged. It can carry the person's own notes for the
+  translation and the spellings they want for names.
 - ``status`` is asked until the job ends; ``result`` is then the translated
   file, which is HTML.
 
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal, Protocol
@@ -90,6 +92,16 @@ class PreparedFile:
 
 
 @dataclass(frozen=True, slots=True)
+class NameSpelling:
+    """How one proper name is to be written in the translation."""
+
+    original: str
+    translation: str
+    #: "Person" or "Organization", as suliko.ge tells the two apart.
+    kind: str = "Person"
+
+
+@dataclass(frozen=True, slots=True)
 class JobStatus:
     state: JobState
     progress: int
@@ -126,6 +138,8 @@ class SulikoTranslator(Protocol):
         source_language_id: int | None,
         output_language_id: int,
         rich: bool,
+        instructions: str | None = None,
+        names: Sequence[NameSpelling] = (),
     ) -> str: ...
 
     async def status(self, job_id: str) -> JobStatus: ...
@@ -283,6 +297,8 @@ class HttpSulikoTranslator:
         source_language_id: int | None,
         output_language_id: int,
         rich: bool,
+        instructions: str | None = None,
+        names: Sequence[NameSpelling] = (),
     ) -> str:
         body: dict[str, Any] = {
             "userId": user_id,
@@ -296,6 +312,16 @@ class HttpSulikoTranslator:
         }
         if source_language_id is not None:
             body["sourceLanguageId"] = source_language_id
+        # What the person asked of the translation, in their own words, and the
+        # spellings they fixed for names. suliko.ge adds both to its prompt, the
+        # same way its own mass translation does.
+        if instructions:
+            body["instructions"] = instructions
+        if names:
+            body["nameTranslations"] = [
+                {"original": n.original, "translation": n.translation, "type": n.kind}
+                for n in names
+            ]
         response = await self._send("POST", START_PATH, json=body)
         data = _json(response)
         error = _field(data, "error")
@@ -381,6 +407,8 @@ class UnconfiguredSulikoTranslator:
         source_language_id: int | None,
         output_language_id: int,
         rich: bool,
+        instructions: str | None = None,
+        names: Sequence[NameSpelling] = (),
     ) -> str:
         raise self._off()
 

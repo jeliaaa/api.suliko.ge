@@ -17,6 +17,9 @@ tenant's resource.
 
 File routes also accept a ticket (see ``security/portal_tokens.py``) so a
 browser can move large files without passing them through the Next.js server.
+
+A translator can also have Suliko Translate work on a file the bureau sent
+(`translate_assigned_file`), paid from their own suliko.ge balance.
 """
 
 from __future__ import annotations
@@ -47,8 +50,18 @@ from suliko.api.portal_deps import (
 )
 from suliko.api.v1._files import read_upload
 from suliko.api.v1.order_files import storage_failure
+from suliko.api.v1.order_translations import (
+    TranslateIn,
+    TranslationOut,
+    Translator,
+    public_file_ids,
+    refresh_translation,
+    start_translation,
+    translation_out,
+)
 from suliko.config import get_settings
 from suliko.core.errors import (
+    ConflictError,
     NotFoundError,
     PermissionDeniedError,
     ValidationError,
@@ -86,6 +99,7 @@ from suliko.models.portal import (
     PersonalOrderLanguagePair,
     PortalTranslator,
 )
+from suliko.models.translation import DocumentTranslation
 
 log = structlog.get_logger()
 
@@ -161,6 +175,10 @@ FilesState = Literal["ok", "unavailable"]
 class AssignedDocumentDetail(AssignedDocumentOut):
     files_state: FilesState
     files: list[OrderFileOut]
+    #: Suliko Translate jobs the caller started on this document, newest first,
+    #: as the database has them. A running one is followed with
+    #: `GET .../documents/{id}/translations`.
+    translations: list[TranslationOut] = Field(default_factory=list)
 
 
 class AssignedOrderDetail(BaseModel):
@@ -446,9 +464,14 @@ async def get_assigned_order(
                 _file_out(row, identity)
                 for row in await list_document_files(tenant_db, item.document.id)
             ]
+            started = await _own_translations(tenant_db, item.document.id, identity)
+            file_ids = await public_file_ids(tenant_db, started)
             documents.append(
                 AssignedDocumentDetail(
-                    **_document_out(item).model_dump(), files_state=state, files=files
+                    **_document_out(item).model_dump(),
+                    files_state=state,
+                    files=files,
+                    translations=[translation_out(row, file_ids) for row in started],
                 )
             )
 
@@ -598,6 +621,148 @@ async def delete_order_file(
                 "actor_external_user_id": identity.user_id,
             },
         )
+
+
+# ── Suliko Translate on an assigned document ────────────────────────────────
+#
+# The translator's own one click, as bureau staff have in Office
+# (`order_translations.py`): a file the bureau sent goes to suliko.ge's
+# translator, with whatever the translator wants to tell it, and the result is
+# filed under the document as theirs. Their suliko.ge balance pays: they are
+# the one who clicked.
+
+#: How many of their own jobs on one document a translator is shown.
+TRANSLATIONS_SHOWN = 10
+
+
+async def _own_translations(
+    tenant_db: AsyncSession, document_id: int, identity: PortalIdentity
+) -> list[DocumentTranslation]:
+    """The jobs this translator started on a document, newest first. Never the
+    bureau's own, nor another translator's: whose pages were spent on what is
+    theirs to know."""
+    return list(
+        (
+            await tenant_db.execute(
+                select(DocumentTranslation)
+                .where(
+                    DocumentTranslation.order_document_id == document_id,
+                    DocumentTranslation.requested_by_portal_user_id == identity.user_id,
+                )
+                .order_by(DocumentTranslation.id.desc())
+                .limit(TRANSLATIONS_SHOWN)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@router.post(
+    "/organizations/{slug}/orders/{order_id}/documents/{document_id}/files/{file_id}/translate",
+    response_model=TranslationOut,
+    status_code=http_status.HTTP_201_CREATED,
+)
+async def translate_assigned_file(
+    slug: SlugPath,
+    order_id: int,
+    document_id: int,
+    file_id: FileIdPath,
+    payload: TranslateIn,
+    identity: PortalCaller,
+    db: PlatformDb,
+    tenants: TenantSessions,
+    storage: Storage,
+    translator: Translator,
+) -> TranslationOut:
+    """Start Suliko Translate on a source file of a document assigned to the caller.
+
+    `payload` carries their notes for the translation and the spellings they
+    want for names. The pages come out of the caller's own suliko.ge balance;
+    a balance that does not cover them is a 402 and nothing is charged.
+    """
+    organization = await _organization(db, identity, slug)
+
+    async def payer() -> str:
+        return identity.user_id
+
+    async with tenants(organization.tenant_id) as tenant_db:
+        order = await _assigned_order(tenant_db, organization, order_id)
+        item = _assigned_document(order, document_id)
+        source = await get_document_file(tenant_db, item.document.id, file_id)
+        if source.kind is not FileKind.SOURCE:
+            raise ValidationError("Only a file the bureau sent can be translated here.")
+
+        started = await start_translation(
+            tenant_db,
+            storage,
+            translator,
+            document=item.document,
+            source=source,
+            payload=payload,
+            suliko_user_id=payer,
+            requested_by_portal_user_id=identity.user_id,
+        )
+        if not started.is_new and started.row.requested_by_portal_user_id != identity.user_id:
+            # Somebody at the bureau pressed the same button first. Its result
+            # is filed under this document too, so there is nothing to start.
+            raise ConflictError(
+                "This file is already being translated. The translation will appear "
+                "here when it is done."
+            )
+
+        if started.is_new:
+            from suliko.core.audit import record
+
+            await record(
+                tenant_db,
+                None,
+                action="order.translation_started",
+                entity_type="order",
+                entity_id=order_id,
+                tenant_id=organization.tenant_id,
+                actor_type=ActorType.PORTAL_TRANSLATOR,
+                after={
+                    **started.audit(document_id, source),
+                    "with_notes": payload.instructions is not None,
+                    "names": len(payload.names),
+                    "actor_external_user_id": identity.user_id,
+                },
+            )
+
+    return started.out
+
+
+@router.get(
+    "/organizations/{slug}/orders/{order_id}/documents/{document_id}/translations",
+    response_model=list[TranslationOut],
+)
+async def list_assigned_translations(
+    slug: SlugPath,
+    order_id: int,
+    document_id: int,
+    identity: PortalCaller,
+    db: PlatformDb,
+    tenants: TenantSessions,
+    storage: Storage,
+    translator: Translator,
+) -> list[TranslationOut]:
+    """The caller's own jobs on one document. Asking is what moves a running
+    one along and files its result, as in Office: there is no worker."""
+    organization = await _organization(db, identity, slug)
+
+    async with tenants(organization.tenant_id) as tenant_db:
+        order = await _assigned_order(tenant_db, organization, order_id)
+        item = _assigned_document(order, document_id)
+        rows = await _own_translations(tenant_db, item.document.id, identity)
+        progress = {
+            row.id: await refresh_translation(
+                tenant_db, storage, translator, row, order.order, item.document
+            )
+            for row in rows
+        }
+        file_ids = await public_file_ids(tenant_db, rows)
+        return [translation_out(row, file_ids, progress=progress[row.id]) for row in rows]
 
 
 # ── Personal orders ─────────────────────────────────────────────────────────

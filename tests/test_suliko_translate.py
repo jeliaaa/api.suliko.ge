@@ -22,6 +22,7 @@ from suliko.integrations.suliko_translate import (
     FORMAT_RICH_HTML,
     HttpSulikoTranslator,
     InsufficientBalanceError,
+    NameSpelling,
     PreparedFile,
     SulikoAccountMissingError,
     SulikoLanguage,
@@ -142,6 +143,33 @@ async def test_start_names_the_person_the_file_and_the_languages() -> None:
     }
     assert rich["outputFormat"] == FORMAT_RICH_HTML
     assert all(request.headers[KEY_HEADER] == KEY for request in seen)
+
+
+async def test_start_passes_on_the_persons_notes_and_name_spellings() -> None:
+    """In the fields suliko.ge's own mass translation sends them in."""
+    client, seen = _client(lambda _: _json(202, {"JobId": "job-1"}))
+
+    await client.start(
+        "suliko-nino",
+        PREPARED,
+        file_name="passport.pdf",
+        target_language_id=2,
+        source_language_id=None,
+        output_language_id=1,
+        rich=False,
+        instructions="Keep company names in English.",
+        names=[
+            NameSpelling("ნინო ბერიძე", "Nino Beridze"),
+            NameSpelling("შპს მზიური", "Mziuri LLC", "Organization"),
+        ],
+    )
+
+    [sent] = (json.loads(request.content) for request in seen)
+    assert sent["instructions"] == "Keep company names in English."
+    assert sent["nameTranslations"] == [
+        {"original": "ნინო ბერიძე", "translation": "Nino Beridze", "type": "Person"},
+        {"original": "შპს მზიური", "translation": "Mziuri LLC", "type": "Organization"},
+    ]
 
 
 async def test_a_balance_that_does_not_cover_it_carries_the_numbers() -> None:

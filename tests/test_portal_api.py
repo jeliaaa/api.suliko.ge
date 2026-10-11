@@ -42,6 +42,8 @@ from suliko.integrations.object_storage import (
     get_object_storage,
 )
 from suliko.integrations.suliko_backend import UnconfiguredSulikoBackend, get_suliko_backend
+from suliko.integrations.suliko_translate import JobStatus, NameSpelling, get_suliko_translator
+from suliko.models.audit import ActorType
 from suliko.models.directory import Client, ClientType, Translator
 from suliko.models.order import CopyType, Order, OrderDocument, Urgency
 from suliko.models.order_file import OrderFile
@@ -55,8 +57,9 @@ from suliko.models.portal import (
     PortalTranslator,
     PortalTranslatorLink,
 )
-from suliko.models.reference import DocumentType
+from suliko.models.reference import DocumentType, Language, TenantSettings
 from suliko.models.tenant import Tenant, TenantStatus
+from suliko.models.translation import DocumentTranslation, TranslationStatus
 from suliko.models.user import (
     Account,
     PasswordResetToken,
@@ -67,7 +70,7 @@ from suliko.models.user import (
 from suliko.security.permissions import permissions_for_role
 from suliko.security.portal_tokens import sign_token
 from suliko.security.sessions import AuthenticatedSession
-from suliko_fakes import FakeBackend, person
+from suliko_fakes import FakeBackend, FakeTranslator, person
 
 SECRET = "portal-secret-for-tests-0123456789abcdef"
 
@@ -93,6 +96,10 @@ MODELS = [
     PersonalOrderLanguagePair,
     PersonalOrderFile,
     OrderFile,
+    # Suliko Translate: its jobs, and what it reads to choose a language.
+    DocumentTranslation,
+    Language,
+    TenantSettings,
     # Before User: a membership points at the person's account.
     Account,
     User,
@@ -333,9 +340,18 @@ def suliko() -> FakeBackend:
     return FakeBackend()
 
 
+@pytest.fixture
+def translator() -> FakeTranslator:
+    """suliko.ge's translator: ten pages on the balance, three in every file."""
+    return FakeTranslator()
+
+
 @pytest_asyncio.fixture
 async def client(
-    maker: async_sessionmaker[AsyncSession], storage: FakeStorage, suliko: FakeBackend
+    maker: async_sessionmaker[AsyncSession],
+    storage: FakeStorage,
+    suliko: FakeBackend,
+    translator: FakeTranslator,
 ) -> AsyncIterator[httpx.AsyncClient]:
     from suliko.main import create_app
 
@@ -365,6 +381,7 @@ async def client(
     app.dependency_overrides[get_tenant_sessions] = lambda: tenant_session
     app.dependency_overrides[get_object_storage] = lambda: storage
     app.dependency_overrides[get_suliko_backend] = lambda: suliko
+    app.dependency_overrides[get_suliko_translator] = lambda: translator
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -849,6 +866,260 @@ async def test_translators_remove_only_their_own_translations(
 
     response = await client.get(f"{files_path(1001)}/{uploaded['id']}", headers=as_user(GIORGI))
     assert response.status_code == 404
+
+
+# ── Suliko Translate on an assigned document ────────────────────────────────
+#
+# The translator's own one click: the bureau's file goes to suliko.ge's
+# translator with the translator's notes, their own balance pays, and what
+# comes back is filed under the document as theirs.
+
+
+def translate_path(file_id: str, document_id: int = 1001) -> str:
+    return f"{files_path(document_id)}/{file_id}/translate"
+
+
+def translations_path(document_id: int = 1001, order_id: int = 101) -> str:
+    return f"{API}/portal/organizations/acme/orders/{order_id}/documents/{document_id}/translations"
+
+
+async def _jobs(maker: async_sessionmaker[AsyncSession]) -> list[DocumentTranslation]:
+    with tenant_scope(ACME):
+        async with maker() as db:
+            return list((await db.execute(select(DocumentTranslation))).scalars().all())
+
+
+async def test_a_translator_starts_suliko_translate_with_their_own_notes(
+    client: httpx.AsyncClient,
+    maker: async_sessionmaker[AsyncSession],
+    storage: FakeStorage,
+    translator: FakeTranslator,
+    audit: list[dict[str, Any]],
+) -> None:
+    await giorgi_at_acme(client)
+    file_id = await staff_file(maker, storage, 1001, "birth certificate.pdf", b"%PDF scan")
+    audit.clear()
+
+    response = await client.post(
+        translate_path(file_id),
+        json={
+            "instructions": "  Keep the registry office's name in Russian.  ",
+            "names": [
+                {"original": "Анна Соколова", "translation": "ანა სოკოლოვა"},
+                {"original": "ЗАГС", "translation": "ზაგსი", "type": "Organization"},
+            ],
+        },
+        headers=as_user(GIORGI),
+    )
+
+    assert response.status_code == 201, response.text
+    out = response.json()
+    assert (out["status"], out["page_count"], out["source_file_id"]) == ("processing", 3, file_id)
+    # Ten pages before, three for this document: the translator's own.
+    assert out["balance"] == "7"
+
+    # The file went over in the name of the translator's suliko.ge account.
+    assert translator.prepared == [(GIORGI, "birth certificate.pdf", b"%PDF scan")]
+    [(payer, asked)] = translator.started
+    assert payer == GIORGI
+    # Document 1001 is English into Georgian.
+    assert (asked["source_language_id"], asked["target_language_id"]) == (2, 1)
+    assert asked["instructions"] == "Keep the registry office's name in Russian."
+    assert asked["names"] == [
+        NameSpelling("Анна Соколова", "ანა სოკოლოვა", "Person"),
+        NameSpelling("ЗАГС", "ზაგსი", "Organization"),
+    ]
+
+    [job] = await _jobs(maker)
+    assert (job.requested_by_portal_user_id, job.requested_by_user_id) == (GIORGI, None)
+    assert job.suliko_user_id == GIORGI
+
+    [entry] = audit
+    assert entry["action"] == "order.translation_started"
+    assert entry["actor_type"] is ActorType.PORTAL_TRANSLATOR
+    assert entry["after"]["with_notes"] is True and entry["after"]["names"] == 2
+
+
+async def test_notes_are_optional_and_a_half_filled_name_is_dropped(
+    client: httpx.AsyncClient,
+    maker: async_sessionmaker[AsyncSession],
+    storage: FakeStorage,
+    translator: FakeTranslator,
+) -> None:
+    await giorgi_at_acme(client)
+    file_id = await staff_file(maker, storage, 1001, "scan.pdf", b"%PDF")
+
+    response = await client.post(
+        translate_path(file_id),
+        json={"instructions": "   ", "names": [{"original": "Anna", "translation": "  "}]},
+        headers=as_user(GIORGI),
+    )
+    assert response.status_code == 201, response.text
+    [(_, asked)] = translator.started
+    assert (asked["instructions"], asked["names"]) == (None, [])
+
+    # A second click while it runs is the same job, with nothing charged twice.
+    again = await client.post(translate_path(file_id), json={}, headers=as_user(GIORGI))
+    assert again.status_code == 201
+    assert again.json()["id"] == response.json()["id"]
+    assert len(translator.started) == 1
+
+
+async def test_notes_longer_than_suliko_takes_are_refused(
+    client: httpx.AsyncClient,
+    maker: async_sessionmaker[AsyncSession],
+    storage: FakeStorage,
+    translator: FakeTranslator,
+) -> None:
+    await giorgi_at_acme(client)
+    file_id = await staff_file(maker, storage, 1001, "scan.pdf", b"%PDF")
+
+    response = await client.post(
+        translate_path(file_id), json={"instructions": "x" * 4001}, headers=as_user(GIORGI)
+    )
+
+    assert response.status_code == 422
+    assert translator.prepared == []
+
+
+async def test_the_result_is_filed_as_the_translators_own(
+    client: httpx.AsyncClient,
+    maker: async_sessionmaker[AsyncSession],
+    storage: FakeStorage,
+    translator: FakeTranslator,
+) -> None:
+    await giorgi_at_acme(client)
+    file_id = await staff_file(maker, storage, 1001, "birth certificate.pdf", b"%PDF")
+    await client.post(translate_path(file_id), json={}, headers=as_user(GIORGI))
+
+    # While it runs: the order says so, and asking reports how far it is.
+    order = (
+        await client.get(f"{API}/portal/organizations/acme/orders/101", headers=as_user(GIORGI))
+    ).json()
+    [first, other] = order["documents"]
+    assert [t["status"] for t in first["translations"]] == ["processing"]
+    assert other["translations"] == []
+    [running] = (await client.get(translations_path(), headers=as_user(GIORGI))).json()
+    assert (running["status"], running["progress"]) == ("processing", 40)
+
+    translator.state = JobStatus("completed", 100)
+    [done] = (await client.get(translations_path(), headers=as_user(GIORGI))).json()
+    assert done["status"] == "completed" and done["result_file_id"]
+
+    order = (
+        await client.get(f"{API}/portal/organizations/acme/orders/101", headers=as_user(GIORGI))
+    ).json()
+    files = {f["id"]: f for f in order["documents"][0]["files"]}
+    result = files[done["result_file_id"]]
+    assert (result["name"], result["kind"]) == ("birth certificate (KA).html", "translation")
+    # Theirs, so they can take it away again.
+    assert result["uploaded_by_me"] is True
+    response = await client.delete(
+        f"{files_path(1001)}/{done['result_file_id']}", headers=as_user(GIORGI)
+    )
+    assert response.status_code == 204
+
+    # Looking again does not file it a second time.
+    await client.get(translations_path(), headers=as_user(GIORGI))
+    assert sum(1 for key in storage.objects if key.endswith(".html")) <= 1
+
+
+async def test_a_balance_that_does_not_cover_it_starts_nothing(
+    client: httpx.AsyncClient,
+    maker: async_sessionmaker[AsyncSession],
+    storage: FakeStorage,
+    translator: FakeTranslator,
+) -> None:
+    from decimal import Decimal
+
+    translator.balance = Decimal("1")
+    await giorgi_at_acme(client)
+    file_id = await staff_file(maker, storage, 1001, "scan.pdf", b"%PDF")
+
+    response = await client.post(translate_path(file_id), json={}, headers=as_user(GIORGI))
+
+    assert response.status_code == 402
+    body = response.json()
+    assert body["type"].endswith("/insufficient_balance")
+    assert (body["pages"], body["balance"]) == (3, "1")
+    assert translator.started == [] and await _jobs(maker) == []
+
+
+async def test_only_a_document_assigned_to_them_can_be_translated(
+    client: httpx.AsyncClient,
+    maker: async_sessionmaker[AsyncSession],
+    storage: FakeStorage,
+    translator: FakeTranslator,
+) -> None:
+    await giorgi_at_acme(client)
+    # Document 1002 is in the same order, and somebody else's.
+    file_id = await staff_file(maker, storage, 1002, "theirs.pdf", b"%PDF")
+
+    response = await client.post(
+        translate_path(file_id, document_id=1002), json={}, headers=as_user(GIORGI)
+    )
+    assert response.status_code == 404
+    # Nor by borrowing one of their own documents' addresses for it.
+    response = await client.post(translate_path(file_id), json={}, headers=as_user(GIORGI))
+    assert response.status_code == 404
+    assert (
+        await client.get(translations_path(document_id=1002), headers=as_user(GIORGI))
+    ).status_code == 404
+    assert translator.prepared == []
+
+
+async def test_only_a_file_the_bureau_sent_can_be_translated(
+    client: httpx.AsyncClient, translator: FakeTranslator
+) -> None:
+    await giorgi_at_acme(client)
+    uploaded = await client.post(
+        files_path(1001),
+        files={"file": ("mine.docx", b"my translation", "application/msword")},
+        headers=as_user(GIORGI),
+    )
+    assert uploaded.status_code == 201, uploaded.text
+
+    response = await client.post(
+        translate_path(uploaded.json()["id"]), json={}, headers=as_user(GIORGI)
+    )
+
+    assert response.status_code == 422
+    assert translator.prepared == []
+
+
+async def test_a_file_the_bureau_is_already_translating_is_left_to_it(
+    client: httpx.AsyncClient,
+    maker: async_sessionmaker[AsyncSession],
+    storage: FakeStorage,
+    translator: FakeTranslator,
+) -> None:
+    await giorgi_at_acme(client)
+    file_id = await staff_file(maker, storage, 1001, "scan.pdf", b"%PDF")
+    with tenant_scope(ACME):
+        async with maker() as db:
+            source = (
+                await db.execute(select(OrderFile).where(OrderFile.public_id == file_id))
+            ).scalar_one()
+            db.add(
+                DocumentTranslation(
+                    public_id="bureaus-own-job",
+                    order_document_id=1001,
+                    source_file_id=source.id,
+                    status=TranslationStatus.PROCESSING,
+                    suliko_job_id="job-office",
+                    suliko_user_id="someone-at-the-bureau",
+                    target_language="ka",
+                    page_count=3,
+                )
+            )
+            await db.commit()
+
+    response = await client.post(translate_path(file_id), json={}, headers=as_user(GIORGI))
+
+    assert response.status_code == 409
+    assert translator.started == []
+    # Whose pages the bureau spent is not the translator's to see.
+    assert (await client.get(translations_path(), headers=as_user(GIORGI))).json() == []
 
 
 # ── Personal orders ─────────────────────────────────────────────────────────
