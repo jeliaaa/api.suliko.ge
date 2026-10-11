@@ -132,6 +132,30 @@ async def list_document_files(db: AsyncSession, document_id: int) -> list[OrderF
     )
 
 
+async def count_files_added_by(
+    db: AsyncSession, document_ids: Iterable[int], *, kind: FileKind, uploaded_by: str
+) -> dict[int, int]:
+    """How many live files of ``kind`` one uploader has added, per document.
+
+    One query for a whole list of documents: a list page must not ask once
+    per row. Documents with none are simply absent from the answer.
+    """
+    ids = list(document_ids)
+    if not ids:
+        return {}
+    rows = await db.execute(
+        select(OrderFile.order_document_id, func.count())
+        .where(
+            OrderFile.order_document_id.in_(ids),
+            OrderFile.deleted_at.is_(None),
+            OrderFile.kind == kind,
+            OrderFile.uploaded_by == uploaded_by,
+        )
+        .group_by(OrderFile.order_document_id)
+    )
+    return {row[0]: row[1] for row in rows.all()}
+
+
 async def get_document_file(db: AsyncSession, document_id: int, public_id: str) -> OrderFile:
     """The file, if it is a live file of this document. Otherwise 404 — never 403."""
     if not FILE_ID_PATTERN.fullmatch(public_id):

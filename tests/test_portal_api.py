@@ -786,6 +786,72 @@ async def test_translation_upload_and_download_with_tickets(
     assert response.headers["x-content-type-options"] == "nosniff"
 
 
+async def test_assignments_say_what_has_been_handed_in(
+    client: httpx.AsyncClient, storage: FakeStorage, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    """`my_translations` counts the caller's own translations, and only live ones."""
+    from suliko.domain.order_files import upload_document_file
+    from suliko.models.portal import FileKind
+
+    await giorgi_at_acme(client)
+    user = as_user(GIORGI)
+    path = files_path(1001)
+
+    def counts(order: dict[str, Any]) -> dict[int, int]:
+        return {document["id"]: document["my_translations"] for document in order["documents"]}
+
+    async def listed() -> dict[int, int]:
+        orders = (await client.get(f"{API}/portal/assignments", headers=user)).json()
+        return counts(next(order for order in orders if order["order_id"] == 101))
+
+    async def detailed() -> dict[int, int]:
+        response = await client.get(f"{API}/portal/organizations/acme/orders/101", headers=user)
+        return counts(response.json())
+
+    # What the bureau puts there is not something the translator handed in:
+    # neither the file to translate, nor a translation of the bureau's own.
+    await staff_file(maker, storage, 1001, "passport.pdf", b"%PDF")
+    with tenant_scope(ACME):
+        async with maker() as db:
+            document = await db.get(OrderDocument, 1001)
+            assert document is not None
+            order = await db.get(Order, document.order_id)
+            assert order is not None
+            await upload_document_file(
+                db,
+                storage,
+                order=order,
+                document=document,
+                kind=FileKind.TRANSLATION,
+                file_name="by the bureau.docx",
+                content=b"theirs",
+                content_type="application/msword",
+                uploaded_by="user:1",
+            )
+            await db.commit()
+    assert set((await listed()).values()) == {0}
+    assert set((await detailed()).values()) == {0}
+
+    first = await client.post(
+        path, headers=user, files={"file": ("a.docx", b"one", "application/msword")}
+    )
+    second = await client.post(
+        path, headers=user, files={"file": ("b.docx", b"two", "application/msword")}
+    )
+    assert first.status_code == second.status_code == 201
+
+    # Counted on the document they went to, and on no other.
+    for seen in (await listed(), await detailed()):
+        assert seen[1001] == 2
+        assert all(count == 0 for document_id, count in seen.items() if document_id != 1001)
+
+    # Taken back: no longer counted.
+    response = await client.delete(f"{path}/{first.json()['id']}", headers=user)
+    assert response.status_code == 204
+    assert (await listed())[1001] == 1
+    assert (await detailed())[1001] == 1
+
+
 async def test_a_ticket_opens_only_its_own_request(client: httpx.AsyncClient) -> None:
     await giorgi_at_acme(client)
     upload = {"file": ("t.txt", b"x", "text/plain")}

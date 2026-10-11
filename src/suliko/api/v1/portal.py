@@ -68,6 +68,7 @@ from suliko.core.errors import (
 )
 from suliko.domain.order_files import (
     attachment_headers,
+    count_files_added_by,
     downloadable,
     get_document_file,
     list_document_files,
@@ -135,6 +136,9 @@ class AssignedDocumentOut(BaseModel):
     source_language: str
     target_language: str
     page_count: int
+    #: How many translations the caller has added to the document and not
+    #: taken back. More than none is what suliko.ge shows as "sent".
+    my_translations: int = 0
 
 
 class AssignedOrderOut(BaseModel):
@@ -319,13 +323,14 @@ def _assigned_document(order: AssignedOrder, document_id: int) -> AssignedDocume
     raise NotFoundError("Document not found.")
 
 
-def _document_out(item: AssignedDocument) -> AssignedDocumentOut:
+def _document_out(item: AssignedDocument, my_translations: int = 0) -> AssignedDocumentOut:
     return AssignedDocumentOut(
         id=item.document.id,
         document_type_name=item.document_type_name,
         source_language=item.document.source_language,
         target_language=item.document.target_language,
         page_count=item.document.page_count,
+        my_translations=my_translations,
     )
 
 
@@ -421,6 +426,13 @@ async def list_assignments(
     for organization in await linked_organizations(db, translator.id):
         async with tenants(organization.tenant_id) as tenant_db:
             orders = await assigned_orders(tenant_db, organization.translator_id)
+            # What the caller has already handed in, for the whole list at once.
+            sent = await count_files_added_by(
+                tenant_db,
+                (item.document.id for order in orders for item in order.documents),
+                kind=FileKind.TRANSLATION,
+                uploaded_by=_uploader_tag(identity),
+            )
         result.extend(
             AssignedOrderOut(
                 organization=_organization_out(organization),
@@ -429,7 +441,9 @@ async def list_assignments(
                 client_name=order.client_name,
                 order_date=order.order.order_date,
                 due_date=order.order.due_date,
-                documents=[_document_out(item) for item in order.documents],
+                documents=[
+                    _document_out(item, sent.get(item.document.id, 0)) for item in order.documents
+                ],
             )
             for order in orders
         )
@@ -466,9 +480,12 @@ async def get_assigned_order(
             ]
             started = await _own_translations(tenant_db, item.document.id, identity)
             file_ids = await public_file_ids(tenant_db, started)
+            mine = sum(
+                1 for file in files if file.kind is FileKind.TRANSLATION and file.uploaded_by_me
+            )
             documents.append(
                 AssignedDocumentDetail(
-                    **_document_out(item).model_dump(),
+                    **_document_out(item, mine).model_dump(),
                     files_state=state,
                     files=files,
                     translations=[translation_out(row, file_ids) for row in started],
