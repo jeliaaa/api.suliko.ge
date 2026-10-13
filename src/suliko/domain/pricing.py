@@ -120,6 +120,12 @@ class DocumentPricingInput:
     #: ``base_rate_per_minute``: no document type, no notary.
     service_type: ServiceType = ServiceType.WRITTEN
     base_rate_per_minute: Decimal | None = None
+    #: Characters with spaces, for a bureau that prices by characters. The
+    #: translation is then priced from the standard pages they make
+    #: (``characters_per_page`` each, at least one); notary fees still follow
+    #: ``page_count``, the physical pages. None: priced by ``page_count``.
+    character_count: int | None = None
+    characters_per_page: int = 1800
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +152,10 @@ class PriceBreakdown:
     is_notarized: bool
     used_fallback_rate: bool
     service_type: ServiceType = ServiceType.WRITTEN
+    #: Set when the translation was priced from characters.
+    character_count: int | None = None
+    #: The standard pages those characters came to, for showing the working.
+    standard_pages: Decimal | None = None
 
     @property
     def profit(self) -> Decimal:
@@ -186,7 +196,17 @@ def price_document(
 
     urgency_multiplier = cfg.urgency_multiplier(doc.urgency)
 
-    translation_cost = base_rate * page_count * doc.document_type_multiplier * urgency_multiplier
+    # What the translation is counted in: the physical pages, or standard
+    # pages worked out from characters (never less than one).
+    standard_pages: Decimal | None = None
+    billed_pages = Decimal(page_count)
+    if doc.character_count:
+        standard_pages = max(
+            Decimal(1), Decimal(doc.character_count) / Decimal(max(1, doc.characters_per_page))
+        )
+        billed_pages = standard_pages
+
+    translation_cost = base_rate * billed_pages * doc.document_type_multiplier * urgency_multiplier
 
     is_notarized = doc.is_notarized if doc.is_notarized is not None else doc.copy_type.is_notarized
 
@@ -223,6 +243,8 @@ def price_document(
         page_count=page_count,
         is_notarized=is_notarized,
         used_fallback_rate=used_fallback,
+        character_count=doc.character_count or None,
+        standard_pages=standard_pages,
     )
 
 

@@ -90,6 +90,10 @@ class ReferenceData(BaseModel):
     #: the frontend's, so they can be translated; these are shown as typed.
     acquisition_sources: list[str] = Field(default_factory=list)
     custom_statuses: list[str] = Field(default_factory=list)
+    #: "pages", or "characters" when the bureau prices written work by the
+    #: characters (with spaces) of each document, `characters_per_page` to a page.
+    pricing_unit: str = "pages"
+    characters_per_page: int = 1800
 
 
 @router.get("", response_model=ReferenceData)
@@ -151,6 +155,8 @@ async def get_reference(
     return ReferenceData(
         acquisition_sources=custom[OptionList.ACQUISITION_SOURCE],
         custom_statuses=custom[OptionList.ORDER_STATUS],
+        pricing_unit=settings.pricing_unit.value if settings else "pages",
+        characters_per_page=int(settings.characters_per_page) if settings else 1800,
         languages=languages,
         document_types=document_types,
         language_pairs=language_pairs,

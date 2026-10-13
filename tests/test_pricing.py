@@ -409,3 +409,56 @@ def test_a_written_line_is_unchanged_by_the_oral_fields() -> None:
         )
     )
     assert b.price == Decimal("80.00")
+
+
+# ── Characters ──────────────────────────────────────────────────────────────
+
+
+def _by_chars(**overrides: object) -> DocumentPricingInput:
+    values: dict[str, object] = {
+        "page_count": 3,  # physical pages: what the notary charges by
+        "base_rate_per_page": Decimal("20"),
+        "document_type_multiplier": Decimal("1"),
+        "copy_type": CopyType.ORIGINAL,
+        "urgency": Urgency.STANDARD,
+        "character_count": 3600,
+        "characters_per_page": 1800,
+    }
+    values.update(overrides)
+    return DocumentPricingInput(**values)  # type: ignore[arg-type]
+
+
+def test_characters_become_standard_pages_and_are_priced_per_page() -> None:
+    b = price_document(_by_chars())
+    assert b.standard_pages == Decimal("2")
+    assert b.price == Decimal("40.00")  # 2 standard pages x 20, not the 3 physical ones
+    assert b.character_count == 3600
+
+
+def test_a_partial_standard_page_is_charged_in_proportion() -> None:
+    b = price_document(_by_chars(character_count=2700))
+    assert b.price == Decimal("30.00")  # 1.5 x 20
+
+
+def test_a_tiny_text_is_never_less_than_one_standard_page() -> None:
+    assert price_document(_by_chars(character_count=100)).price == Decimal("20.00")
+
+
+def test_the_page_size_is_the_bureaus() -> None:
+    assert price_document(_by_chars(characters_per_page=1000)).price == Decimal("72.00")
+
+
+def test_notary_fees_still_follow_the_physical_pages() -> None:
+    plain = price_document(_by_chars())
+    notarised = price_document(_by_chars(copy_type=CopyType.NOTARY_COPY))
+    pages_only = price_document(
+        _by_chars(copy_type=CopyType.NOTARY_COPY, character_count=None, page_count=3)
+    )
+    assert notarised.notary_cost == pages_only.notary_cost > 0
+    assert notarised.price - notarised.notary_cost == plain.price
+
+
+def test_no_character_count_prices_by_pages_as_before() -> None:
+    b = price_document(_by_chars(character_count=None))
+    assert b.price == Decimal("60.00")  # 3 pages x 20
+    assert b.standard_pages is None

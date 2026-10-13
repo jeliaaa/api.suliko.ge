@@ -106,6 +106,9 @@ class OrderDocumentIn(BaseModel):
     source_language: str = Field(min_length=2, max_length=5)
     target_language: str = Field(min_length=2, max_length=5)
     page_count: int = Field(ge=1, le=10_000)
+    #: Characters with spaces, for a bureau that prices by characters. The
+    #: translation is priced from it; `page_count` stays the physical pages.
+    character_count: int | None = Field(default=None, ge=1, le=100_000_000)
     copy_type: CopyType = CopyType.ORIGINAL
     #: Overrides what `copy_type` implies. Staff notarise a translation of an
     #: original, or waive notarisation on a notary copy type. None = derive.
@@ -133,6 +136,7 @@ class OrderDocumentIn(BaseModel):
             ):
                 raise ValueError("An oral line has no copy type, notarisation or notary.")
             self.document_type_id = None
+            self.character_count = None
         return self
 
 
@@ -192,6 +196,7 @@ class OrderDocumentUpdate(BaseModel):
     source_language: str | None = Field(default=None, min_length=2, max_length=5)
     target_language: str | None = Field(default=None, min_length=2, max_length=5)
     page_count: int | None = Field(default=None, ge=1, le=10_000)
+    character_count: int | None = Field(default=None, ge=1, le=100_000_000)
     copy_type: CopyType | None = None
     is_notarized: bool | None = None
     translator_id: int | None = None
@@ -239,6 +244,8 @@ class OrderDocumentOut(BaseModel):
     source_language: str
     target_language: str
     page_count: int
+    #: Characters with spaces, when the line was priced by characters.
+    character_count: int | None = None
     copy_type: CopyType
     is_notarized: bool
     price: Decimal
@@ -711,6 +718,7 @@ async def _load_detail(
                 source_language=d.source_language,
                 target_language=d.target_language,
                 page_count=d.page_count,
+                character_count=d.character_count,
                 copy_type=d.copy_type,
                 is_notarized=d.is_notarized,
                 price=d.price,
@@ -752,6 +760,11 @@ async def _document_row(
 ) -> OrderDocument:
     """A priced document row for `order`, overrides applied."""
     oral = item.service_type is ServiceType.ORAL
+    if not oral and ctx.count_by_characters and item.character_count is None:
+        raise ValidationError(
+            "Enter the number of characters (with spaces) for each document: "
+            "this bureau prices by characters."
+        )
     _require_rate(
         ctx,
         item.source_language,
@@ -768,6 +781,7 @@ async def _document_row(
         copy_type=item.copy_type,
         urgency=order.urgency,
         is_notarized=item.is_notarized,
+        character_count=item.character_count,
     )
     # Overrides win: the calculated figure is a starting point, and a
     # negotiated price is a business fact.
@@ -784,6 +798,7 @@ async def _document_row(
         source_language=item.source_language.lower(),
         target_language=item.target_language.lower(),
         page_count=item.page_count,
+        character_count=item.character_count if oral is False else None,
         copy_type=item.copy_type,
         is_notarized=breakdown.is_notarized,
         price=item.price_override if item.price_override is not None else breakdown.price,
@@ -889,6 +904,7 @@ def _computed(document: OrderDocument, ctx: PricingContext, urgency: Urgency) ->
         copy_type=document.copy_type,
         urgency=urgency,
         is_notarized=document.is_notarized,
+        character_count=document.character_count,
     )
 
 
@@ -1058,7 +1074,13 @@ async def update_order_document(
         raise NotFoundError("Order not found.")
 
     changes = payload.model_dump(exclude_unset=True)
-    nullable = {"translator_id", "notary_id", "is_notarized", "document_type_id"}
+    nullable = {
+        "translator_id",
+        "notary_id",
+        "is_notarized",
+        "document_type_id",
+        "character_count",
+    }
     for key, value in changes.items():
         if value is None and key not in nullable:
             raise ValidationError(f"{key} cannot be empty.")
@@ -1081,6 +1103,7 @@ async def update_order_document(
         "source_language",
         "target_language",
         "page_count",
+        "character_count",
         "copy_type",
         "is_notarized",
     }

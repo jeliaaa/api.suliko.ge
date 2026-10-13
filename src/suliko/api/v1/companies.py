@@ -54,6 +54,7 @@ from suliko.core.errors import ConflictError, NotFoundError
 from suliko.domain.clock import today_in
 from suliko.domain.invoice_numbers import new_invoice_number
 from suliko.domain.orders import base_order_query
+from suliko.domain.pricing_context import tenant_settings
 from suliko.models.directory import Client, ClientType
 from suliko.models.invoice import Invoice
 from suliko.models.order import Order, OrderDocument, ServiceType
@@ -148,9 +149,9 @@ class InvoiceLine(BaseModel):
     description: str
     #: Full names in the invoice's language ("ქართული → ინგლისური"), not codes.
     languages: str
-    #: Pages, or minutes when `unit` is "minutes".
+    #: Pages, minutes or characters, as `unit` says.
     pages: int
-    unit: Literal["pages", "minutes"] = "pages"
+    unit: Literal["pages", "minutes", "characters"] = "pages"
     unit_price: Decimal
     amount: Decimal
 
@@ -566,6 +567,23 @@ async def _issued_invoice(db: AsyncSession, order_id: int, today: date) -> Invoi
     raise ConflictError("Could not allocate an invoice number. Try again.")
 
 
+def _unit_of(d: OrderDocument) -> Literal["pages", "minutes", "characters"]:
+    if d.service_type is ServiceType.ORAL:
+        return "minutes"
+    return "characters" if d.character_count else "pages"
+
+
+def _unit_price(d: OrderDocument, characters_per_page: int) -> Decimal:
+    """What one unit of the line cost, for display: per page, minute, or
+    standard page of characters. Zero units shows the whole amount."""
+    if d.character_count:
+        per_page = Decimal(characters_per_page)
+        return (d.price * per_page / Decimal(d.character_count)).quantize(Decimal("0.01"))
+    if d.page_count:
+        return (d.price / d.page_count).quantize(Decimal("0.01"))
+    return d.price
+
+
 @invoice_router.get("/{order_id}/invoice", response_model=InvoiceOut)
 async def order_invoice(
     order_id: int,
@@ -616,6 +634,8 @@ async def order_invoice(
         )
 
     docs = (await db.execute(_invoice_documents_query(order_id))).unique().scalars().all()
+    settings = await tenant_settings(db)
+    characters_per_page = int(settings.characters_per_page) if settings else 1800
 
     codes = {d.source_language for d in docs} | {d.target_language for d in docs}
     names = {
@@ -634,14 +654,13 @@ async def order_invoice(
                 if locale == "en" and d.document_type
                 else (d.document_type.name_ka if d.document_type else "Translation")
             ),
-            unit="minutes" if d.service_type is ServiceType.ORAL else "pages",
+            unit=_unit_of(d),
             languages=_language_pair(d.source_language, d.target_language, names, locale),
-            pages=d.page_count,
-            # Per page, derived for display only. The authority is `amount`.
-            # Rounded: 100 / 3 is not a price anyone can print.
-            unit_price=(d.price / d.page_count).quantize(Decimal("0.01"))
-            if d.page_count
-            else d.price,
+            pages=d.character_count if _unit_of(d) == "characters" else d.page_count,
+            # Per unit, derived for display only. The authority is `amount`.
+            # Rounded: 100 / 3 is not a price anyone can print. A line counted
+            # in characters shows its price per standard page, not per character.
+            unit_price=_unit_price(d, characters_per_page),
             amount=d.price,
         )
         for d in docs

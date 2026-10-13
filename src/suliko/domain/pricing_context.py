@@ -25,7 +25,12 @@ from suliko.domain.pricing import (
     price_document,
 )
 from suliko.models.order import CopyType, ServiceType, Urgency
-from suliko.models.reference import DocumentType, LanguagePairPrice, TenantSettings
+from suliko.models.reference import (
+    DocumentType,
+    LanguagePairPrice,
+    PricingUnit,
+    TenantSettings,
+)
 
 #: Days from order date to the default due date, when a tenant has no
 #: settings row. Same as the PHP portal/API and the column defaults.
@@ -46,6 +51,10 @@ class PricingContext:
     #: document_type_id -> multiplier, for the types that were asked about.
     multipliers: dict[int, Decimal]
     due_days: dict[Urgency, int] = field(default_factory=lambda: dict(DEFAULT_DUE_DAYS))
+    #: Written work counted in characters instead of pages (a bureau setting).
+    count_by_characters: bool = False
+    #: Characters in one standard page, when counting by characters.
+    characters_per_page: int = 1800
 
     def rate(self, source: str, target: str) -> Decimal | None:
         return self.rates.get((source.lower(), target.lower()))
@@ -64,6 +73,7 @@ class PricingContext:
         urgency: Urgency,
         is_notarized: bool | None = None,
         service_type: ServiceType = ServiceType.WRITTEN,
+        character_count: int | None = None,
     ) -> PriceBreakdown:
         return price_document(
             DocumentPricingInput(
@@ -77,6 +87,8 @@ class PricingContext:
                 is_notarized=is_notarized,
                 service_type=service_type,
                 base_rate_per_minute=self.minute_rate(source_language, target_language),
+                character_count=character_count,
+                characters_per_page=self.characters_per_page,
             ),
             self.config,
         )
@@ -148,6 +160,8 @@ async def load_pricing_context(
         config=config_from_settings(settings, plan),
         rates=rates,
         minute_rates=minute_rates,
+        count_by_characters=bool(settings and settings.pricing_unit is PricingUnit.CHARACTERS),
+        characters_per_page=int(settings.characters_per_page) if settings else 1800,
         multipliers=multipliers,
         due_days=due_days_from_settings(settings),
     )

@@ -61,6 +61,8 @@ LATER_REVISIONS = (
     "0022_oral_interpreting.py",
     # One column on orders — see test_migration_0023.py.
     "0023_order_identifier.py",
+    # Pricing by characters — see test_migration_0024.py.
+    "0024_pricing_by_characters.py",
 )
 
 
