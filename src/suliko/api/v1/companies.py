@@ -170,8 +170,11 @@ class InvoiceOut(BaseModel):
     bank: InvoiceBank | None
 
     order_id: int
-    #: The order's number in the bureau, which the invoice prints.
+    #: The order's number in the bureau. Kept for clients that read it; the
+    #: invoice no longer prints it.
     order_number: int
+    #: The client's own reference (a tender number), printed when there is one.
+    reference: str | None = None
     order_date: date
     due_date: date | None
 
@@ -702,6 +705,7 @@ async def order_invoice(
         ),
         order_id=order.id,
         order_number=order.number,
+        reference=order.identifier,
         order_date=order.order_date,
         due_date=order.due_date,
         lines=lines,

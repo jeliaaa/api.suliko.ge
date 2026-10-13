@@ -86,6 +86,7 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 
 MAX_DOCUMENTS = 50
 NOTES_MAX = 5000
+IDENTIFIER_MAX = 100
 
 OrdersReader = Annotated[AuthenticatedSession, Depends(require(Permission.ORDERS_READ))]
 OrdersWriter = Annotated[AuthenticatedSession, Depends(require(Permission.ORDERS_WRITE))]
@@ -144,6 +145,8 @@ class OrderCreate(BaseModel):
     #: Omitted -> order date plus the tenant's days for this urgency.
     due_date: date | None = None
     contact_info: str | None = Field(default=None, max_length=255)
+    #: The client's own reference, such as a tender number. Blank is none.
+    identifier: str | None = Field(default=None, max_length=IDENTIFIER_MAX)
     urgency: Urgency = Urgency.STANDARD
     handover_method: HandoverMethod = HandoverMethod.SCAN
     delivery_address: str | None = Field(default=None, max_length=500)
@@ -160,6 +163,8 @@ class OrderUpdate(BaseModel):
     order_date: date | None = None
     due_date: date | None = None
     contact_info: str | None = Field(default=None, max_length=255)
+    #: Null or blank clears it.
+    identifier: str | None = Field(default=None, max_length=IDENTIFIER_MAX)
     urgency: Urgency | None = None
     handover_method: HandoverMethod | None = None
     delivery_address: str | None = Field(default=None, max_length=500)
@@ -250,6 +255,8 @@ class OrderSummary(BaseModel):
     id: int
     #: What people see: 1, 2, 3 within the bureau. `id` is for links only.
     number: int
+    #: The client's own reference (a tender number), when the order has one.
+    identifier: str | None = None
     order_date: date
     due_date: date | None
     client_id: int
@@ -357,6 +364,7 @@ def _summary_from_row(row: Row[Any], *, today: date, show_costs: bool) -> OrderS
     return OrderSummary(
         id=order.id,
         number=order.number,
+        identifier=order.identifier,
         order_date=order.order_date,
         due_date=order.due_date,
         client_id=order.client_id,
@@ -533,6 +541,8 @@ async def list_orders(
             Client.email.ilike(pattern, escape=LIKE_ESCAPE),
             Client.personal_number.ilike(pattern, escape=LIKE_ESCAPE),
             Order.contact_info.ilike(pattern, escape=LIKE_ESCAPE),
+            # The client's own reference, such as a tender number.
+            Order.identifier.ilike(pattern, escape=LIKE_ESCAPE),
             # Who is translating it — the question the office phone usually asks.
             has_document(
                 OrderDocument.translator_id.in_(
@@ -815,6 +825,7 @@ async def create_order(payload: OrderCreate, db: Db, session: OrdersWriter) -> O
         order_date=order_date,
         due_date=payload.due_date or add_days(order_date, ctx.due_days[payload.urgency]),
         contact_info=payload.contact_info or client.phone,
+        identifier=(payload.identifier or "").strip() or None,
         urgency=payload.urgency,
         handover_method=payload.handover_method,
         delivery_address=payload.delivery_address,
@@ -920,6 +931,9 @@ async def update_order(
     handover_changed = (
         "handover_method" in changes and changes["handover_method"] != order.handover_method
     )
+
+    if "identifier" in changes:
+        changes["identifier"] = (changes["identifier"] or "").strip() or None
 
     for field, value in changes.items():
         setattr(order, field, value)

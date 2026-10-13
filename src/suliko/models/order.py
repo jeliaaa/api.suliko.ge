@@ -105,6 +105,11 @@ class Order(Base, IdMixin, TenantScoped, TimestampMixin):
 
     contact_info: Mapped[str | None] = mapped_column(String(255), default=None)
 
+    #: The client's own reference for this order, such as a tender number.
+    #: Free text, optional, and usually empty: the order's number in the bureau
+    #: stays what people see and quote. Searchable, printed on the invoice.
+    identifier: Mapped[str | None] = mapped_column(String(100), default=None)
+
     urgency: Mapped[Urgency] = mapped_column(
         Enum(Urgency, name="urgency", values_callable=enum_values, native_enum=False, length=20),
         default=Urgency.STANDARD,
