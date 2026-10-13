@@ -112,6 +112,11 @@ class Translator(Base, IdMixin, TenantScoped, TimestampMixin):
         Boolean, default=False, server_default=false(), nullable=False
     )
 
+    # Cities where they certify, as codes from ``domain.cities`` joined by
+    # commas with a comma at each end (",tbilisi,batumi,"), so a filter is a
+    # plain LIKE on ",code,". Null: none given.
+    cities: Mapped[str | None] = mapped_column(String(300), default=None)
+
     # Translator-portal credentials. Presence of a username is what the UI
     # renders as the "Active" / "None" account badge.
     portal_username: Mapped[str | None] = mapped_column(String(100), default=None)

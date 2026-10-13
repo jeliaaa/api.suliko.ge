@@ -41,6 +41,7 @@ from suliko.domain.portal import (
     portal_translator_for,
     registration_url,
 )
+from suliko.domain.cities import CITIES, pack, unpack
 from suliko.integrations.suliko_backend import SulikoBackend, SulikoUser, get_suliko_backend
 from suliko.models.directory import Translator, TranslatorLanguagePair
 from suliko.models.portal import (
@@ -83,6 +84,16 @@ class LanguagePairOut(BaseModel):
     rate_per_page: Decimal | None
 
 
+def _valid_cities(cities: list[str] | None) -> list[str] | None:
+    if cities is None:
+        return None
+    cleaned = [c.strip().lower() for c in cities]
+    unknown = sorted({c for c in cleaned if c not in CITIES})
+    if unknown:
+        raise ValueError(f"not a known city: {', '.join(unknown)}")
+    return list(dict.fromkeys(cleaned))
+
+
 def _unique_pairs(pairs: list[LanguagePairIn] | None) -> list[LanguagePairIn] | None:
     if pairs is None:
         return None
@@ -114,6 +125,8 @@ class TranslatorBase(BaseModel):
     can_notarize: bool = False
     works_written: bool = True
     works_oral: bool = False
+    #: City codes (``domain.cities``) where they certify.
+    cities: list[str] = Field(default_factory=list, max_length=len(CITIES))
 
 
 class TranslatorCreate(TranslatorBase):
@@ -124,6 +137,7 @@ class TranslatorCreate(TranslatorBase):
         if not (self.works_written or self.works_oral):
             raise ValueError("a translator does written work, oral work, or both")
         _unique_pairs(self.language_pairs)
+        self.cities = _valid_cities(self.cities) or []
         return self
 
 
@@ -144,12 +158,14 @@ class TranslatorUpdate(BaseModel):
     can_notarize: bool | None = None
     works_written: bool | None = None
     works_oral: bool | None = None
+    cities: list[str] | None = Field(default=None, max_length=len(CITIES))
     #: Sent: replaces the whole set. Left out: the pairs stay as they are.
     language_pairs: list[LanguagePairIn] | None = Field(default=None, max_length=100)
 
     @model_validator(mode="after")
     def _pairs_once(self) -> TranslatorUpdate:
         _unique_pairs(self.language_pairs)
+        self.cities = _valid_cities(self.cities)
         return self
 
 
@@ -167,6 +183,7 @@ class TranslatorSummary(BaseModel):
     can_notarize: bool
     works_written: bool
     works_oral: bool
+    cities: list[str]
     language_pairs: list[LanguagePairOut]
 
 
@@ -197,6 +214,7 @@ def _summary(row: Translator, pairs: list[TranslatorLanguagePair]) -> Translator
         can_notarize=row.can_notarize,
         works_written=row.works_written,
         works_oral=row.works_oral,
+        cities=unpack(row.cities),
         language_pairs=[
             LanguagePairOut(
                 source_language=p.source_language,
@@ -288,6 +306,8 @@ async def list_translators(
     is_active: bool | None = None,
     #: A language code: the translators with a pair from or into it.
     language: Annotated[str | None, Query(max_length=5)] = None,
+    #: A city code: the translators who certify there.
+    city: Annotated[str | None, Query(max_length=30)] = None,
     sort: Literal["name", "-name", "id", "-id"] = "-id",
     limit: Annotated[int, Query(ge=1, le=200)] = 20,
     offset: Annotated[int, Query(ge=0)] = 0,
@@ -320,6 +340,9 @@ async def list_translators(
                 )
             )
         )
+
+    if city and city.strip():
+        stmt = stmt.where(Translator.cities.like(f"%,{city.strip().lower()},%"))
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
 
@@ -893,7 +916,8 @@ async def create_translator(
     session: CurrentSession,
     _: Annotated[object, Depends(require(Permission.TRANSLATORS_WRITE))],
 ) -> TranslatorDetail:
-    row = Translator(**payload.model_dump(exclude={"language_pairs"}))
+    fields = payload.model_dump(exclude={"language_pairs", "cities"})
+    row = Translator(**fields, cities=pack(payload.cities))
     db.add(row)
     await db.flush()
     await _replace_pairs(db, row.id, payload.language_pairs)
@@ -926,9 +950,12 @@ async def update_translator(
     changes = payload.model_dump(exclude_unset=True)
     new_pairs = changes.pop("language_pairs", None)
     before = {k: getattr(row, k) for k in changes}
+    if "cities" in changes:
+        before["cities"] = unpack(row.cities)
+        changes["cities"] = payload.cities or []
 
     for field, value in changes.items():
-        setattr(row, field, value)
+        setattr(row, field, pack(value) if field == "cities" else value)
     if not (row.works_written or row.works_oral):
         raise ValidationError("A translator does written work, oral work, or both.")
     await db.flush()

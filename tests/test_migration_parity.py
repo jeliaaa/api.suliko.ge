@@ -53,6 +53,8 @@ LATER_REVISIONS = (
     "0018_translation_from_portal.py",
     # Three flags on translators — see test_migration_0019.py.
     "0019_translator_capabilities.py",
+    # One column on translators — see test_migration_0020.py.
+    "0020_translator_cities.py",
 )
 
 
