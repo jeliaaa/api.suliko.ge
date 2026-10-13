@@ -38,8 +38,8 @@ from suliko.domain.cities import CITIES
 MAX_BYTES = 4 * 1024 * 1024
 MAX_ROWS = 5000
 
-Kind = Literal["clients", "translators"]
-KINDS: tuple[Kind, ...] = ("clients", "translators")
+Kind = Literal["clients", "translators", "orders"]
+KINDS: tuple[Kind, ...] = ("clients", "translators", "orders")
 
 
 # ── The fields of each kind ─────────────────────────────────────────────────
@@ -206,6 +206,147 @@ SYNONYMS: dict[str, dict[str, tuple[str, ...]]] = {
             "языки",
         ),
     },
+}
+
+
+FIELDS["orders"] = (
+    FieldSpec("client_name"),
+    FieldSpec("client_phone"),
+    FieldSpec("client_email"),
+    FieldSpec("client_personal_number"),
+    FieldSpec("order_date", required=True),
+    FieldSpec("due_date"),
+    FieldSpec("language_pair"),
+    FieldSpec("source_language"),
+    FieldSpec("target_language"),
+    FieldSpec("document_type"),
+    FieldSpec("pages"),
+    FieldSpec("price", required=True),
+    FieldSpec("translator"),
+    FieldSpec("translator_cost"),
+    FieldSpec("status"),
+    FieldSpec("paid"),
+    FieldSpec("identifier"),
+    FieldSpec("notes"),
+)
+
+SYNONYMS["orders"] = {
+    "client_name": (
+        "client",
+        "client name",
+        "customer",
+        "name",
+        "კლიენტი",
+        "კლიენტის სახელი",
+        "დამკვეთი",
+        "სახელი გვარი",
+        "клиент",
+        "заказчик",
+    ),
+    "client_phone": (
+        "phone",
+        "tel",
+        "mobile",
+        "client phone",
+        "ტელეფონი",
+        "ტელ",
+        "მობილური",
+        "телефон",
+    ),
+    "client_email": ("email", "e-mail", "client email", "ელფოსტა", "იმეილი", "почта"),
+    "client_personal_number": (
+        "id",
+        "id number",
+        "personal number",
+        "პირადი ნომერი",
+        "პირადობის ნომერი",
+        "საიდენტიფიკაციო კოდი",
+        "ს კ",
+    ),
+    "order_date": (
+        "date",
+        "order date",
+        "created",
+        "received",
+        "თარიღი",
+        "შეკვეთის თარიღი",
+        "მიღების თარიღი",
+        "дата",
+    ),
+    "due_date": (
+        "due",
+        "due date",
+        "deadline",
+        "ვადა",
+        "ბოლო ვადა",
+        "გადაცემის თარიღი",
+        "срок",
+    ),
+    "language_pair": (
+        "languages",
+        "language pair",
+        "pair",
+        "ენები",
+        "ენობრივი წყვილი",
+        "მიმართულება",
+        "языки",
+    ),
+    "source_language": ("from", "source", "source language", "საიდან", "ორიგინალის ენა", "с"),
+    "target_language": ("to", "target", "target language", "სად", "თარგმანის ენა", "на"),
+    "document_type": (
+        "document",
+        "document type",
+        "type",
+        "doc type",
+        "დოკუმენტი",
+        "დოკუმენტის ტიპი",
+        "ტიპი",
+        "документ",
+    ),
+    "pages": (
+        "pages",
+        "page count",
+        "qty",
+        "quantity",
+        "გვერდი",
+        "გვერდები",
+        "გვერდების რაოდენობა",
+        "страниц",
+    ),
+    "price": (
+        "price",
+        "amount",
+        "total",
+        "cost",
+        "sum",
+        "ფასი",
+        "თანხა",
+        "ღირებულება",
+        "ჯამი",
+        "цена",
+        "сумма",
+    ),
+    "translator": ("translator", "თარჯიმანი", "переводчик"),
+    "translator_cost": (
+        "translator cost",
+        "translator fee",
+        "translator payment",
+        "თარჯიმნის ანაზღაურება",
+        "თარჯიმნის თანხა",
+    ),
+    "status": ("status", "სტატუსი", "статус"),
+    "paid": ("paid", "paid amount", "payment", "გადახდილი", "გადახდილი თანხა", "оплачено"),
+    "identifier": (
+        "identifier",
+        "tender",
+        "tender number",
+        "reference",
+        "ref",
+        "იდენტიფიკატორი",
+        "ტენდერი",
+        "ტენდერის ნომერი",
+    ),
+    "notes": ("notes", "note", "comment", "comments", "შენიშვნა", "კომენტარი", "примечание"),
 }
 
 
@@ -409,6 +550,47 @@ def parse_rate(value: str) -> Decimal | None:
     return amount if Decimal(0) <= amount <= Decimal(100000) else None
 
 
+_DATE_FORMATS = (
+    "%d.%m.%Y",
+    "%d.%m.%y",
+    "%d/%m/%Y",
+    "%d/%m/%y",
+    "%d-%m-%Y",
+    "%Y-%m-%d",
+    "%Y/%m/%d",
+    "%d.%m.%Y %H:%M",
+    "%Y-%m-%d %H:%M:%S",
+)
+
+
+def parse_date(value: Any) -> date | None:
+    """A date from an Excel date cell or from text such as "25.10.2025" or "2025-10-25".
+
+    Day first, as Georgian sheets are written. None for anything else, and for
+    years outside 2000 to 2100, which are a typo or a serial number.
+    """
+    if isinstance(value, datetime):
+        found: date | None = value.date()
+    elif isinstance(value, date):
+        found = value
+    else:
+        text = cell_text(value)
+        found = None
+        for pattern in _DATE_FORMATS:
+            try:
+                found = datetime.strptime(text, pattern).date()  # noqa: DTZ007 (a calendar date, no zone)
+                break
+            except ValueError:
+                continue
+    return found if found and 2000 <= found.year <= 2100 else None
+
+
+def parse_int(value: str) -> int | None:
+    """ "3", "3.0" and "3 pages" as 3; None when there is no whole number."""
+    match = re.search(r"\d+", value.replace(",", "."))
+    return int(match.group()) if match else None
+
+
 # ── Judging rows ────────────────────────────────────────────────────────────
 
 
@@ -436,40 +618,52 @@ class ExistingPerson:
     email: str | None = None
     personal_number: str | None = None
     name: str | None = None
+    #: What the record is called elsewhere: a client's id, or a placeholder for one
+    #: this import is about to create.
+    ref: int | str | None = None
 
 
 class Seen:
     """Who is already known: the bureau's records, then the rows accepted so far."""
 
     def __init__(self, existing: Iterable[ExistingPerson] = ()) -> None:
-        self.by_phone: dict[str, str] = {}
-        self.by_email: dict[str, str] = {}
-        self.by_number: dict[str, str] = {}
-        self.by_name: dict[str, str] = {}
+        # Each maps to (label, ref).
+        self.by_phone: dict[str, tuple[str, int | str | None]] = {}
+        self.by_email: dict[str, tuple[str, int | str | None]] = {}
+        self.by_number: dict[str, tuple[str, int | str | None]] = {}
+        self.by_name: dict[str, tuple[str, int | str | None]] = {}
         for person in existing:
             self.add(person)
 
     def add(self, person: ExistingPerson) -> None:
+        entry = (person.label, person.ref)
         if key := phone_key(person.phone):
-            self.by_phone.setdefault(key, person.label)
+            self.by_phone.setdefault(key, entry)
         if person.email:
-            self.by_email.setdefault(person.email.casefold(), person.label)
+            self.by_email.setdefault(person.email.casefold(), entry)
         if person.personal_number:
-            self.by_number.setdefault(person.personal_number.casefold(), person.label)
+            self.by_number.setdefault(person.personal_number.casefold(), entry)
         if person.name:
-            self.by_name.setdefault(person.name.casefold(), person.label)
+            self.by_name.setdefault(person.name.casefold(), entry)
+
+    def match_ref(
+        self, person: ExistingPerson, *, by_name: bool = False
+    ) -> tuple[str, str, int | str | None] | None:
+        """(what matched, the record's label, its ref), or None."""
+        if (key := phone_key(person.phone)) and key in self.by_phone:
+            return ("phone", *self.by_phone[key])
+        if person.email and person.email.casefold() in self.by_email:
+            return ("email", *self.by_email[person.email.casefold()])
+        if person.personal_number and person.personal_number.casefold() in self.by_number:
+            return ("ID number", *self.by_number[person.personal_number.casefold()])
+        if by_name and person.name and person.name.casefold() in self.by_name:
+            return ("name", *self.by_name[person.name.casefold()])
+        return None
 
     def match(self, person: ExistingPerson, *, by_name: bool = False) -> tuple[str, str] | None:
         """(what matched, the record's label), or None."""
-        if (key := phone_key(person.phone)) and key in self.by_phone:
-            return "phone", self.by_phone[key]
-        if person.email and person.email.casefold() in self.by_email:
-            return "email", self.by_email[person.email.casefold()]
-        if person.personal_number and person.personal_number.casefold() in self.by_number:
-            return "ID number", self.by_number[person.personal_number.casefold()]
-        if by_name and person.name and person.name.casefold() in self.by_name:
-            return "name", self.by_name[person.name.casefold()]
-        return None
+        hit = self.match_ref(person, by_name=by_name)
+        return (hit[0], hit[1]) if hit else None
 
 
 def _cell(cells: list[Any], mapping: dict[str, int], key: str) -> str:
@@ -728,9 +922,14 @@ def judge_sheet(
     mapping: dict[str, int],
     existing: Iterable[ExistingPerson],
     language_lookup: Callable[[str], str | None] | None = None,
+    orders: Any = None,
 ) -> Judged:
     seen = Seen(existing)
     results: list[RowResult] = []
+    if kind == "orders":
+        from suliko.domain.imports_orders import judge_orders
+
+        return Judged(judge_orders(sheet, mapping, seen, orders))
     for number, cells in sheet.rows:
         if kind == "clients":
             results.append(judge_client(number, cells, mapping, seen))

@@ -20,7 +20,8 @@ records at once.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
+from decimal import Decimal
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile
@@ -46,12 +47,30 @@ from suliko.domain.imports import (
     read_sheet,
     suggest_mapping,
 )
+from suliko.domain.imports_orders import ExistingOrder, OrdersContext
 from suliko.domain.order_files import safe_file_name
+from suliko.domain.statuses import INITIAL_STATUS, STATUS_DEFINITIONS
+from suliko.models.collaboration import OrderComment
 from suliko.models.directory import Client, ClientType, Translator, TranslatorLanguagePair
-from suliko.models.finance import ClientPayment, TranslatorPayment
+from suliko.models.finance import (
+    ClientPayment,
+    ClientPaymentAllocation,
+    PaymentMethod,
+    TranslatorPayment,
+    TranslatorPaymentAllocation,
+)
 from suliko.models.imports import ImportBatch, ImportBatchItem
-from suliko.models.order import Order, OrderDocument
-from suliko.models.reference import Language
+from suliko.models.order import (
+    CopyType,
+    HandoverMethod,
+    Order,
+    OrderDocument,
+    OrderStatusEvent,
+    ServiceType,
+    Urgency,
+)
+from suliko.models.order_file import OrderFile
+from suliko.models.reference import CustomOption, DocumentType, Language, OptionList
 from suliko.security.permissions import Permission
 
 router = APIRouter(prefix="/imports", tags=["imports"])
@@ -160,7 +179,104 @@ async def _language_lookup(db: Any) -> Any:
     return lookup
 
 
+async def _orders_context(db: Any) -> OrdersContext:
+    """What a row of an orders sheet is matched against: the bureau's own lists."""
+    lookup = await _language_lookup(db)
+
+    types = (
+        await db.execute(
+            select(DocumentType.id, DocumentType.name_en, DocumentType.name_ka)
+            .where(DocumentType.is_active)
+            .order_by(DocumentType.name_en)
+        )
+    ).all()
+    document_types: dict[str, tuple[int, str]] = {}
+    for type_id, name_en, name_ka in types:
+        for word in (name_en, name_ka):
+            if word:
+                document_types.setdefault(word.strip().casefold(), (type_id, name_en or name_ka))
+    default = (types[0][0], types[0][1] or types[0][2]) if types else None
+
+    translators = {
+        name.strip().casefold(): (translator_id, name)
+        for translator_id, name in (
+            await db.execute(select(Translator.id, Translator.name).where(Translator.is_active))
+        ).all()
+    }
+
+    statuses: dict[str, str] = {}
+    for key, definition in STATUS_DEFINITIONS.items():
+        statuses[key.casefold()] = key
+        statuses.setdefault(definition.label.casefold(), key)
+    for value in (
+        await db.execute(
+            select(CustomOption.value).where(CustomOption.list_key == OptionList.ORDER_STATUS)
+        )
+    ).scalars():
+        statuses[value.strip().casefold()] = value
+
+    existing = [
+        ExistingOrder(
+            label=f"order #{number}",
+            client_id=client_id,
+            order_date=order_date,
+            source_language=source,
+            target_language=target,
+            page_count=pages,
+            price=Decimal(str(price)),
+            identifier=identifier,
+        )
+        for number, client_id, order_date, identifier, source, target, pages, price in (
+            await db.execute(
+                select(
+                    Order.number,
+                    Order.client_id,
+                    Order.order_date,
+                    Order.identifier,
+                    OrderDocument.source_language,
+                    OrderDocument.target_language,
+                    OrderDocument.page_count,
+                    OrderDocument.price,
+                ).join(OrderDocument, OrderDocument.order_id == Order.id)
+            )
+        ).all()
+    ]
+    return OrdersContext(
+        language_lookup=lookup,
+        document_types=document_types,
+        default_document_type=default,
+        translators=translators,
+        status_lookup=lambda text: statuses.get(text.strip().casefold()),
+        existing_orders=existing,
+    )
+
+
 async def _existing(db: Any, kind: str) -> list[ExistingPerson]:
+    if kind == "orders":
+        # The bureau's clients, so a row can name one: by phone, email, ID, then name.
+        rows = (
+            await db.execute(
+                select(
+                    Client.id,
+                    Client.number,
+                    Client.name,
+                    Client.phone,
+                    Client.email,
+                    Client.personal_number,
+                )
+            )
+        ).all()
+        return [
+            ExistingPerson(
+                label=f"#{number} {name}",
+                phone=phone,
+                email=email,
+                personal_number=national_id,
+                name=name,
+                ref=client_id,
+            )
+            for client_id, number, name, phone, email, national_id in rows
+        ]
     if kind == "clients":
         rows = (
             await db.execute(
@@ -190,6 +306,16 @@ def _summary(kind: str, values: dict[str, Any]) -> list[str]:
     if not values:
         return []
     parts: list[str] = []
+    if kind == "orders":
+        parts.append(values["order_date"].isoformat())
+        parts.append(f"{values['source_language']}-{values['target_language']}")
+        parts.append(f"{values['document_type_label']} x{values['page_count']}")
+        parts.append(f"{values['price']} GEL")
+        if values["paid"]:
+            parts.append(f"paid {values['paid']}")
+        if values["client"]["new"] is not None:
+            parts.append("new client")
+        return parts
     if kind == "clients":
         parts.append(values["client_type"])
         for key in ("phone", "email", "personal_number"):
@@ -232,6 +358,7 @@ async def _read(
         mapping,
         await _existing(db, kind),
         await _language_lookup(db) if kind == "translators" else None,
+        orders=await _orders_context(db) if kind == "orders" else None,
     )
     return sheet, mapping, judged
 
@@ -331,7 +458,9 @@ async def commit(
     await db.flush()
 
     created: list[tuple[str, int]] = []
-    if kind == "clients":
+    if kind == "orders":
+        created = await _create_orders(db, session, good)
+    elif kind == "clients":
         rows = [
             Client(**{**r.values, "client_type": ClientType(r.values["client_type"])}) for r in good
         ]
@@ -380,6 +509,109 @@ async def commit(
     return _batch_out(batch, can_undo=True)
 
 
+async def _create_orders(db: Any, session: Any, good: list[RowResult]) -> list[tuple[str, int]]:
+    """Clients first, then each order with its document, status history and payment.
+
+    Few flushes: all the clients, all the orders, then everything that hangs
+    from an order, then the allocations that need the payments' ids.
+    """
+    created: list[tuple[str, int]] = []
+
+    new_clients: dict[str, Client] = {}
+    for result in good:
+        spec = result.values["client"]
+        if spec["new"] is not None:
+            new_clients[spec["ref"]] = Client(
+                **{**spec["new"], "client_type": ClientType(spec["new"]["client_type"])}
+            )
+    db.add_all(new_clients.values())
+    await db.flush()
+    created += [("client", client.id) for client in new_clients.values()]
+
+    def client_id_of(ref: int | str) -> int:
+        return new_clients[ref].id if isinstance(ref, str) else ref
+
+    orders = [
+        Order(
+            client_id=client_id_of(r.values["client"]["ref"]),
+            order_date=r.values["order_date"],
+            due_date=r.values["due_date"],
+            identifier=r.values["identifier"],
+            urgency=Urgency.STANDARD,
+            handover_method=HandoverMethod.SCAN,
+            delivery_cost=Decimal("0"),
+            source="import",
+            notes=r.values["notes"],
+            created_by_user_id=session.user_id,
+        )
+        for r in good
+    ]
+    db.add_all(orders)
+    await db.flush()
+    created += [("order", order.id) for order in orders]
+
+    now = datetime.now(UTC)
+    payments: list[tuple[ClientPayment, Order, Decimal]] = []
+    for result, order in zip(good, orders, strict=True):
+        v = result.values
+        db.add(
+            OrderDocument(
+                order_id=order.id,
+                document_type_id=v["document_type_id"],
+                service_type=ServiceType.WRITTEN,
+                source_language=v["source_language"],
+                target_language=v["target_language"],
+                page_count=v["page_count"],
+                copy_type=CopyType.ORIGINAL,
+                is_notarized=False,
+                price=v["price"],
+                translator_cost=v["translator_cost"],
+                notary_cost=Decimal("0"),
+                translator_id=v["translator_id"],
+            )
+        )
+        db.add(
+            OrderStatusEvent(
+                order_id=order.id,
+                status=INITIAL_STATUS,
+                changed_at=datetime.combine(v["order_date"], time(), tzinfo=UTC),
+                changed_by_user_id=session.user_id,
+            )
+        )
+        if v["status"] and v["status"] != INITIAL_STATUS:
+            db.add(
+                OrderStatusEvent(
+                    order_id=order.id,
+                    status=v["status"],
+                    changed_at=now,
+                    changed_by_user_id=session.user_id,
+                    note="Imported",
+                )
+            )
+        if v["paid"]:
+            payment = ClientPayment(
+                client_id=order.client_id,
+                amount=v["paid"],
+                payment_date=v["order_date"],
+                method=PaymentMethod.OTHER,
+                notes="Imported with the order",
+                recorded_by_user_id=session.user_id,
+            )
+            db.add(payment)
+            payments.append((payment, order, v["paid"]))
+    await db.flush()
+
+    for payment, order, amount in payments:
+        db.add(
+            ClientPaymentAllocation(
+                payment_id=payment.id, order_id=order.id, amount_allocated=amount
+            )
+        )
+        created.append(("payment", payment.id))
+    await db.flush()
+    return created
+
+
 # ── History, and undo ───────────────────────────────────────────────────────
 
 
@@ -410,6 +642,55 @@ async def history(db: Db, _: Importer) -> list[BatchOut]:
     return [_batch_out(r, can_undo=r.id == latest) for r in rows]
 
 
+async def _undo_orders(db: Any, by_type: dict[str, list[int]]) -> None:
+    """Remove what an orders import created, unless anything has built on it.
+
+    "Built on it" is a payment of someone else's allocated to one of the orders,
+    money paid out to a translator, a file, or a comment. Clients the import
+    created stay when they have gained other orders or payments since.
+    """
+    order_ids = by_type.get("order", [])
+    payment_ids = by_type.get("payment", [])
+    client_ids = by_type.get("client", [])
+
+    others = await db.scalar(
+        select(func.count()).where(
+            ClientPaymentAllocation.order_id.in_(order_ids),
+            ClientPaymentAllocation.payment_id.not_in(payment_ids or [-1]),
+        )
+    )
+    paid_out = await db.scalar(
+        select(func.count()).where(TranslatorPaymentAllocation.order_id.in_(order_ids))
+    )
+    document_ids = (
+        (await db.execute(select(OrderDocument.id).where(OrderDocument.order_id.in_(order_ids))))
+        .scalars()
+        .all()
+    )
+    files = await db.scalar(
+        select(func.count()).where(
+            OrderFile.order_document_id.in_(document_ids), OrderFile.deleted_at.is_(None)
+        )
+    )
+    comments = await db.scalar(select(func.count()).where(OrderComment.order_id.in_(order_ids)))
+    if others or paid_out or files or comments:
+        raise ConflictError(
+            "Some of the imported orders already have other payments, a translator payout, "
+            "files or comments, so this import can no longer be undone."
+        )
+
+    await db.execute(
+        delete(ClientPaymentAllocation).where(ClientPaymentAllocation.payment_id.in_(payment_ids))
+    )
+    await db.execute(delete(ClientPayment).where(ClientPayment.id.in_(payment_ids)))
+    await db.execute(delete(OrderStatusEvent).where(OrderStatusEvent.order_id.in_(order_ids)))
+    await db.execute(delete(OrderDocument).where(OrderDocument.order_id.in_(order_ids)))
+    await db.execute(delete(Order).where(Order.id.in_(order_ids)))
+
+    still_used = select(Order.client_id).union(select(ClientPayment.client_id))
+    await db.execute(delete(Client).where(Client.id.in_(client_ids), Client.id.not_in(still_used)))
+
+
 @router.post("/{batch_id}/undo", response_model=BatchOut)
 async def undo(batch_id: int, db: Db, session: CurrentSession, _: Importer) -> BatchOut:
     """Delete what the latest import created, unless any of it is already in use."""
@@ -430,8 +711,13 @@ async def undo(batch_id: int, db: Db, session: CurrentSession, _: Importer) -> B
         .all()
     )
     ids = [item.entity_id for item in items]
+    by_type: dict[str, list[int]] = {}
+    for item in items:
+        by_type.setdefault(item.entity_type, []).append(item.entity_id)
 
-    if batch.kind == "clients":
+    if batch.kind == "orders":
+        await _undo_orders(db, by_type)
+    elif batch.kind == "clients":
         used = await db.scalar(
             select(func.count(func.distinct(Order.client_id))).where(Order.client_id.in_(ids))
         )

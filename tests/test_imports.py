@@ -4,6 +4,8 @@ The engine (``domain/imports.py``) is pure and tested directly. The endpoints
 run for real against in-memory SQLite, like ``test_translator_profile.py``.
 """
 
+# ruff: noqa: E501, DTZ001  (test data rows are wide; calendar dates need no zone)
+
 from __future__ import annotations
 
 import io
@@ -24,11 +26,19 @@ from suliko.db.base import Base
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
 from suliko.domain import imports as engine
 from suliko.domain.plans import TenantPlan
+from suliko.models.collaboration import OrderComment
 from suliko.models.directory import Client, Translator, TranslatorLanguagePair
-from suliko.models.finance import ClientPayment, TranslatorPayment
+from suliko.models.finance import (
+    ClientPayment,
+    ClientPaymentAllocation,
+    PaymentMethod,
+    TranslatorPayment,
+    TranslatorPaymentAllocation,
+)
 from suliko.models.imports import ImportBatch, ImportBatchItem
-from suliko.models.order import Order, OrderDocument
-from suliko.models.reference import Language
+from suliko.models.order import Order, OrderDocument, OrderStatusEvent
+from suliko.models.order_file import OrderFile
+from suliko.models.reference import CustomOption, DocumentType, Language
 from suliko.models.tenant import Tenant, TenantStatus
 from suliko.models.user import Role
 from suliko.security.permissions import permissions_for_role
@@ -290,6 +300,13 @@ MODELS = (
     OrderDocument,
     ClientPayment,
     TranslatorPayment,
+    ClientPaymentAllocation,
+    TranslatorPaymentAllocation,
+    OrderStatusEvent,
+    OrderComment,
+    OrderFile,
+    DocumentType,
+    CustomOption,
 )
 
 
@@ -361,6 +378,8 @@ async def db() -> AsyncIterator[AsyncSession]:
             await session.flush()
             for code, en, ka in (("ka", "Georgian", "ქართული"), ("en", "English", "ინგლისური")):
                 session.add(Language(tenant_id=ACME, code=code, name_en=en, name_ka=ka))
+            session.add(DocumentType(tenant_id=ACME, name_en="Passport", name_ka="პასპორტი"))
+            session.add(DocumentType(tenant_id=ACME, name_en="Diploma", name_ka="დიპლომა"))
             await session.commit()
         with tenant_scope(ACME):
             yield session
@@ -498,4 +517,307 @@ async def test_an_unknown_kind_is_not_found(db: AsyncSession) -> None:
     from suliko.core.errors import NotFoundError
 
     with pytest.raises(NotFoundError):
-        await api.analyse("orders", Upload(csv_bytes("a\n1\n"), "x.csv"), None)  # type: ignore[arg-type]
+        await api.analyse("invoices", Upload(csv_bytes("a\n1\n"), "x.csv"), None)  # type: ignore[arg-type]
+
+
+# ── Orders: the engine ──────────────────────────────────────────────────────
+
+from datetime import date  # noqa: E402
+from decimal import Decimal  # noqa: E402
+
+from suliko.domain.imports_orders import ExistingOrder, OrdersContext  # noqa: E402
+
+
+def test_dates_are_read_day_first_from_text_and_excel_cells() -> None:
+    from datetime import datetime
+
+    assert engine.parse_date("25.10.2025") == date(2025, 10, 25)
+    assert engine.parse_date("25/10/2025") == date(2025, 10, 25)
+    assert engine.parse_date("2025-10-25") == date(2025, 10, 25)
+    assert engine.parse_date(datetime(2025, 10, 25, 14, 30)) == date(2025, 10, 25)
+    assert engine.parse_date("31.02.2025") is None
+    assert engine.parse_date("soon") is None
+    assert engine.parse_date("25.10.1925") is None  # a typo, not an order
+
+
+def test_pages_are_read_from_text() -> None:
+    assert engine.parse_int("3") == 3
+    assert engine.parse_int("3.0") == 3
+    assert engine.parse_int("3 pages") == 3
+    assert engine.parse_int("n/a") is None
+
+
+HEADERS = [
+    "Client", "Phone", "Date", "Languages", "Document", "Pages", "Price", "Translator", "Status", "Paid", "Tender",
+]  # fmt: skip
+MAPPING = {
+    "client_name": 0, "client_phone": 1, "order_date": 2, "language_pair": 3, "document_type": 4,
+    "pages": 5, "price": 6, "translator": 7, "status": 8, "paid": 9, "identifier": 10,
+}  # fmt: skip
+
+
+def orders_ctx(existing: list[ExistingOrder] | None = None) -> OrdersContext:
+    return OrdersContext(
+        language_lookup=lookup,
+        document_types={"passport": (1, "Passport"), "პასპორტი": (1, "Passport")},
+        default_document_type=(1, "Passport"),
+        translators={"mari": (7, "Mari")},
+        status_lookup=lambda text: {"completed": "completed", "delivered": "completed"}.get(
+            text.casefold()
+        ),
+        existing_orders=existing or [],
+    )
+
+
+def order_rows(
+    *rows: list[Any],
+    clients: list[engine.ExistingPerson] | None = None,
+    ctx: OrdersContext | None = None,
+) -> list[engine.RowResult]:
+    sheet = engine.Sheet(headers=HEADERS, rows=list(enumerate(rows, start=2)))
+    return engine.judge_sheet(
+        "orders", sheet, MAPPING, clients or [], lookup, orders=ctx or orders_ctx()
+    ).results
+
+
+def row(**fields: Any) -> list[Any]:
+    base = {
+        "Client": "Nino", "Phone": "555111222", "Date": "25.10.2025", "Languages": "ka-en",
+        "Document": "Passport", "Pages": 2, "Price": "40", "Translator": None, "Status": None,
+        "Paid": None, "Tender": None,
+    }  # fmt: skip
+    base.update(fields)
+    return [base[h] for h in HEADERS]
+
+
+def test_a_good_row_is_an_order_with_a_new_client() -> None:
+    (result,) = order_rows(row())
+    assert result.status == "ok"
+    v = result.values
+    assert v["client"]["new"]["name"] == "Nino"
+    assert (v["source_language"], v["target_language"]) == ("ka", "en")
+    assert (v["page_count"], v["price"], v["document_type_id"]) == (2, Decimal("40"), 1)
+    assert v["order_date"] == date(2025, 10, 25)
+
+
+def test_the_same_client_twice_is_one_new_client() -> None:
+    first, second = order_rows(row(), row(Date="26.10.2025"))
+    assert first.values["client"]["ref"] == second.values["client"]["ref"] == "new:0"
+    assert first.values["client"]["new"] is not None
+    assert second.values["client"]["new"] is None
+
+
+def test_a_client_the_bureau_has_is_matched_by_phone() -> None:
+    known = [engine.ExistingPerson(label="#7 Nino B.", phone="+995 555 111 222", ref=7)]
+    (result,) = order_rows(row(Client="Someone else"), clients=known)
+    assert result.values["client"] == {"ref": 7, "new": None}
+    assert result.name == "#7 Nino B."
+
+
+def test_a_client_matched_by_name_only_is_flagged() -> None:
+    known = [engine.ExistingPerson(label="#7 Nino", name="Nino", ref=7)]
+    (result,) = order_rows(row(Phone=None), clients=known)
+    assert result.values["client"]["ref"] == 7
+    assert any("matched by name only" in w for w in result.warnings)
+
+
+@pytest.mark.parametrize(
+    ("fields", "message"),
+    [
+        ({"Date": "later"}, "not a date"),
+        ({"Date": None}, "No order date"),
+        ({"Languages": "ka-xx"}, "languages"),
+        ({"Price": None}, "No price"),
+        ({"Price": "free"}, "not an amount"),
+        ({"Client": None, "Phone": None}, "No client"),
+    ],
+)
+def test_rows_that_cannot_be_orders_are_errors_with_a_reason(
+    fields: dict[str, Any], message: str
+) -> None:
+    (result,) = order_rows(row(**fields))
+    assert result.status == "error"
+    assert message.lower() in result.messages[0].lower()
+
+
+def test_a_bad_row_leaves_no_client_behind_for_the_next_one() -> None:
+    bad, good = order_rows(row(Price=None), row())
+    assert bad.status == "error"
+    assert good.values["client"] == {"ref": "new:0", "new": good.values["client"]["new"]}
+    assert good.values["client"]["new"] is not None
+
+
+def test_things_not_recognised_are_warnings_and_the_row_still_imports() -> None:
+    (result,) = order_rows(
+        row(Document="Contract", Translator="Zaza", Status="weird", Pages="many")
+    )
+    assert result.status == "ok"
+    assert len(result.warnings) == 4
+    v = result.values
+    assert (v["document_type_id"], v["translator_id"], v["status"], v["page_count"]) == (
+        1,
+        None,
+        None,
+        1,
+    )
+
+
+def test_paid_more_than_the_price_is_capped_and_a_status_is_found() -> None:
+    (result,) = order_rows(row(Paid="100", Status="Delivered", Translator="Mari"))
+    assert result.values["paid"] == Decimal("40")
+    assert result.values["status"] == "completed"
+    assert result.values["translator_id"] == 7
+    assert any("more than the price" in w for w in result.warnings)
+
+
+def test_the_same_order_in_the_file_twice_is_a_duplicate() -> None:
+    first, second = order_rows(row(), row())
+    assert (first.status, second.status) == ("ok", "duplicate")
+    # A different tender number makes it a different order.
+    a, b = order_rows(row(Tender="T-1"), row(Tender="T-2"))
+    assert (a.status, b.status) == ("ok", "ok")
+
+
+def test_an_order_already_in_the_bureau_is_a_duplicate() -> None:
+    known = [engine.ExistingPerson(label="#7 Nino", phone="555111222", ref=7)]
+    existing = [
+        ExistingOrder(
+            label="order #12",
+            client_id=7,
+            order_date=date(2025, 10, 25),
+            source_language="ka",
+            target_language="en",
+            page_count=2,
+            price=Decimal("40"),
+        )
+    ]
+    (result,) = order_rows(row(), clients=known, ctx=orders_ctx(existing))
+    assert result.status == "duplicate"
+    assert result.matched == "order #12"
+
+
+# ── Orders: the endpoints ───────────────────────────────────────────────────
+
+ORDERS_CSV = (
+    "Client,Phone,Date,Languages,Document,Pages,Price,Status,Paid,Tender\n"
+    "Nino,555111222,25.10.2025,ka-en,Passport,2,40,Delivered,40,T-1\n"
+    "Nino,555111222,26.10.2025,en-ka,Diploma,1,30,,0,\n"
+    "Gia,,27.10.2025,ka-en,Passport,1,25,,10,\n"
+    ",,,,,,,,,\n"
+    "Bad,555999000,not a date,ka-en,Passport,1,25,,,\n"
+)
+ORDERS_MAPPING = {
+    "client_name": 0, "client_phone": 1, "order_date": 2, "language_pair": 3, "document_type": 4,
+    "pages": 5, "price": 6, "status": 7, "paid": 8, "identifier": 9,
+}  # fmt: skip
+
+
+async def commit_orders(db: AsyncSession) -> api.BatchOut:
+    return await api.commit(
+        "orders",
+        Upload(csv_bytes(ORDERS_CSV), "orders.csv"),  # type: ignore[arg-type]
+        json.dumps(ORDERS_MAPPING),
+        db,
+        _session(),
+        None,
+    )
+
+
+async def count(db: AsyncSession, model: Any) -> int:
+    return await db.scalar(select(func.count()).select_from(model)) or 0
+
+
+@pytest.mark.asyncio
+async def test_preview_of_orders_counts_each_kind_of_row(db: AsyncSession) -> None:
+    out = await api.preview(
+        "orders",
+        Upload(csv_bytes(ORDERS_CSV), "orders.csv"),  # type: ignore[arg-type]
+        json.dumps(ORDERS_MAPPING),
+        db,
+        None,
+    )
+    assert (out.total, out.will_create, out.errors) == (4, 3, 1)
+    assert await count(db, Order) == 0
+    assert out.sample[0].summary[0] == "2025-10-25"
+    assert "new client" in out.sample[0].summary[-1]
+
+
+@pytest.mark.asyncio
+async def test_commit_creates_clients_orders_documents_history_and_payments(
+    db: AsyncSession,
+) -> None:
+    batch = await commit_orders(db)
+    assert batch.created_count == 3
+    assert {c.name for c in (await db.execute(select(Client))).scalars()} == {"Nino", "Gia"}
+    orders = (await db.execute(select(Order).order_by(Order.order_date))).scalars().all()
+    assert [o.source for o in orders] == ["import"] * 3
+    assert orders[0].identifier == "T-1"
+    assert await count(db, OrderDocument) == 3
+    # Each order starts New; the delivered one has a second event.
+    statuses = (await db.execute(select(OrderStatusEvent.status))).scalars().all()
+    assert sorted(statuses) == ["completed", "new", "new", "new"]
+    # Paid 40 and 10 become payments allocated to their orders; the 0 does not.
+    amounts = sorted(p.amount for p in (await db.execute(select(ClientPayment))).scalars())
+    assert amounts == [Decimal("10.00"), Decimal("40.00")]
+    assert await count(db, ClientPaymentAllocation) == 2
+
+
+@pytest.mark.asyncio
+async def test_importing_the_same_orders_again_creates_nothing(db: AsyncSession) -> None:
+    await commit_orders(db)
+    with pytest.raises(ValidationError, match="Nothing to import"):
+        await commit_orders(db)
+    assert await count(db, Order) == 3
+
+
+@pytest.mark.asyncio
+async def test_undo_removes_the_orders_payments_and_the_clients_it_made(db: AsyncSession) -> None:
+    batch = await commit_orders(db)
+    await api.undo(batch.id, db, _session(), None)
+    for model in (
+        Order,
+        OrderDocument,
+        OrderStatusEvent,
+        ClientPayment,
+        ClientPaymentAllocation,
+        Client,
+    ):
+        assert await count(db, model) == 0, model.__name__
+
+
+@pytest.mark.asyncio
+async def test_a_payment_made_since_stops_the_undo(db: AsyncSession) -> None:
+    batch = await commit_orders(db)
+    order = (await db.execute(select(Order).order_by(Order.order_date))).scalars().first()
+    other = ClientPayment(
+        client_id=order.client_id,
+        amount=Decimal("5"),
+        payment_date=date(2025, 11, 1),
+        method=PaymentMethod.CASH,
+        recorded_by_user_id=1,
+    )
+    db.add(other)
+    await db.flush()
+    db.add(
+        ClientPaymentAllocation(
+            payment_id=other.id, order_id=order.id, amount_allocated=Decimal("5")
+        )
+    )
+    await db.flush()
+    with pytest.raises(ConflictError, match="no longer be undone"):
+        await api.undo(batch.id, db, _session(), None)
+    assert await count(db, Order) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_client_that_gained_an_order_since_is_kept_when_the_import_is_undone(
+    db: AsyncSession,
+) -> None:
+    batch = await commit_orders(db)
+    gia = await db.scalar(select(Client.id).where(Client.name == "Gia"))
+    # Gia's imported order is undone with the batch; a second, later order of hers is not.
+    db.add(Order(client_id=gia, order_date=date(2026, 1, 5), created_by_user_id=1))
+    await db.flush()
+    await api.undo(batch.id, db, _session(), None)
+    remaining = (await db.execute(select(Client.name))).scalars().all()
+    assert remaining == ["Gia"]
