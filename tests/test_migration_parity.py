@@ -59,6 +59,8 @@ LATER_REVISIONS = (
     "0021_invoices.py",
     # Oral lines and a per-minute rate — see test_migration_0022.py.
     "0022_oral_interpreting.py",
+    # One column on orders — see test_migration_0023.py.
+    "0023_order_identifier.py",
 )
 
 

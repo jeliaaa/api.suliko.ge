@@ -108,6 +108,7 @@ def _row(
     order = SimpleNamespace(
         id=1,
         number=1,
+        identifier=None,
         order_date=date(2026, 9, 1),
         due_date=due,
         client_id=1,
@@ -466,3 +467,20 @@ def test_an_oral_line_refuses_a_notary_a_copy_type_or_notarisation() -> None:
     for extra in ({"is_notarized": True}, {"notary_id": 3}, {"copy_type": "notary_copy"}):
         with pytest.raises(ValidationError):
             OrderDocumentIn(**_doc(service_type="oral", **extra))  # type: ignore[arg-type]
+
+
+# ── The client's own reference ──────────────────────────────────────────────
+
+
+def test_the_identifier_is_optional_and_bounded() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    from suliko.api.v1.orders import OrderCreate, OrderUpdate
+
+    doc = {"document_type_id": 1, "source_language": "ka", "target_language": "en", "page_count": 1}
+    assert OrderCreate(client_id=1, documents=[doc]).identifier is None  # type: ignore[list-item]
+    assert OrderCreate(client_id=1, documents=[doc], identifier="NAT-2026/17").identifier  # type: ignore[list-item]
+    assert OrderUpdate().identifier is None
+    with pytest.raises(ValidationError):
+        OrderCreate(client_id=1, documents=[doc], identifier="x" * 101)  # type: ignore[list-item]
