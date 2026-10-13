@@ -51,7 +51,7 @@ from suliko.domain.clock import today_in
 from suliko.domain.orders import base_order_query
 from suliko.models.directory import Client, ClientType
 from suliko.models.order import Order, OrderDocument
-from suliko.models.reference import Company, CompanyBankAccount
+from suliko.models.reference import Company, CompanyBankAccount, Language
 from suliko.security.permissions import Permission
 
 router = APIRouter(prefix="/companies", tags=["companies"])
@@ -126,6 +126,8 @@ class InvoiceParty(BaseModel):
     email: str
     phone: str
     site: str
+    #: Who signs for the seller. Empty for the buyer.
+    director: str = ""
 
 
 class InvoiceBank(BaseModel):
@@ -138,6 +140,7 @@ class InvoiceBank(BaseModel):
 
 class InvoiceLine(BaseModel):
     description: str
+    #: Full names in the invoice's language ("ქართული → ინგლისური"), not codes.
     languages: str
     pages: int
     unit_price: Decimal
@@ -484,6 +487,11 @@ def _party(company: Company | None, locale: str) -> InvoiceParty:
         or company.address_ka
         or company.address_en
     )
+    director = (
+        (company.director_en if locale == "en" else company.director_ka)
+        or company.director_ka
+        or company.director_en
+    )
     return InvoiceParty(
         name=name,
         address=address,
@@ -491,7 +499,26 @@ def _party(company: Company | None, locale: str) -> InvoiceParty:
         email=company.email,
         phone=company.phone,
         site=company.site,
+        director=director,
     )
+
+
+def _language_pair(source: str, target: str, names: dict[str, Language], locale: str) -> str:
+    """A line's languages as a client reads them: "ქართული → ინგლისური".
+
+    Names come from the bureau's own language list, in the invoice's language
+    and then the other one. A code the list no longer has (a language removed
+    after the order was taken) still prints, as the code, rather than as a gap.
+    """
+
+    def name(code: str) -> str:
+        language = names.get(code)
+        if language is None:
+            return code.upper()
+        preferred = language.name_en if locale == "en" else language.name_ka
+        return preferred or language.name_ka or language.name_en or code.upper()
+
+    return f"{name(source)} → {name(target)}"
 
 
 @invoice_router.get("/{order_id}/invoice", response_model=InvoiceOut)
@@ -545,12 +572,20 @@ async def order_invoice(
 
     docs = (await db.execute(_invoice_documents_query(order_id))).unique().scalars().all()
 
+    codes = {d.source_language for d in docs} | {d.target_language for d in docs}
+    names = {
+        language.code: language
+        for language in (
+            await db.execute(select(Language).where(Language.code.in_(codes)))
+        ).scalars()
+    }
+
     lines = [
         InvoiceLine(
             description=d.document_type.name_en
             if locale == "en" and d.document_type
             else (d.document_type.name_ka if d.document_type else "Translation"),
-            languages=f"{d.source_language.upper()} → {d.target_language.upper()}",
+            languages=_language_pair(d.source_language, d.target_language, names, locale),
             pages=d.page_count,
             # Per page, derived for display only. The authority is `amount`.
             # Rounded: 100 / 3 is not a price anyone can print.

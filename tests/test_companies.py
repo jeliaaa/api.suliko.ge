@@ -13,10 +13,11 @@ from suliko.api.v1.companies import (
     CompanyIn,
     InvoiceParty,
     _invoice_documents_query,
+    _language_pair,
     _missing,
     _party,
 )
-from suliko.models.reference import Company
+from suliko.models.reference import Company, Language
 
 
 def company(**overrides: str) -> Company:
@@ -98,6 +99,15 @@ def test_no_company_yields_an_empty_party_rather_than_raising() -> None:
     assert party.name == ""
 
 
+def test_the_director_signs_in_the_invoice_language() -> None:
+    assert _party(company(), "ka").director == "დათა ხარაიშვილი"
+    assert _party(company(), "en").director == "Data Kharaishvili"
+
+
+def test_a_director_without_an_english_name_still_signs_an_english_invoice() -> None:
+    assert _party(company(director_en=""), "en").director == "დათა ხარაიშვილი"
+
+
 # ── The form accepts what the model stores ──────────────────────────────────
 
 
@@ -134,3 +144,32 @@ def test_invoice_lines_load_the_document_type_in_the_same_query() -> None:
     assert "JOIN document_types" in sql
     assert "document_types_1.name_ka" in sql
     assert "document_types_1.name_en" in sql
+
+
+# ── Languages by name ───────────────────────────────────────────────────────
+
+
+LANGUAGES = {
+    "ka": Language(code="ka", name_ka="ქართული", name_en="Georgian"),
+    "en": Language(code="en", name_ka="ინგლისური", name_en="English"),
+}
+
+
+def test_a_georgian_invoice_names_the_languages_in_georgian() -> None:
+    """A client reads "ქართული → ინგლისური", not the codes "KA → EN"."""
+    assert _language_pair("ka", "en", LANGUAGES, "ka") == "ქართული → ინგლისური"
+
+
+def test_an_english_invoice_names_the_languages_in_english() -> None:
+    assert _language_pair("ka", "en", LANGUAGES, "en") == "Georgian → English"
+
+
+def test_a_language_without_an_english_name_falls_back_to_georgian() -> None:
+    names = {**LANGUAGES, "de": Language(code="de", name_ka="გერმანული", name_en="")}
+    assert _language_pair("de", "en", names, "en") == "გერმანული → English"
+
+
+def test_a_language_no_longer_on_the_list_prints_its_code() -> None:
+    """Removed from the bureau's list after the order was taken: the line
+    still says which language it was."""
+    assert _language_pair("ka", "tr", LANGUAGES, "ka") == "ქართული → TR"
