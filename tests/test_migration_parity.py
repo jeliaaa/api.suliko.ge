@@ -51,6 +51,8 @@ LATER_REVISIONS = (
     "0017_document_translations.py",
     # One column on document_translations — see test_migration_0018.py.
     "0018_translation_from_portal.py",
+    # Three flags on translators — see test_migration_0019.py.
+    "0019_translator_capabilities.py",
 )
 
 
