@@ -63,6 +63,8 @@ LATER_REVISIONS = (
     "0023_order_identifier.py",
     # Pricing by characters — see test_migration_0024.py.
     "0024_pricing_by_characters.py",
+    # import_batches, import_batch_items — see test_migration_0025.py.
+    "0025_imports.py",
 )
 
 
