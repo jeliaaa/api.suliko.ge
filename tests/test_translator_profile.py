@@ -308,3 +308,27 @@ async def test_removing_a_translator_removes_its_pairs(
     with tenant_scope(ACME), pytest.raises(NotFoundError):
         async with maker() as db:
             await api.get_translator(created.id, db=db, _=None)
+
+
+# ── Cities ──────────────────────────────────────────────────────────────────
+
+
+async def test_cities_are_saved_listed_and_filtered(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    a = await create(maker, name="Ana", cities=["Tbilisi", "batumi", "tbilisi"])
+    await create(maker, name="Beka", cities=["kutaisi"])
+    assert a.cities == ["tbilisi", "batumi"]
+
+    with tenant_scope(ACME):
+        async with maker() as db:
+            page = await api.list_translators(db=db, _=None, city="batumi", language=None)
+    assert [t.name for t in page.items] == ["Ana"]
+
+    changed = await update(maker, a.id, cities=[])
+    assert changed.cities == []
+
+
+async def test_unknown_city_is_refused() -> None:
+    with pytest.raises(pydantic.ValidationError):
+        api.TranslatorCreate(name="X", cities=["atlantis"])
