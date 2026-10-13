@@ -190,6 +190,10 @@ class OrderDocument(Base, IdMixin, TenantScoped, TimestampMixin):
     target_language: Mapped[str] = mapped_column(String(5), nullable=False)
     #: Pages for a written line, minutes for an oral one (see ``ServiceType``).
     page_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    #: Characters with spaces, when the bureau prices written work by
+    #: characters. The translation is priced from this; ``page_count`` stays
+    #: the physical pages, which the notary charges by. Null: priced by pages.
+    character_count: Mapped[int | None] = mapped_column(Integer, default=None)
 
     copy_type: Mapped[CopyType] = mapped_column(
         Enum(CopyType, name="copy_type", values_callable=enum_values, native_enum=False, length=30),

@@ -5,10 +5,10 @@ from __future__ import annotations
 import enum
 from decimal import Decimal
 
-from sqlalchemy import Boolean, Index, Integer, Numeric, String, UniqueConstraint
+from sqlalchemy import Boolean, Enum, Index, Integer, Numeric, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
-from suliko.db.base import Base, IdMixin, TenantScoped, TimestampMixin
+from suliko.db.base import Base, IdMixin, TenantScoped, TimestampMixin, enum_values
 
 
 class Language(Base, IdMixin, TenantScoped, TimestampMixin):
@@ -109,6 +109,15 @@ class CompanyBankAccount(Base, IdMixin, TenantScoped, TimestampMixin):
     is_primary: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
+class PricingUnit(enum.StrEnum):
+    """What a bureau counts a written document in to price it."""
+
+    PAGES = "pages"
+    #: Characters with spaces, converted to standard pages of
+    #: ``TenantSettings.characters_per_page`` and priced per page.
+    CHARACTERS = "characters"
+
+
 class TenantSettings(Base, IdMixin, TenantScoped, TimestampMixin):
     """One row per tenant. General settings from the Settings → General tab."""
 
@@ -135,6 +144,25 @@ class TenantSettings(Base, IdMixin, TenantScoped, TimestampMixin):
     )
     default_translator_share: Mapped[Decimal] = mapped_column(
         Numeric(4, 3), default=Decimal("0.5"), nullable=False
+    )
+
+    # Written work is priced per page, or per standard page worked out from
+    # a character count (with spaces). Notary fees stay per physical page
+    # either way, so a line counted in characters keeps its page count too.
+    pricing_unit: Mapped[PricingUnit] = mapped_column(
+        Enum(
+            PricingUnit,
+            name="pricing_unit",
+            values_callable=enum_values,
+            native_enum=False,
+            length=10,
+        ),
+        default=PricingUnit.PAGES,
+        server_default=PricingUnit.PAGES.value,
+        nullable=False,
+    )
+    characters_per_page: Mapped[int] = mapped_column(
+        Integer, default=1800, server_default="1800", nullable=False
     )
 
     # Days from the order date to the default due date, per urgency. The PHP

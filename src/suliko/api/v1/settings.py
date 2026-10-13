@@ -22,7 +22,13 @@ from sqlalchemy import select
 from suliko.api.deps import CurrentSession, Db, require
 from suliko.core.errors import ConflictError, NotFoundError, ValidationError
 from suliko.domain.clock import is_valid_zone
-from suliko.models.reference import DocumentType, Language, LanguagePairPrice, TenantSettings
+from suliko.models.reference import (
+    DocumentType,
+    Language,
+    LanguagePairPrice,
+    PricingUnit,
+    TenantSettings,
+)
 from suliko.models.tenant import Tenant
 from suliko.security.permissions import Permission
 
@@ -45,6 +51,10 @@ class GeneralSettings(BaseModel):
     urgency_multiplier_urgent: Decimal
     delivery_fee: Decimal
     default_translator_share: Decimal
+    #: How written work is counted for pricing: pages, or characters (with
+    #: spaces) turned into standard pages of `characters_per_page`.
+    pricing_unit: PricingUnit
+    characters_per_page: int
     #: Days from order date to the default due date, per urgency.
     due_days_standard: int
     due_days_express: int
@@ -67,6 +77,8 @@ class GeneralSettingsUpdate(BaseModel):
     default_translator_share: Decimal | None = Field(
         default=None, ge=0, le=1, max_digits=4, decimal_places=3
     )
+    pricing_unit: PricingUnit | None = None
+    characters_per_page: int | None = Field(default=None, ge=100, le=100_000)
     due_days_standard: int | None = Field(default=None, ge=0, le=365)
     due_days_express: int | None = Field(default=None, ge=0, le=365)
     due_days_urgent: int | None = Field(default=None, ge=0, le=365)
@@ -89,6 +101,8 @@ def _general_out(row: TenantSettings, tenant: Tenant) -> GeneralSettings:
         urgency_multiplier_urgent=row.urgency_multiplier_urgent,
         delivery_fee=row.delivery_fee,
         default_translator_share=row.default_translator_share,
+        pricing_unit=row.pricing_unit,
+        characters_per_page=row.characters_per_page,
         due_days_standard=row.due_days_standard,
         due_days_express=row.due_days_express,
         due_days_urgent=row.due_days_urgent,

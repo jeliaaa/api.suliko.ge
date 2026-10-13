@@ -45,6 +45,8 @@ class QuoteDocument(BaseModel):
     #: Oral: `page_count` is minutes, priced per minute, never notarised.
     service_type: ServiceType = ServiceType.WRITTEN
     page_count: int = Field(ge=1, le=10_000)
+    #: Characters with spaces; the translation is then priced from them.
+    character_count: int | None = Field(default=None, ge=1, le=100_000_000)
     copy_type: CopyType = CopyType.ORIGINAL
     #: Overrides what the copy type implies — a notarised translation of an
     #: original. None = derive from the copy type.
@@ -84,6 +86,8 @@ class QuoteLine(BaseModel):
     page_count: int
     is_notarized: bool
     service_type: ServiceType
+    character_count: int | None = None
+    standard_pages: Decimal | None = None
     #: True when the pair has no configured rate and a fallback was used, so
     #: the UI can warn instead of quoting a number nobody agreed to.
     used_fallback_rate: bool
@@ -134,6 +138,8 @@ async def quote(
             ),
             service_type=d.service_type,
             base_rate_per_minute=ctx.minute_rate(d.source_language, d.target_language),
+            character_count=d.character_count if d.service_type is ServiceType.WRITTEN else None,
+            characters_per_page=ctx.characters_per_page,
             copy_type=d.copy_type,
             urgency=payload.urgency,
             is_notarized=d.is_notarized,
@@ -160,6 +166,8 @@ async def quote(
                 page_count=b.page_count,
                 is_notarized=b.is_notarized,
                 service_type=b.service_type,
+                character_count=b.character_count,
+                standard_pages=b.standard_pages,
                 used_fallback_rate=b.used_fallback_rate,
             )
             for b in result.documents
