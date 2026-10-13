@@ -267,6 +267,28 @@ async def test_the_list_shows_each_translators_own_pairs(
     assert by_id == {nino.id: [("ka", "en")], levan.id: [("de", "ka"), ("ka", "de")]}
 
 
+async def test_the_list_filters_by_a_language_on_either_side(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    await create(maker, name="Nino", language_pairs=[pair("ka", "en")])
+    await create(maker, name="Levan", language_pairs=[pair("de", "ka")])
+    await create(maker, name="Ana", language_pairs=[pair("en", "ka")], is_active=False)
+    await create(maker, name="Giorgi")
+
+    async def names(**filters: object) -> list[str]:
+        with tenant_scope(ACME):
+            async with maker() as db:
+                page = await api.list_translators(db=db, _=None, sort="name", **filters)  # type: ignore[arg-type]
+        assert page.meta.total == len(page.items)
+        return [item.name for item in page.items]
+
+    assert await names(language="EN") == ["Ana", "Nino"]
+    assert await names(language="en", is_active=True) == ["Nino"]
+    assert await names(language="de") == ["Levan"]
+    assert await names(language="ka") == ["Ana", "Levan", "Nino"]
+    assert await names(language="fr") == []
+
+
 async def test_removing_a_translator_removes_its_pairs(
     maker: async_sessionmaker[AsyncSession],
 ) -> None:

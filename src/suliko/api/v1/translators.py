@@ -286,6 +286,8 @@ async def list_translators(
     _: Annotated[object, Depends(require(Permission.TRANSLATORS_READ))],
     search: Annotated[str | None, Query(max_length=255)] = None,
     is_active: bool | None = None,
+    #: A language code: the translators with a pair from or into it.
+    language: Annotated[str | None, Query(max_length=5)] = None,
     sort: Literal["name", "-name", "id", "-id"] = "-id",
     limit: Annotated[int, Query(ge=1, le=200)] = 20,
     offset: Annotated[int, Query(ge=0)] = 0,
@@ -304,6 +306,20 @@ async def list_translators(
 
     if is_active is not None:
         stmt = stmt.where(Translator.is_active == is_active)
+
+    if language and language.strip():
+        # Pairs are stored lower-case (`LanguagePairIn`).
+        code = language.strip().lower()
+        stmt = stmt.where(
+            Translator.id.in_(
+                select(TranslatorLanguagePair.translator_id).where(
+                    or_(
+                        TranslatorLanguagePair.source_language == code,
+                        TranslatorLanguagePair.target_language == code,
+                    )
+                )
+            )
+        )
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
 
