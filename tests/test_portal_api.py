@@ -44,7 +44,7 @@ from suliko.integrations.object_storage import (
 from suliko.integrations.suliko_backend import UnconfiguredSulikoBackend, get_suliko_backend
 from suliko.integrations.suliko_translate import JobStatus, NameSpelling, get_suliko_translator
 from suliko.models.audit import ActorType
-from suliko.models.directory import Client, ClientType, Translator
+from suliko.models.directory import Client, ClientType, Translator, TranslatorLanguagePair
 from suliko.models.order import CopyType, Order, OrderDocument, Urgency
 from suliko.models.order_file import OrderFile
 from suliko.models.portal import (
@@ -86,6 +86,8 @@ MODELS = [
     Tenant,
     Client,
     Translator,
+    # A translator's detail carries their language pairs.
+    TranslatorLanguagePair,
     DocumentType,
     Order,
     OrderDocument,

@@ -9,6 +9,9 @@ Follows `clients.py`. The differences that matter:
   making callers infer it.
 - The portal password is never accepted or returned here. Setting a
   translator's portal credentials is a separate, audited action.
+- Language pairs live in their own table (`TranslatorLanguagePair`) and are
+  written as a whole: a create or update that sends `language_pairs` replaces
+  the translator's set. They name the bureau's own language codes.
 """
 
 from __future__ import annotations
@@ -21,13 +24,13 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from suliko.api.deps import CurrentSession, Db, require
 from suliko.api.v1._shared import PageMeta, mask_tail
 from suliko.core import mail
-from suliko.core.errors import ConflictError, NotFoundError, RateLimitedError
+from suliko.core.errors import ConflictError, NotFoundError, RateLimitedError, ValidationError
 from suliko.core.ratelimit import RateLimiter, get_rate_limiter
 from suliko.domain.portal import (
     account_matches,
@@ -39,7 +42,7 @@ from suliko.domain.portal import (
     registration_url,
 )
 from suliko.integrations.suliko_backend import SulikoBackend, SulikoUser, get_suliko_backend
-from suliko.models.directory import Translator
+from suliko.models.directory import Translator, TranslatorLanguagePair
 from suliko.models.portal import (
     InviteKind,
     InviteStatus,
@@ -47,10 +50,49 @@ from suliko.models.portal import (
     PortalTranslator,
     PortalTranslatorLink,
 )
+from suliko.models.reference import Language
 from suliko.models.tenant import Tenant
 from suliko.security.permissions import Permission
 
 router = APIRouter(prefix="/translators", tags=["translators"])
+
+
+class LanguagePairIn(BaseModel):
+    """One direction a translator works in: from `source` into `target`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_language: str = Field(min_length=2, max_length=5)
+    target_language: str = Field(min_length=2, max_length=5)
+    #: What they are paid per page for this pair, when it differs from their
+    #: default rate.
+    rate_per_page: Decimal | None = Field(default=None, ge=0, le=100000)
+
+    @model_validator(mode="after")
+    def _two_languages(self) -> LanguagePairIn:
+        self.source_language = self.source_language.strip().lower()
+        self.target_language = self.target_language.strip().lower()
+        if self.source_language == self.target_language:
+            raise ValueError("a language pair needs two different languages")
+        return self
+
+
+class LanguagePairOut(BaseModel):
+    source_language: str
+    target_language: str
+    rate_per_page: Decimal | None
+
+
+def _unique_pairs(pairs: list[LanguagePairIn] | None) -> list[LanguagePairIn] | None:
+    if pairs is None:
+        return None
+    seen: set[tuple[str, str]] = set()
+    for pair in pairs:
+        key = (pair.source_language, pair.target_language)
+        if key in seen:
+            raise ValueError(f"the pair {key[0]} → {key[1]} is listed twice")
+        seen.add(key)
+    return pairs
 
 
 class TranslatorBase(BaseModel):
@@ -69,9 +111,20 @@ class TranslatorBase(BaseModel):
     bank_inn: str | None = Field(default=None, max_length=20)
     bank_code: str | None = Field(default=None, max_length=20)
 
+    can_notarize: bool = False
+    works_written: bool = True
+    works_oral: bool = False
+
 
 class TranslatorCreate(TranslatorBase):
-    pass
+    language_pairs: list[LanguagePairIn] = Field(default_factory=list, max_length=100)
+
+    @model_validator(mode="after")
+    def _some_work(self) -> TranslatorCreate:
+        if not (self.works_written or self.works_oral):
+            raise ValueError("a translator does written work, oral work, or both")
+        _unique_pairs(self.language_pairs)
+        return self
 
 
 class TranslatorUpdate(BaseModel):
@@ -88,6 +141,16 @@ class TranslatorUpdate(BaseModel):
     bank_iban: str | None = Field(default=None, max_length=34)
     bank_inn: str | None = Field(default=None, max_length=20)
     bank_code: str | None = Field(default=None, max_length=20)
+    can_notarize: bool | None = None
+    works_written: bool | None = None
+    works_oral: bool | None = None
+    #: Sent: replaces the whole set. Left out: the pairs stay as they are.
+    language_pairs: list[LanguagePairIn] | None = Field(default=None, max_length=100)
+
+    @model_validator(mode="after")
+    def _pairs_once(self) -> TranslatorUpdate:
+        _unique_pairs(self.language_pairs)
+        return self
 
 
 class TranslatorSummary(BaseModel):
@@ -101,6 +164,10 @@ class TranslatorSummary(BaseModel):
     bank_iban_masked: str | None
     #: Per-page rate; the order builder pre-fills translator cost from it.
     default_rate: Decimal | None
+    can_notarize: bool
+    works_written: bool
+    works_oral: bool
+    language_pairs: list[LanguagePairOut]
 
 
 class TranslatorDetail(TranslatorSummary):
@@ -117,7 +184,7 @@ class TranslatorPage(BaseModel):
     meta: PageMeta
 
 
-def _summary(row: Translator) -> TranslatorSummary:
+def _summary(row: Translator, pairs: list[TranslatorLanguagePair]) -> TranslatorSummary:
     return TranslatorSummary(
         id=row.id,
         name=row.name,
@@ -127,12 +194,83 @@ def _summary(row: Translator) -> TranslatorSummary:
         has_portal_account=row.has_portal_account,
         bank_iban_masked=mask_tail(row.bank_iban),
         default_rate=row.default_rate,
+        can_notarize=row.can_notarize,
+        works_written=row.works_written,
+        works_oral=row.works_oral,
+        language_pairs=[
+            LanguagePairOut(
+                source_language=p.source_language,
+                target_language=p.target_language,
+                rate_per_page=p.rate_per_page,
+            )
+            for p in pairs
+        ],
     )
 
 
-def _detail(row: Translator) -> TranslatorDetail:
+async def _pairs_of(
+    db: AsyncSession, translator_ids: list[int]
+) -> dict[int, list[TranslatorLanguagePair]]:
+    """Every listed translator's pairs, in one query, in the order they were added."""
+    if not translator_ids:
+        return {}
+    rows = (
+        (
+            await db.execute(
+                select(TranslatorLanguagePair)
+                .where(TranslatorLanguagePair.translator_id.in_(translator_ids))
+                .order_by(TranslatorLanguagePair.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_translator: dict[int, list[TranslatorLanguagePair]] = {}
+    for row in rows:
+        by_translator.setdefault(row.translator_id, []).append(row)
+    return by_translator
+
+
+async def _replace_pairs(db: AsyncSession, translator_id: int, pairs: list[LanguagePairIn]) -> None:
+    """Make the translator's pairs exactly `pairs`.
+
+    Each code must be one of the bureau's languages (active or not: a language
+    switched off later must not make an existing translator unsaveable), the
+    same codes the order form offers.
+    """
+    codes = {p.source_language for p in pairs} | {p.target_language for p in pairs}
+    if codes:
+        known = set(
+            (await db.execute(select(Language.code).where(Language.code.in_(codes)))).scalars()
+        )
+        unknown = sorted(codes - known)
+        if unknown:
+            raise ValidationError(
+                f"Not one of your languages: {', '.join(unknown)}. Add it under Settings first."
+            )
+
+    await db.execute(
+        delete(TranslatorLanguagePair).where(TranslatorLanguagePair.translator_id == translator_id)
+    )
+    for pair in pairs:
+        db.add(
+            TranslatorLanguagePair(
+                translator_id=translator_id,
+                source_language=pair.source_language,
+                target_language=pair.target_language,
+                rate_per_page=pair.rate_per_page,
+            )
+        )
+    await db.flush()
+
+
+async def _detail_of(db: AsyncSession, row: Translator) -> TranslatorDetail:
+    return _detail(row, (await _pairs_of(db, [row.id])).get(row.id, []))
+
+
+def _detail(row: Translator, pairs: list[TranslatorLanguagePair]) -> TranslatorDetail:
     return TranslatorDetail(
-        **_summary(row).model_dump(),
+        **_summary(row, pairs).model_dump(),
         office_address=row.office_address,
         comment=row.comment,
         experience_from=row.experience_from,
@@ -173,9 +311,10 @@ async def list_translators(
     stmt = stmt.order_by(column.desc() if sort.startswith("-") else column.asc())
 
     rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
+    pairs = await _pairs_of(db, [r.id for r in rows])
 
     return TranslatorPage(
-        items=[_summary(r) for r in rows],
+        items=[_summary(r, pairs.get(r.id, [])) for r in rows],
         meta=PageMeta(total=total, limit=limit, offset=offset),
     )
 
@@ -478,7 +617,7 @@ async def invite_translator(
         # A phone-only account has no address. Nothing is sent and the quota is
         # not spent: there is nothing to retry either.
         return TranslatorInviteOut(
-            translator=_detail(directory_row),
+            translator=await _detail_of(db, directory_row),
             invite_status=existing.status.value,  # type: ignore[arg-type]
             matched_display_name=matched_display_name,
             email_sent=False,
@@ -504,7 +643,7 @@ async def invite_translator(
     mail_result = await mail.send(email, subject, body)
 
     return TranslatorInviteOut(
-        translator=_detail(directory_row),
+        translator=await _detail_of(db, directory_row),
         invite_status=existing.status.value,  # type: ignore[arg-type]
         matched_display_name=matched_display_name,
         email_sent=mail_result.delivered,
@@ -728,7 +867,7 @@ async def get_translator(
     row = await db.get(Translator, translator_id)
     if row is None:
         raise NotFoundError("Translator not found.")
-    return _detail(row)
+    return await _detail_of(db, row)
 
 
 @router.post("", response_model=TranslatorDetail, status_code=status.HTTP_201_CREATED)
@@ -738,9 +877,10 @@ async def create_translator(
     session: CurrentSession,
     _: Annotated[object, Depends(require(Permission.TRANSLATORS_WRITE))],
 ) -> TranslatorDetail:
-    row = Translator(**payload.model_dump())
+    row = Translator(**payload.model_dump(exclude={"language_pairs"}))
     db.add(row)
     await db.flush()
+    await _replace_pairs(db, row.id, payload.language_pairs)
 
     from suliko.core.audit import record
 
@@ -752,7 +892,7 @@ async def create_translator(
         entity_id=row.id,
         after=payload.model_dump(mode="json"),
     )
-    return _detail(row)
+    return await _detail_of(db, row)
 
 
 @router.patch("/{translator_id}", response_model=TranslatorDetail)
@@ -768,11 +908,24 @@ async def update_translator(
         raise NotFoundError("Translator not found.")
 
     changes = payload.model_dump(exclude_unset=True)
+    new_pairs = changes.pop("language_pairs", None)
     before = {k: getattr(row, k) for k in changes}
 
     for field, value in changes.items():
         setattr(row, field, value)
+    if not (row.works_written or row.works_oral):
+        raise ValidationError("A translator does written work, oral work, or both.")
     await db.flush()
+
+    if new_pairs is not None:
+        old_pairs = (await _pairs_of(db, [row.id])).get(row.id, [])
+        before["language_pairs"] = [
+            {"source": p.source_language, "target": p.target_language} for p in old_pairs
+        ]
+        await _replace_pairs(db, row.id, payload.language_pairs or [])
+        changes["language_pairs"] = [
+            {"source": p["source_language"], "target": p["target_language"]} for p in new_pairs
+        ]
 
     from suliko.core.audit import record
 
@@ -785,7 +938,7 @@ async def update_translator(
         before=before,
         after=changes,
     )
-    return _detail(row)
+    return await _detail_of(db, row)
 
 
 @router.delete("/{translator_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -812,4 +965,8 @@ async def delete_translator(
     # order_documents.translator_id is ON DELETE SET NULL, so past work is
     # kept and simply becomes unassigned. Deactivating (is_active=false) is
     # still the better move for someone who has history.
+    # The pairs have no foreign key to cascade from: they go explicitly.
+    await db.execute(
+        delete(TranslatorLanguagePair).where(TranslatorLanguagePair.translator_id == row.id)
+    )
     await db.delete(row)

@@ -18,6 +18,8 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
+    true,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -96,6 +98,19 @@ class Translator(Base, IdMixin, TenantScoped, TimestampMixin):
     # Default per-page rate paid to this translator. Per-pair overrides live in
     # TranslatorLanguagePair.
     default_rate: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
+
+    # What the bureau may give them. Whether they can certify a translation at
+    # a notary, and whether they translate documents, interpret, or both. The
+    # API keeps at least one of the two kinds of work on.
+    can_notarize: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
+    works_written: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=true(), nullable=False
+    )
+    works_oral: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
 
     # Translator-portal credentials. Presence of a username is what the UI
     # renders as the "Active" / "None" account badge.
