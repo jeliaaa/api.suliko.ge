@@ -1546,6 +1546,9 @@ class SessionInfo(BaseModel):
     timezone: str
     #: Whether this user has a confirmed second factor (Account screen).
     has_mfa: bool
+    #: Whether two-factor is switched on at all (`MFA_ENFORCED`). Off, a factor
+    #: is never asked for, so the frontend hides the screens that manage one.
+    mfa_enforced: bool = True
     #: Whether this address has been confirmed — drives the banner. Not
     #: enforced anywhere yet; see the note above `POST /auth/verify-email`.
     email_verified: bool
@@ -1599,6 +1602,7 @@ async def current_session(
         is_impersonated=session.is_impersonated,
         timezone=session.timezone,
         has_mfa=session.has_mfa,
+        mfa_enforced=get_settings().mfa_enforced,
         email_verified=session.email_verified,
     )
 

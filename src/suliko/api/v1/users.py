@@ -8,8 +8,8 @@ several rules are enforced that are not obvious from the data model:
 - You cannot assign a role above your own. Same reason.
 - The last active owner cannot be demoted, deactivated or deleted, or the
   tenant is left with nobody who can administer it.
-- `superuser` cannot be granted here at all — it is platform-level and is
-  created out-of-band by the CLI.
+- `superuser` cannot be granted here at all — it is platform-level, and comes
+  from the CLI or from another superuser (`POST /platform/superusers`).
 - A role change revokes that user's sessions, so a demotion takes effect
   immediately rather than at their next login.
 
@@ -80,8 +80,8 @@ from suliko.security.sessions import revoke_all_for_user
 
 router = APIRouter(prefix="/users", tags=["users"])
 
-#: Roles assignable through the API. `superuser` is deliberately absent —
-#: it is platform-level and only the CLI creates it.
+#: Roles assignable from a tenant's Users screen. `superuser` is deliberately
+#: absent — it is platform-level, and no tenant role can hand it out.
 ASSIGNABLE_ROLES = (Role.OWNER, Role.ADMIN, Role.MANAGER, Role.STAFF)
 
 #: Seniority, for the "cannot assign above your own role" check.

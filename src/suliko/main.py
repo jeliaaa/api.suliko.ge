@@ -96,8 +96,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "mfa_disabled",
             detail=(
                 "MFA_ENFORCED is false. Every account, including superusers, "
-                "signs in with a password alone. Set MFA_ENFORCED=true once "
-                "the enrolment screen exists."
+                "signs in with a password alone. Set MFA_ENFORCED=true to "
+                "turn two-factor authentication back on."
             ),
         )
     elif not settings.mfa_require_enrolment:

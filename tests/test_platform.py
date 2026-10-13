@@ -307,9 +307,10 @@ def test_writing_into_another_tenant_binds_all_three() -> None:
 # ── The guards ──────────────────────────────────────────────────────────────
 
 
-def test_superuser_cannot_be_minted_over_http() -> None:
-    """Unchanged from `users.py`, and asserted there too: an account with
-    platform-wide reach requires filesystem access to the server."""
+def test_superuser_cannot_be_minted_inside_a_bureau() -> None:
+    """Unchanged from `users.py`, and asserted there too: creating an account
+    in a tenant never makes a superuser. The one way to name one over HTTP is
+    `POST /platform/superusers` — see `test_platform_superusers.py`."""
     body = inspect.getsource(platform.create_tenant_user)
     assert "Role.SUPERUSER" in body
     assert "server console" in body

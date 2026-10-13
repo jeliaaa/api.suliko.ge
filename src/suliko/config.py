@@ -133,11 +133,13 @@ class Settings(BaseSettings):
     #: ignored. Enrolled secrets are NOT deleted, so flipping this back to
     #: true restores the previous behaviour with no re-enrolment.
     #:
-    #: Intended as a temporary measure while the enrolment UI is being built.
-    #: Startup logs a warning on every boot while it is off, deliberately —
-    #: this is not a setting that should quietly become permanent, in a system
-    #: holding client identity documents and bank details.
-    mfa_enforced: bool = True
+    #: Off for now (decided 2026-10-13): two-factor is dropped until it is
+    #: wanted again, so the default is false and the frontend hides its
+    #: screens. Set MFA_ENFORCED=true to bring it back. Startup logs a warning
+    #: on every boot while it is off, deliberately — this is not a setting
+    #: that should quietly become permanent, in a system holding client
+    #: identity documents and bank details.
+    mfa_enforced: bool = False
 
     #: Whether a role in MFA_REQUIRED_ROLES may sign in with NO factor enrolled.
     #:

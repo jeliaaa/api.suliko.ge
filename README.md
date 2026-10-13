@@ -18,9 +18,11 @@ uvicorn suliko.main:app --reload      # http://localhost:8000/docs
 ```
 
 The CLI also has discrete commands — `create-database`, `migrate`,
-`create-tenant`, `seed-reference`, `create-superuser`, `check`. A superuser can
-only be made here, never through the API: there is no sign-up path and no
-"first user becomes admin" rule.
+`create-tenant`, `seed-reference`, `create-superuser`, `check`. The first
+superuser is made here: there is no sign-up path and no "first user becomes
+admin" rule. After that a superuser can let named suliko.ge accounts in from
+the admin console at `app.suliko.ge/admin` (`POST /api/v1/platform/superusers`).
+Two-factor is switched off for now (`MFA_ENFORCED=false`).
 
 ```bash
 pytest -q                             # 330 tests

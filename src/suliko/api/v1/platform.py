@@ -44,21 +44,31 @@ there is still no enrolment screen, so the one control standing between "read
 a tenant's data" and "act as their owner" cannot currently be satisfied.
 Shipping it without that is shipping the feature without its safety catch.
 
-**Creating a superuser.** Unchanged and not negotiable:
-`suliko create-superuser` on the server, never over HTTP. An account with
-platform-wide reach should require filesystem access to the machine.
+**Minting a superuser inside a bureau.** `create_tenant_user` still refuses
+the role, and so does a tenant's own Users screen.
+
+## Superusers
+
+The first one is made on the server (`suliko create-superuser`). After that an
+existing superuser can let named suliko.ge accounts in (`POST /superusers`,
+decided 2026-10-13): each gets a superuser membership of the organisation the
+caller is signed in to, and signs in with their suliko.ge email or phone and
+password like everyone else. Only a person suliko.ge knows can be named — no
+password is ever made or handed out here — and every grant and removal is
+audited. It does mean a superuser's sign-in is only as strong as that person's
+suliko.ge password.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query
 from fastapi import status as http_status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
-from sqlalchemy import case, func, select
+from sqlalchemy import case, delete, func, or_, select
 
 from suliko.api.deps import Db, require
 from suliko.core.errors import (
@@ -68,13 +78,23 @@ from suliko.core.errors import (
 )
 from suliko.db.session import bind_tenant_guc
 from suliko.db.tenancy import bypass_tenant_scope, tenant_scope
-from suliko.domain.accounts import UNUSABLE_PASSWORD_HASH, find_account
+from suliko.domain.accounts import (
+    UNUSABLE_PASSWORD_HASH,
+    SulikoAccountConflictError,
+    find_account,
+    find_suliko_person,
+    login_name,
+    upsert_from_suliko,
+    username_for_account,
+)
 from suliko.domain.plans import TenantPlan, effective_plan
+from suliko.domain.portal import checked_login
+from suliko.integrations.suliko_backend import SulikoBackend, get_suliko_backend
 from suliko.models.order import Order, OrderDocument
 from suliko.models.order_file import OrderFile
 from suliko.models.reference import Language, LanguagePairPrice
 from suliko.models.tenant import Tenant, TenantStatus
-from suliko.models.user import Account, Role, User
+from suliko.models.user import Account, Role, User, UserPermissionOverride
 from suliko.security.passwords import (
     generate_one_time_password,
     hash_password_async,
@@ -213,6 +233,47 @@ class PlatformTotals(BaseModel):
     users: int
     orders: int
     revenue: Decimal
+
+
+class SuperuserOut(BaseModel):
+    id: int
+    #: What they sign in with: the address, else the phone number.
+    login: str
+    full_name: str
+    #: The organisation their superuser membership sits in.
+    tenant_id: int
+    tenant_slug: str
+    is_active: bool
+    #: Their password is suliko.ge's. False for an account with a password of
+    #: its own — one made from the server console.
+    signs_in_with_suliko: bool
+    last_login_at: datetime | None
+
+
+class SuperuserGrant(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    #: suliko.ge sign-ins: an email address or a phone number each.
+    #: Capped because each one is a round trip to suliko.ge, in turn.
+    identifiers: list[Annotated[str, Field(max_length=255)]] = Field(min_length=1, max_length=50)
+
+
+class SuperuserGrantResult(BaseModel):
+    #: As it was sent, so the caller can tell which line this answers.
+    identifier: str
+    #: `granted` and `already` are in; the other three are not, and nothing was
+    #: written for them. `not_found`: no suliko.ge account signs in with it.
+    status: Literal["granted", "already", "not_found", "invalid", "conflict"]
+    #: Why, for `invalid` and `conflict`.
+    detail: str | None = None
+    superuser: SuperuserOut | None = None
+    #: An Office account with this address had a password of its own; it now
+    #: signs in with its suliko.ge password and the old one no longer works.
+    password_moved_to_suliko: bool = False
+
+
+class SuperuserGrantOut(BaseModel):
+    results: list[SuperuserGrantResult]
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -645,6 +706,242 @@ async def delete_tenant_user(
         entity_type="user",
         entity_id=row.id,
         tenant_id=tenant_id,
+        before={"username": row.username, "role": row.role.value},
+    )
+
+    await revoke_all_for_user(db, row.id)
+    with bypass_tenant_scope():
+        await db.delete(row)
+
+
+# ── Superusers ──────────────────────────────────────────────────────────────
+
+
+def _superuser_out(row: User, tenant: Tenant, account: Account | None) -> SuperuserOut:
+    return SuperuserOut(
+        id=row.id,
+        login=(login_name(account) if account else "") or row.email or row.username,
+        full_name=row.full_name,
+        tenant_id=row.tenant_id,
+        tenant_slug=tenant.slug,
+        is_active=row.is_active,
+        signs_in_with_suliko=account is not None and account.suliko_user_id is not None,
+        last_login_at=row.last_login_at,
+    )
+
+
+@router.get("/superusers", response_model=list[SuperuserOut])
+async def list_superusers(db: Db, _: Superuser) -> list[SuperuserOut]:
+    """Everyone with platform-wide reach, wherever their membership sits."""
+    with bypass_tenant_scope():
+        rows = (
+            await db.execute(
+                select(User, Tenant, Account)
+                .join(Tenant, Tenant.id == User.tenant_id)
+                .outerjoin(Account, Account.id == User.account_id)
+                .where(User.role == Role.SUPERUSER)
+                .order_by(User.id)
+            )
+        ).all()
+    return [_superuser_out(user, tenant, account) for user, tenant, account in rows]
+
+
+async def _grant_superuser(
+    db: Db,
+    session: AuthenticatedSession,
+    backend: SulikoBackend,
+    tenant: Tenant,
+    identifier: str,
+) -> SuperuserGrantResult:
+    """Let one suliko.ge account into the platform area, or say why not.
+
+    Who the person is comes from suliko.ge, never from what was typed: the
+    identifier only finds them, and their account here is whatever
+    `upsert_from_suliko` says it is. A membership they already hold in this
+    organisation is promoted rather than doubled.
+    """
+    try:
+        login = checked_login(identifier)
+    except ValidationError as exc:
+        return SuperuserGrantResult(identifier=identifier, status="invalid", detail=exc.detail)
+
+    person = await find_suliko_person(backend, login)
+    if person is None:
+        return SuperuserGrantResult(identifier=identifier, status="not_found")
+    try:
+        link = await upsert_from_suliko(db, person)
+    except SulikoAccountConflictError as exc:
+        return SuperuserGrantResult(identifier=identifier, status="conflict", detail=exc.detail)
+    account = link.account
+
+    tenant_id = int(tenant.id)
+    username = username_for_account(account)
+    same_sign_in = [func.lower(User.username) == username.lower()]
+    if account.email:
+        same_sign_in.append(func.lower(User.email) == account.email)
+    with bypass_tenant_scope():
+        rows = (
+            (
+                await db.execute(
+                    select(User)
+                    .where(
+                        User.tenant_id == tenant_id,
+                        or_(User.account_id == account.id, *same_sign_in),
+                    )
+                    .order_by(User.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    row = next((r for r in rows if r.account_id == account.id), None)
+    if row is None and rows:
+        # A row under this sign-in that is not this person's: usernames are
+        # unique per organisation, and it is not ours to hand over.
+        return SuperuserGrantResult(
+            identifier=identifier,
+            status="conflict",
+            detail="Someone else in this organisation already uses this sign-in.",
+        )
+
+    promoted_from: str | None = None
+    if row is not None and row.role is Role.SUPERUSER and row.is_active:
+        status: Literal["granted", "already"] = "already"
+    else:
+        status = "granted"
+        # The GUC and the ORM stamp point at the tenant the row is written to,
+        # as for every write in this router.
+        await bind_tenant_guc(db, tenant_id)
+        with tenant_scope(tenant_id):
+            if row is None:
+                row = User(
+                    tenant_id=tenant_id,
+                    account_id=account.id,
+                    username=username,
+                    email=account.email,
+                    full_name=account.full_name.strip() or username,
+                    password_hash=UNUSABLE_PASSWORD_HASH,
+                    role=Role.SUPERUSER,
+                    is_active=True,
+                    email_verified_at=account.email_verified_at,
+                )
+                db.add(row)
+            else:
+                promoted_from = row.role.value
+                row.role = Role.SUPERUSER
+                row.is_active = True
+                row.invitation_pending = False
+                # What an owner unticked for them as staff must not follow
+                # them into a role whose access is nobody's to trim.
+                await db.execute(
+                    delete(UserPermissionOverride).where(
+                        UserPermissionOverride.tenant_id == tenant_id,
+                        UserPermissionOverride.user_id == row.id,
+                    )
+                )
+            await db.flush()
+        if promoted_from is not None:
+            # Their live sessions carry the old role's permissions.
+            await revoke_all_for_user(db, row.id)
+    assert row is not None
+
+    if status == "granted" or link.linked_existing:
+        from suliko.core.audit import record
+
+        await record(
+            db,
+            session,
+            action=(
+                "platform.superuser_granted"
+                if status == "granted"
+                else "platform.superuser_linked_to_suliko"
+            ),
+            entity_type="user",
+            entity_id=row.id,
+            tenant_id=tenant_id,
+            before={"role": promoted_from} if promoted_from else None,
+            after={
+                "username": row.username,
+                "role": Role.SUPERUSER.value,
+                "tenant_slug": tenant.slug,
+                "suliko_user_id": account.suliko_user_id,
+                "password_moved_to_suliko": link.linked_existing,
+            },
+        )
+
+    return SuperuserGrantResult(
+        identifier=identifier,
+        status=status,
+        superuser=_superuser_out(row, tenant, account),
+        password_moved_to_suliko=link.linked_existing,
+    )
+
+
+@router.post("/superusers", response_model=SuperuserGrantOut)
+async def grant_superusers(
+    payload: SuperuserGrant,
+    db: Db,
+    session: Superuser,
+    backend: Annotated[SulikoBackend, Depends(get_suliko_backend)],
+) -> SuperuserGrantOut:
+    """Let suliko.ge accounts into the platform area, as superusers.
+
+    Each identifier is what the person signs in to suliko.ge with: an email
+    address or a phone number. suliko.ge is asked who they are; their account
+    is made here if this is the first Office has heard of them, and it gets a
+    superuser membership of the organisation the caller is signed in to — the
+    one whose plan demonstrably carries the platform permissions. From then on
+    they sign in as usual, with their suliko.ge password, and pick it.
+
+    One answer per identifier, and a line that cannot be granted never stops
+    the others. suliko.ge being unreachable is the exception: a 503 for the
+    whole request with nothing written, because "not found" would be a guess.
+    """
+    if not backend.enabled:
+        raise ConflictError(
+            "Suliko Office is not connected to suliko.ge (SULIKO_API_URL), so "
+            "there are no suliko.ge accounts to let in."
+        )
+    tenant = await _tenant_or_404(db, session.tenant_id)
+
+    results: list[SuperuserGrantResult] = []
+    seen: set[str] = set()
+    for raw in payload.identifiers:
+        identifier = raw.strip()
+        if not identifier or identifier.lower() in seen:
+            continue
+        seen.add(identifier.lower())
+        results.append(await _grant_superuser(db, session, backend, tenant, identifier))
+    return SuperuserGrantOut(results=results)
+
+
+@router.delete("/superusers/{user_id}", status_code=http_status.HTTP_204_NO_CONTENT)
+async def revoke_superuser(user_id: int, db: Db, session: Superuser) -> None:
+    """Take platform access away again, by removing the superuser membership.
+
+    The person keeps their account and every other organisation they belong
+    to. Nobody removes themselves, which is also what guarantees that a
+    superuser is always left.
+    """
+    with bypass_tenant_scope():
+        row = await db.get(User, user_id)
+    if row is None or row.role is not Role.SUPERUSER:
+        raise NotFoundError("Superuser not found.")
+
+    if row.id == session.user_id or (
+        row.account_id is not None and row.account_id == session.account_id
+    ):
+        raise ValidationError("You cannot remove your own platform access.")
+
+    from suliko.core.audit import record
+
+    await record(
+        db,
+        session,
+        action="platform.superuser_revoked",
+        entity_type="user",
+        entity_id=row.id,
+        tenant_id=row.tenant_id,
         before={"username": row.username, "role": row.role.value},
     )
 

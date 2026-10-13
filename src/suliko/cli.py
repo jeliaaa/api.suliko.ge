@@ -11,10 +11,11 @@
     python -m suliko.cli check
     python -m suliko.cli purge-files        # daily: reclaim removed order files
 
-The superuser is created here and **never through the HTTP API**. There is no
-sign-up path, no "first user becomes admin" rule, and no way to escalate into
-the role from inside the application — an account with platform-wide reach must
-require filesystem access to the server to create.
+The FIRST superuser is created here. There is no sign-up path, no "first user
+becomes admin" rule, and no way for a tenant's own roles to escalate into it.
+The one way over HTTP is `POST /platform/superusers`, which an existing
+superuser uses to let named suliko.ge accounts in (decided 2026-10-13; see
+`api/v1/platform.py`).
 
 See docs/03-SECURITY-AND-TENANCY.md §3.1.
 """
@@ -269,6 +270,18 @@ async def create_superuser(
             )
             db.add(user)
             await db.flush()
+
+            # With two-factor switched off (MFA_ENFORCED=false) there is no
+            # factor to enrol: it would never be asked for. They can add one
+            # from their Account screen once it is switched back on.
+            if not get_settings().mfa_enforced:
+                await db.commit()
+                heading("Superuser created")
+                say(f"  username : {username}")
+                say(f"  tenant   : {tenant_slug}")
+                say("")
+                warn("Two-factor is switched off (MFA_ENFORCED=false): no factor was enrolled.")
+                return
 
             # Superusers must hold a second factor — enrol it now rather than
             # leaving a window where the most privileged account has none.

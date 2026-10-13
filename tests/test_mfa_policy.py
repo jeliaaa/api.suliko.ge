@@ -144,7 +144,7 @@ def test_the_strict_policy_is_one_flag_away() -> None:
 
 
 def test_enrolment_is_not_required_by_default() -> None:
-    """The counterpart to `test_default_is_enforced`.
+    """The counterpart to `test_default_is_off_for_now`.
 
     A default that locks out the owner of every new tenant is not a safe
     default, it is an outage. This one has to be flipped deliberately, the
@@ -155,17 +155,17 @@ def test_enrolment_is_not_required_by_default() -> None:
     assert Settings(_env_file=None).mfa_require_enrolment is False
 
 
-def test_default_is_enforced() -> None:
-    """A fresh deployment must require MFA. Disabling it has to be a
-    deliberate, written-down act, never a default.
+def test_default_is_off_for_now() -> None:
+    """Two-factor was dropped for now (2026-10-13), so a deployment that says
+    nothing gets none. Turning it back on is `MFA_ENFORCED=true` — and this
+    default, with this test, when that becomes the rule again.
 
     `_env_file=None` is essential: without it this reads whatever the local
-    .env says, so on a machine that has MFA switched off the test would assert
-    that switching it off is the default — and pass.
+    .env says, and would pass or fail on that instead of on the default.
     """
     from suliko.config import Settings
 
-    assert Settings(_env_file=None).mfa_enforced is True
+    assert Settings(_env_file=None).mfa_enforced is False
 
 
 def test_mirror_matches_source() -> None:

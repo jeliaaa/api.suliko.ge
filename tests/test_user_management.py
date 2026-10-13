@@ -69,9 +69,10 @@ def test_can_assign_at_or_below_own_role(actor: Role, target: Role) -> None:
 def test_superuser_cannot_be_granted_through_the_api(actor: Role) -> None:
     """Not even by another superuser.
 
-    A platform-wide account must require filesystem access to the server, so
-    that compromising one tenant's admin session can never mint one. The CLI
-    is the only path.
+    Nothing on a tenant's own Users screen can mint a platform-wide account,
+    so compromising one tenant's admin session never yields one. They come
+    from the server console, or from `POST /platform/superusers`, which only
+    an existing superuser can call.
     """
     with pytest.raises(ValidationError, match="server console"):
         _guard_assignable(actor, Role.SUPERUSER)
