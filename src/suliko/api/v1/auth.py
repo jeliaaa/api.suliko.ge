@@ -27,6 +27,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from suliko.api.deps import (
+    CurrentSession,
     Db,
     get_client_ip,
     get_client_user_agent,
@@ -96,6 +97,7 @@ from suliko.security.sessions import (
     create_session,
     mark_mfa_satisfied,
     resolve_session,
+    revoke_all_for_user,
     revoke_session,
 )
 
@@ -1466,6 +1468,86 @@ async def change_password(
         action="user.password_changed",
         entity_type="user",
         entity_id=session.user_id,
+    )
+
+
+class LeaveRequest(BaseModel):
+    #: Required for an account with a password of its own. An account kept on
+    #: suliko.ge has none to ask for here.
+    current_password: str | None = Field(default=None, max_length=1024)
+
+
+@router.post("/leave", status_code=status.HTTP_204_NO_CONTENT)
+async def leave_organisation(
+    payload: LeaveRequest,
+    session: CurrentSession,
+    db: Db,
+) -> None:
+    """Close your own access to this organisation.
+
+    The account is switched off, not erased: nothing is deleted, every session
+    is ended, and an owner or admin of the organisation can switch it back on
+    from Users. Orders and clients stay with the organisation. The account
+    itself (and suliko.ge) is untouched, and so is any other organisation the
+    person belongs to.
+
+    The one rule: the last active owner cannot leave while other people still
+    use the organisation, or nobody would be left to run it. Hand ownership
+    over first. A sole user, such as a freelancer's own workspace, can.
+    """
+    if session.impersonated_by_user_id is not None:
+        raise ValidationError("You cannot close an account while acting as someone else.")
+
+    user = await db.get(User, session.user_id)
+    if user is None:
+        raise AuthenticationError("Your account is no longer available.")
+
+    account = await db.get(Account, session.account_id) if session.account_id else None
+    if account is not None and account.suliko_user_id is None:
+        ok = False
+        if payload.current_password:
+            ok, _ = await verify_and_maybe_rehash_async(
+                payload.current_password, account.password_hash
+            )
+        if not ok:
+            # 422, not 401: the session is fine, one field is wrong.
+            raise ValidationError("Your current password is not correct.")
+
+    if user.role is Role.OWNER:
+        others = (
+            await db.scalar(
+                select(func.count())
+                .select_from(User)
+                .where(User.is_active.is_(True), User.id != user.id)
+            )
+        ) or 0
+        other_owners = (
+            await db.scalar(
+                select(func.count())
+                .select_from(User)
+                .where(User.role == Role.OWNER, User.is_active.is_(True), User.id != user.id)
+            )
+        ) or 0
+        if others > 0 and other_owners == 0:
+            raise ConflictError(
+                "You are the only owner. Make someone else an owner under Users first, "
+                "then you can close your access."
+            )
+
+    user.is_active = False
+    await db.flush()
+    await revoke_all_for_user(db, user.id)
+
+    from suliko.core.audit import record
+
+    await record(
+        db,
+        session,
+        action="user.left",
+        entity_type="user",
+        entity_id=user.id,
+        before={"is_active": True},
+        after={"is_active": False},
     )
 
 
