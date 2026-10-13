@@ -32,6 +32,7 @@ from suliko.api.v1._shared import PageMeta, mask_tail
 from suliko.core import mail
 from suliko.core.errors import ConflictError, NotFoundError, RateLimitedError, ValidationError
 from suliko.core.ratelimit import RateLimiter, get_rate_limiter
+from suliko.domain.cities import CITIES, pack, unpack
 from suliko.domain.portal import (
     account_matches,
     checked_login,
@@ -41,7 +42,6 @@ from suliko.domain.portal import (
     portal_translator_for,
     registration_url,
 )
-from suliko.domain.cities import CITIES, pack, unpack
 from suliko.integrations.suliko_backend import SulikoBackend, SulikoUser, get_suliko_backend
 from suliko.models.directory import Translator, TranslatorLanguagePair
 from suliko.models.portal import (
