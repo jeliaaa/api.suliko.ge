@@ -43,6 +43,18 @@ class HandoverMethod(enum.StrEnum):
     DELIVERY = "delivery"
 
 
+class ServiceType(enum.StrEnum):
+    """What a line is: a document to translate, or time spent interpreting.
+
+    An oral line counts MINUTES in ``page_count``, has no document type, and is
+    never notarised. Everything that sums or prints ``page_count`` has to know
+    which of the two it is adding up.
+    """
+
+    WRITTEN = "written"
+    ORAL = "oral"
+
+
 class CopyType(enum.StrEnum):
     ORIGINAL = "original"
     PLAIN = "plain"
@@ -152,12 +164,26 @@ class OrderDocument(Base, IdMixin, TenantScoped, TimestampMixin):
     order_id: Mapped[int] = mapped_column(
         ForeignKey("orders.id", ondelete="CASCADE"), nullable=False
     )
-    document_type_id: Mapped[int] = mapped_column(
-        ForeignKey("document_types.id", ondelete="RESTRICT"), nullable=False
+    #: Null on an oral line, which has no document.
+    document_type_id: Mapped[int | None] = mapped_column(
+        ForeignKey("document_types.id", ondelete="RESTRICT"), default=None
+    )
+    service_type: Mapped[ServiceType] = mapped_column(
+        Enum(
+            ServiceType,
+            name="service_type",
+            values_callable=enum_values,
+            native_enum=False,
+            length=10,
+        ),
+        default=ServiceType.WRITTEN,
+        server_default=ServiceType.WRITTEN.value,
+        nullable=False,
     )
 
     source_language: Mapped[str] = mapped_column(String(5), nullable=False)
     target_language: Mapped[str] = mapped_column(String(5), nullable=False)
+    #: Pages for a written line, minutes for an oral one (see ``ServiceType``).
     page_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
     copy_type: Mapped[CopyType] = mapped_column(
@@ -192,7 +218,7 @@ class OrderDocument(Base, IdMixin, TenantScoped, TimestampMixin):
     )
 
     order: Mapped[Order] = relationship(back_populates="documents", lazy="raise")
-    document_type: Mapped[DocumentType] = relationship(lazy="raise", viewonly=True)
+    document_type: Mapped[DocumentType | None] = relationship(lazy="raise", viewonly=True)
     translator: Mapped[Translator | None] = relationship(lazy="raise", viewonly=True)
     notary: Mapped[Notary | None] = relationship(lazy="raise", viewonly=True)
 

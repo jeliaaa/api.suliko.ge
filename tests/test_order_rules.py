@@ -431,3 +431,38 @@ async def test_list_extras_are_loaded_in_one_query(db: AsyncSession) -> None:
     extras = await orders._load_list_extras(db, [1])
     assert extras == {1: (["Acme translator"], ["ka→en"])}
     assert await orders._load_list_extras(db, []) == {}
+
+
+# ── Oral lines ──────────────────────────────────────────────────────────────
+
+
+def _doc(**fields: object) -> dict[str, object]:
+    return {"source_language": "ka", "target_language": "en", "page_count": 30, **fields}
+
+
+def test_an_oral_line_needs_no_document_type() -> None:
+    from suliko.api.v1.orders import OrderDocumentIn
+
+    line = OrderDocumentIn(**_doc(service_type="oral"))  # type: ignore[arg-type]
+    assert line.document_type_id is None
+
+
+def test_a_written_line_still_needs_a_document_type() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    from suliko.api.v1.orders import OrderDocumentIn
+
+    with pytest.raises(ValidationError):
+        OrderDocumentIn(**_doc())  # type: ignore[arg-type]
+
+
+def test_an_oral_line_refuses_a_notary_a_copy_type_or_notarisation() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    from suliko.api.v1.orders import OrderDocumentIn
+
+    for extra in ({"is_notarized": True}, {"notary_id": 3}, {"copy_type": "notary_copy"}):
+        with pytest.raises(ValidationError):
+            OrderDocumentIn(**_doc(service_type="oral", **extra))  # type: ignore[arg-type]

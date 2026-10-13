@@ -57,6 +57,8 @@ class LanguagePairOut(BaseModel):
     source_language: str
     target_language: str
     price_per_page: Decimal
+    #: Null when no per-minute rate is set for the pair.
+    price_per_minute: Decimal | None = None
 
 
 class EnumOption(BaseModel):
@@ -121,6 +123,9 @@ async def get_reference(
             source_language=row.source_language,
             target_language=row.target_language,
             price_per_page=Decimal(str(row.price_per_page)),
+            price_per_minute=(
+                Decimal(str(row.price_per_minute)) if row.price_per_minute is not None else None
+            ),
         )
         for row in (
             await db.execute(

@@ -56,7 +56,7 @@ from suliko.domain.invoice_numbers import new_invoice_number
 from suliko.domain.orders import base_order_query
 from suliko.models.directory import Client, ClientType
 from suliko.models.invoice import Invoice
-from suliko.models.order import Order, OrderDocument
+from suliko.models.order import Order, OrderDocument, ServiceType
 from suliko.models.reference import Company, CompanyBankAccount, Language
 from suliko.security.permissions import Permission
 
@@ -148,7 +148,9 @@ class InvoiceLine(BaseModel):
     description: str
     #: Full names in the invoice's language ("ქართული → ინგლისური"), not codes.
     languages: str
+    #: Pages, or minutes when `unit` is "minutes".
     pages: int
+    unit: Literal["pages", "minutes"] = "pages"
     unit_price: Decimal
     amount: Decimal
 
@@ -622,9 +624,14 @@ async def order_invoice(
 
     lines = [
         InvoiceLine(
-            description=d.document_type.name_en
-            if locale == "en" and d.document_type
-            else (d.document_type.name_ka if d.document_type else "Translation"),
+            description=(
+                ("Oral interpreting" if locale == "en" else "ზეპირი თარგმანი")
+                if d.service_type is ServiceType.ORAL
+                else d.document_type.name_en
+                if locale == "en" and d.document_type
+                else (d.document_type.name_ka if d.document_type else "Translation")
+            ),
+            unit="minutes" if d.service_type is ServiceType.ORAL else "pages",
             languages=_language_pair(d.source_language, d.target_language, names, locale),
             pages=d.page_count,
             # Per page, derived for display only. The authority is `amount`.

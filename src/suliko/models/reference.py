@@ -42,7 +42,7 @@ class DocumentType(Base, IdMixin, TenantScoped, TimestampMixin):
 
 
 class LanguagePairPrice(Base, IdMixin, TenantScoped, TimestampMixin):
-    """Base rate per page for a directed language pair."""
+    """Base rate per page (and optionally per minute) for a directed language pair."""
 
     __tablename__ = "language_pair_prices"
     __table_args__ = (
@@ -58,6 +58,9 @@ class LanguagePairPrice(Base, IdMixin, TenantScoped, TimestampMixin):
     source_language: Mapped[str] = mapped_column(String(5), nullable=False)
     target_language: Mapped[str] = mapped_column(String(5), nullable=False)
     price_per_page: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    #: What interpreting between these languages costs per minute. Null: the
+    #: bureau has not set one, and an oral line is priced by hand.
+    price_per_minute: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     @property

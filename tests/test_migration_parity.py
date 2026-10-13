@@ -57,6 +57,8 @@ LATER_REVISIONS = (
     "0020_translator_cities.py",
     # invoices — see test_migration_0021.py.
     "0021_invoices.py",
+    # Oral lines and a per-minute rate — see test_migration_0022.py.
+    "0022_oral_interpreting.py",
 )
 
 

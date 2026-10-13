@@ -41,6 +41,7 @@ from suliko.models.order import (
     Order,
     OrderDocument,
     OrderStatusEvent,
+    ServiceType,
     Urgency,
 )
 from suliko.models.order_file import OrderFile
@@ -130,6 +131,7 @@ __all__ = [
     "PortalTranslatorLink",
     "Role",
     "ServicePage",
+    "ServiceType",
     "SiteString",
     "Tenant",
     "TenantSettings",

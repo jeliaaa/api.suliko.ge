@@ -381,6 +381,8 @@ class PairPriceIn(BaseModel):
     source_language: str = Field(min_length=2, max_length=5)
     target_language: str = Field(min_length=2, max_length=5)
     price_per_page: Decimal = Field(ge=0, le=100_000)
+    #: What interpreting costs per minute. Left out: not offered for this pair.
+    price_per_minute: Decimal | None = Field(default=None, ge=0, le=100_000)
     is_active: bool = True
 
 
@@ -389,6 +391,7 @@ class PairPriceOut(BaseModel):
     source_language: str
     target_language: str
     price_per_page: Decimal
+    price_per_minute: Decimal | None
     is_active: bool
 
 
@@ -443,6 +446,7 @@ async def create_pair_price(
         source_language=source,
         target_language=target,
         price_per_page=payload.price_per_page,
+        price_per_minute=payload.price_per_minute,
         is_active=payload.is_active,
     )
     db.add(row)
@@ -477,12 +481,14 @@ async def update_pair_price(
         "source_language": row.source_language,
         "target_language": row.target_language,
         "price_per_page": row.price_per_page,
+        "price_per_minute": row.price_per_minute,
         "is_active": row.is_active,
     }
 
     row.source_language = payload.source_language.lower()
     row.target_language = payload.target_language.lower()
     row.price_per_page = payload.price_per_page
+    row.price_per_minute = payload.price_per_minute
     row.is_active = payload.is_active
     await db.flush()
 

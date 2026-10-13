@@ -24,7 +24,7 @@ from suliko.domain.pricing import (
     PricingConfig,
     price_document,
 )
-from suliko.models.order import CopyType, Urgency
+from suliko.models.order import CopyType, ServiceType, Urgency
 from suliko.models.reference import DocumentType, LanguagePairPrice, TenantSettings
 
 #: Days from order date to the default due date, when a tenant has no
@@ -41,6 +41,8 @@ class PricingContext:
     config: PricingConfig
     #: (source, target), lower-cased -> active per-page rate.
     rates: dict[tuple[str, str], Decimal]
+    #: The same pairs' per-minute rate, where the bureau set one.
+    minute_rates: dict[tuple[str, str], Decimal]
     #: document_type_id -> multiplier, for the types that were asked about.
     multipliers: dict[int, Decimal]
     due_days: dict[Urgency, int] = field(default_factory=lambda: dict(DEFAULT_DUE_DAYS))
@@ -48,25 +50,33 @@ class PricingContext:
     def rate(self, source: str, target: str) -> Decimal | None:
         return self.rates.get((source.lower(), target.lower()))
 
+    def minute_rate(self, source: str, target: str) -> Decimal | None:
+        return self.minute_rates.get((source.lower(), target.lower()))
+
     def price(
         self,
         *,
-        document_type_id: int,
+        document_type_id: int | None,
         source_language: str,
         target_language: str,
         page_count: int,
         copy_type: CopyType,
         urgency: Urgency,
         is_notarized: bool | None = None,
+        service_type: ServiceType = ServiceType.WRITTEN,
     ) -> PriceBreakdown:
         return price_document(
             DocumentPricingInput(
                 page_count=page_count,
                 base_rate_per_page=self.rate(source_language, target_language),
-                document_type_multiplier=self.multipliers.get(document_type_id, Decimal("1.0")),
+                document_type_multiplier=self.multipliers.get(document_type_id, Decimal("1.0"))
+                if document_type_id is not None
+                else Decimal("1.0"),
                 copy_type=copy_type,
                 urgency=urgency,
                 is_notarized=is_notarized,
+                service_type=service_type,
+                base_rate_per_minute=self.minute_rate(source_language, target_language),
             ),
             self.config,
         )
@@ -116,12 +126,15 @@ async def load_pricing_context(
     be 100 round trips.
     """
     settings = await tenant_settings(db)
-    rates = {
-        (row.source_language.lower(), row.target_language.lower()): Decimal(str(row.price_per_page))
-        for row in (
-            await db.execute(select(LanguagePairPrice).where(LanguagePairPrice.is_active))
-        ).scalars()
-    }
+    rates: dict[tuple[str, str], Decimal] = {}
+    minute_rates: dict[tuple[str, str], Decimal] = {}
+    for row in (
+        await db.execute(select(LanguagePairPrice).where(LanguagePairPrice.is_active))
+    ).scalars():
+        pair = (row.source_language.lower(), row.target_language.lower())
+        rates[pair] = Decimal(str(row.price_per_page))
+        if row.price_per_minute is not None:
+            minute_rates[pair] = Decimal(str(row.price_per_minute))
     type_ids = set(document_type_ids)
     multipliers: dict[int, Decimal] = {}
     if type_ids:
@@ -134,6 +147,7 @@ async def load_pricing_context(
     return PricingContext(
         config=config_from_settings(settings, plan),
         rates=rates,
+        minute_rates=minute_rates,
         multipliers=multipliers,
         due_days=due_days_from_settings(settings),
     )
