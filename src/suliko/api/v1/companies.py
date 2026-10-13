@@ -18,10 +18,11 @@ it just cannot issue an invoice, and `GET /companies/invoice-readiness` says
 exactly what is missing rather than letting them find out at the point of
 sending one to a client.
 
-## Invoices are computed, never stored
+## Invoices are computed; only their number is stored
 
 `GET /orders/{id}/invoice` assembles an invoice from the order's STORED
-document costs plus the company record as it is right now. Nothing is written.
+document costs plus the company record as it is right now. The one thing it
+writes is the invoice's number and issue date, the first time (``Invoice``).
 
 That is deliberate and it has a consequence worth knowing: reissuing an
 invoice after the company's address changes produces the new address. The
@@ -29,7 +30,8 @@ figures cannot drift — those are stored on the documents and never recomputed
 — but the letterhead can. Freezing the whole document would mean a
 `generated_invoices` table, a numbering sequence and an immutability rule,
 which is the right design once invoices are legally issued rather than
-informally sent. It is not built yet, and the numbering below says so.
+informally sent. It is not built yet: the number is random, not a gapless
+sequence.
 """
 
 from __future__ import annotations
@@ -42,14 +44,18 @@ from fastapi import APIRouter, Depends
 from fastapi import status as http_status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Select, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from suliko.api.deps import CurrentSession, Db, require
 from suliko.api.v1._shared import mask_tail
 from suliko.core.errors import ConflictError, NotFoundError
 from suliko.domain.clock import today_in
+from suliko.domain.invoice_numbers import new_invoice_number
 from suliko.domain.orders import base_order_query
 from suliko.models.directory import Client, ClientType
+from suliko.models.invoice import Invoice
 from suliko.models.order import Order, OrderDocument
 from suliko.models.reference import Company, CompanyBankAccount, Language
 from suliko.security.permissions import Permission
@@ -148,8 +154,8 @@ class InvoiceLine(BaseModel):
 
 
 class InvoiceOut(BaseModel):
-    #: Provisional — see the module docstring. Derived from the order id, not
-    #: allocated from a sequence, and NOT a legal invoice number.
+    #: Allocated the first time the order is invoiced and kept (``Invoice``),
+    #: so it is the same on every view. Random, not a gapless sequence.
     number: str
     is_provisional: bool
     issued_on: date
@@ -521,6 +527,40 @@ def _language_pair(source: str, target: str, names: dict[str, Language], locale:
     return f"{name(source)} → {name(target)}"
 
 
+async def _issued_invoice(db: AsyncSession, order_id: int, today: date) -> Invoice:
+    """The order's invoice number: read back if it has one, else allocated now.
+
+    Kept so a reprint, or the other language, is the same document. Two people
+    opening the same order at once both try to write: the unique constraint
+    lets one win, and the loser reads the winner's row.
+    """
+
+    async def existing() -> Invoice | None:
+        return (
+            await db.execute(select(Invoice).where(Invoice.order_id == order_id))
+        ).scalar_one_or_none()
+
+    if (found := await existing()) is not None:
+        return found
+
+    for _ in range(10):
+        number = new_invoice_number(today)
+        taken = await db.scalar(select(Invoice.id).where(Invoice.number == number))
+        if taken is not None:
+            continue
+        row = Invoice(order_id=order_id, number=number, issued_on=today)
+        try:
+            async with db.begin_nested():
+                db.add(row)
+                await db.flush()
+        except IntegrityError:
+            if (found := await existing()) is not None:
+                return found
+            continue
+        return row
+    raise ConflictError("Could not allocate an invoice number. Try again.")
+
+
 @invoice_router.get("/{order_id}/invoice", response_model=InvoiceOut)
 async def order_invoice(
     order_id: int,
@@ -623,13 +663,14 @@ async def order_invoice(
                 after={"order_id": order.id, "document": "invoice"},
             )
 
+    issued = await _issued_invoice(db, order.id, today_in(session.timezone))
+
     return InvoiceOut(
-        # Provisional: derived from the order's number in the bureau, not
-        # allocated from a sequence. See the module docstring before treating
-        # it as legal.
-        number=f"{order.number}",
+        number=issued.number,
+        # Kept for clients that still read it. The number is now allocated once
+        # and stored, but it is not a legal sequence: see the module docstring.
         is_provisional=True,
-        issued_on=today_in(session.timezone),
+        issued_on=issued.issued_on,
         locale=locale,
         seller=_party(legal, locale),
         seller_brand=(

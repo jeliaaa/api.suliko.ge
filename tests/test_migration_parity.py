@@ -55,6 +55,8 @@ LATER_REVISIONS = (
     "0019_translator_capabilities.py",
     # One column on translators — see test_migration_0020.py.
     "0020_translator_cities.py",
+    # invoices — see test_migration_0021.py.
+    "0021_invoices.py",
 )
 
 

@@ -34,6 +34,7 @@ from suliko.models.finance import (
     TranslatorPaymentAllocation,
 )
 from suliko.models.integration import IntegrationCredential, IntegrationProvider
+from suliko.models.invoice import Invoice
 from suliko.models.order import (
     CopyType,
     HandoverMethod,
@@ -100,6 +101,7 @@ __all__ = [
     "IntegrationProvider",
     "InviteKind",
     "InviteStatus",
+    "Invoice",
     "Language",
     "LanguagePairPrice",
     "LoginAttempt",
