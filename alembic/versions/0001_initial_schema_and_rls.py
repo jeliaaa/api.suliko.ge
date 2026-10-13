@@ -103,6 +103,9 @@ LATER_REVISION_TABLES = frozenset(
         "document_translations",
         # 0021
         "invoices",
+        # 0025
+        "import_batches",
+        "import_batch_items",
     }
 )
 

@@ -33,6 +33,7 @@ from suliko.models.finance import (
     TranslatorPayment,
     TranslatorPaymentAllocation,
 )
+from suliko.models.imports import ImportBatch, ImportBatchItem
 from suliko.models.integration import IntegrationCredential, IntegrationProvider
 from suliko.models.invoice import Invoice
 from suliko.models.order import (
@@ -98,6 +99,8 @@ __all__ = [
     "Expense",
     "FileKind",
     "HandoverMethod",
+    "ImportBatch",
+    "ImportBatchItem",
     "IntegrationCredential",
     "IntegrationProvider",
     "InviteKind",
