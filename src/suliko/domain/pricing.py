@@ -29,7 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
 
-from suliko.models.order import CopyType, HandoverMethod, Urgency
+from suliko.models.order import CopyType, HandoverMethod, ServiceType, Urgency
 
 # ── Fixed Georgian notary tariffs ───────────────────────────────────────────
 
@@ -57,6 +57,11 @@ CERTIFICATION_PAGE_TIERS: tuple[tuple[int | None, Decimal], ...] = (
 #: `?? 15` fallback. Reaching this means reference data is incomplete, so
 #: `PriceBreakdown.used_fallback_rate` flags it for the caller to surface.
 FALLBACK_RATE_PER_PAGE = Decimal("15")
+
+#: The same for a minute of interpreting with no configured per-minute rate.
+#: Flagged on the breakdown like the per-page one: a bureau that has not set a
+#: rate must see that the figure is a guess.
+FALLBACK_RATE_PER_MINUTE = Decimal("2")
 
 TWO_PLACES = Decimal("0.01")
 
@@ -111,6 +116,10 @@ class DocumentPricingInput:
     #: Overrides ``copy_type.is_notarized`` when set. Staff can notarise a
     #: plain copy, or waive notarisation on a notary copy type.
     is_notarized: bool | None = None
+    #: An oral line counts minutes in ``page_count`` and is priced from
+    #: ``base_rate_per_minute``: no document type, no notary.
+    service_type: ServiceType = ServiceType.WRITTEN
+    base_rate_per_minute: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,12 +136,16 @@ class PriceBreakdown:
     price: Decimal
     translator_cost: Decimal
 
+    #: The rate per unit: per page for a written line, per minute for an oral
+    #: one (see ``service_type``). The name is the PHP's.
     base_rate_per_page: Decimal
     document_type_multiplier: Decimal
     urgency_multiplier: Decimal
+    #: Pages, or minutes for an oral line.
     page_count: int
     is_notarized: bool
     used_fallback_rate: bool
+    service_type: ServiceType = ServiceType.WRITTEN
 
     @property
     def profit(self) -> Decimal:
@@ -162,6 +175,9 @@ def price_document(
     # The PHP clamps to at least one page; a zero-page document is a UI bug,
     # not a free translation.
     page_count = max(1, doc.page_count)
+
+    if doc.service_type is ServiceType.ORAL:
+        return _price_oral(doc, page_count, cfg)
 
     used_fallback = doc.base_rate_per_page is None
     base_rate = (
@@ -207,6 +223,36 @@ def price_document(
         page_count=page_count,
         is_notarized=is_notarized,
         used_fallback_rate=used_fallback,
+    )
+
+
+def _price_oral(doc: DocumentPricingInput, minutes: int, cfg: PricingConfig) -> PriceBreakdown:
+    """Interpreting: minutes x the pair's per-minute rate x urgency.
+
+    No document type multiplier and no notary: there is no document. The
+    translator's share applies as it does to written work.
+    """
+    used_fallback = doc.base_rate_per_minute is None
+    rate = (
+        doc.base_rate_per_minute
+        if doc.base_rate_per_minute is not None
+        else (FALLBACK_RATE_PER_MINUTE)
+    )
+    urgency_multiplier = cfg.urgency_multiplier(doc.urgency)
+    cost = money(rate * minutes * urgency_multiplier)
+    return PriceBreakdown(
+        translation_cost=cost,
+        notary_cost=Decimal("0.00"),
+        certification_cost=Decimal("0.00"),
+        price=cost,
+        translator_cost=money(cost * cfg.translator_share),
+        base_rate_per_page=rate,
+        document_type_multiplier=Decimal("1"),
+        urgency_multiplier=urgency_multiplier,
+        page_count=minutes,
+        is_notarized=False,
+        used_fallback_rate=used_fallback,
+        service_type=ServiceType.ORAL,
     )
 
 

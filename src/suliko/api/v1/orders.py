@@ -30,7 +30,7 @@ from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Query
 from fastapi import status as http_status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -74,6 +74,7 @@ from suliko.models.order import (
     Order,
     OrderDocument,
     OrderStatusEvent,
+    ServiceType,
     Urgency,
 )
 from suliko.models.reference import CustomOption, OptionList
@@ -96,7 +97,11 @@ OrdersWriter = Annotated[AuthenticatedSession, Depends(require(Permission.ORDERS
 class OrderDocumentIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    document_type_id: int
+    #: Required for a written line, left out for an oral one.
+    document_type_id: int | None = None
+    #: An oral line is interpreting: `page_count` is its minutes, it has no
+    #: document type, and it is never notarised.
+    service_type: ServiceType = ServiceType.WRITTEN
     source_language: str = Field(min_length=2, max_length=5)
     target_language: str = Field(min_length=2, max_length=5)
     page_count: int = Field(ge=1, le=10_000)
@@ -113,6 +118,21 @@ class OrderDocumentIn(BaseModel):
     price_override: Money | None = None
     translator_cost_override: Money | None = None
     notary_cost_override: Money | None = None
+
+    @model_validator(mode="after")
+    def _kind_rules(self) -> OrderDocumentIn:
+        if self.service_type is ServiceType.WRITTEN:
+            if self.document_type_id is None:
+                raise ValueError("A written line needs a document type.")
+        else:
+            if (
+                self.copy_type is not CopyType.ORIGINAL
+                or self.is_notarized
+                or self.notary_id is not None
+            ):
+                raise ValueError("An oral line has no copy type, notarisation or notary.")
+            self.document_type_id = None
+        return self
 
 
 class OrderCreate(BaseModel):
@@ -163,6 +183,7 @@ class OrderDocumentUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     document_type_id: int | None = None
+    service_type: ServiceType | None = None
     source_language: str | None = Field(default=None, min_length=2, max_length=5)
     target_language: str | None = Field(default=None, min_length=2, max_length=5)
     page_count: int | None = Field(default=None, ge=1, le=10_000)
@@ -205,7 +226,9 @@ class StatusChange(BaseModel):
 
 class OrderDocumentOut(BaseModel):
     id: int
-    document_type_id: int
+    #: Null on an oral line.
+    document_type_id: int | None
+    service_type: ServiceType
     document_type_name: str | None
     document_type_name_ka: str | None
     source_language: str
@@ -378,24 +401,41 @@ async def _check_assignees(
     return translator
 
 
-def _translator_default_cost(translator: Translator | None, page_count: int) -> Decimal | None:
+def _translator_default_cost(
+    translator: Translator | None,
+    page_count: int,
+    service_type: ServiceType = ServiceType.WRITTEN,
+) -> Decimal | None:
     """The translator's own per-page rate times pages, when they have one.
 
     How the PHP office screen priced a translator — their rate, not a share
-    of the client price. Only a default: an explicit cost always wins.
+    of the client price. Only a default: an explicit cost always wins. Their
+    per-page rate says nothing about minutes, so an oral line takes the
+    bureau's translator share instead.
     """
+    if service_type is ServiceType.ORAL:
+        return None
     if translator is None or translator.default_rate is None:
         return None
     return (Decimal(str(translator.default_rate)) * page_count).quantize(Decimal("0.01"))
 
 
-def _require_rate(ctx: PricingContext, source: str, target: str, *, has_price: bool) -> None:
+def _require_rate(
+    ctx: PricingContext, source: str, target: str, *, has_price: bool, oral: bool = False
+) -> None:
     """No silent fallback rate on a stored order.
 
     The engine falls back to 15 GEL/page for an unpriced pair, which is fine
     for a quote that says so on screen and wrong for an order the client is
     billed from. Either the pair has a rate or the price was typed in.
     """
+    if oral:
+        if not has_price and ctx.minute_rate(source, target) is None:
+            raise ValidationError(
+                f"No price per minute is set for {source.lower()} → {target.lower()}. "
+                "Add it in Settings → Pricing, or enter the price for this line by hand."
+            )
+        return
     if not has_price and ctx.rate(source, target) is None:
         raise ValidationError(
             f"No price is set for {source.lower()} → {target.lower()}. "
@@ -655,6 +695,7 @@ async def _load_detail(
             OrderDocumentOut(
                 id=d.id,
                 document_type_id=d.document_type_id,
+                service_type=d.service_type,
                 document_type_name=d.document_type.name_en if d.document_type else None,
                 document_type_name_ka=d.document_type.name_ka if d.document_type else None,
                 source_language=d.source_language,
@@ -700,10 +741,16 @@ async def _document_row(
     translator: Translator | None,
 ) -> OrderDocument:
     """A priced document row for `order`, overrides applied."""
+    oral = item.service_type is ServiceType.ORAL
     _require_rate(
-        ctx, item.source_language, item.target_language, has_price=item.price_override is not None
+        ctx,
+        item.source_language,
+        item.target_language,
+        has_price=item.price_override is not None,
+        oral=oral,
     )
     breakdown = ctx.price(
+        service_type=item.service_type,
         document_type_id=item.document_type_id,
         source_language=item.source_language,
         target_language=item.target_language,
@@ -716,13 +763,14 @@ async def _document_row(
     # negotiated price is a business fact.
     translator_cost = item.translator_cost_override
     if translator_cost is None:
-        translator_cost = _translator_default_cost(translator, item.page_count)
+        translator_cost = _translator_default_cost(translator, item.page_count, item.service_type)
     if translator_cost is None:
         translator_cost = breakdown.translator_cost
 
     return OrderDocument(
         order_id=order.id,
         document_type_id=item.document_type_id,
+        service_type=item.service_type,
         source_language=item.source_language.lower(),
         target_language=item.target_language.lower(),
         page_count=item.page_count,
@@ -749,7 +797,7 @@ async def create_order(payload: OrderCreate, db: Db, session: OrdersWriter) -> O
     if payload.handover_method is HandoverMethod.DELIVERY and not payload.delivery_address:
         raise ValidationError("Courier delivery needs a delivery address.")
 
-    type_ids = {d.document_type_id for d in payload.documents}
+    type_ids = {d.document_type_id for d in payload.documents if d.document_type_id is not None}
     # Must match what the quote endpoint showed while the order was built.
     ctx = await load_pricing_context(db, session.plan, type_ids)
     missing = type_ids - set(ctx.multipliers)
@@ -822,6 +870,7 @@ async def create_order(payload: OrderCreate, db: Db, session: OrdersWriter) -> O
 
 def _computed(document: OrderDocument, ctx: PricingContext, urgency: Urgency) -> PriceBreakdown:
     return ctx.price(
+        service_type=document.service_type,
         document_type_id=document.document_type_id,
         source_language=document.source_language,
         target_language=document.target_language,
@@ -886,7 +935,9 @@ async def update_order(
             .scalars()
             .all()
         )
-        ctx = await load_pricing_context(db, session.plan, {d.document_type_id for d in documents})
+        ctx = await load_pricing_context(
+            db, session.plan, {d.document_type_id for d in documents if d.document_type_id}
+        )
 
         # The courier fee follows the handover, unless the caller set it.
         if handover_changed and "delivery_cost" not in changes:
@@ -945,8 +996,10 @@ async def add_order_document(
     if (count or 0) >= MAX_DOCUMENTS:
         raise ValidationError(f"An order can have at most {MAX_DOCUMENTS} documents.")
 
-    ctx = await load_pricing_context(db, session.plan, {payload.document_type_id})
-    if payload.document_type_id not in ctx.multipliers:
+    ctx = await load_pricing_context(
+        db, session.plan, {payload.document_type_id} if payload.document_type_id else set()
+    )
+    if payload.document_type_id is not None and payload.document_type_id not in ctx.multipliers:
         raise ValidationError("That document type does not exist.")
     translator = await _check_assignees(
         db, session, translator_id=payload.translator_id, notary_id=payload.notary_id
@@ -991,7 +1044,7 @@ async def update_order_document(
         raise NotFoundError("Order not found.")
 
     changes = payload.model_dump(exclude_unset=True)
-    nullable = {"translator_id", "notary_id", "is_notarized"}
+    nullable = {"translator_id", "notary_id", "is_notarized", "document_type_id"}
     for key, value in changes.items():
         if value is None and key not in nullable:
             raise ValidationError(f"{key} cannot be empty.")
@@ -1010,6 +1063,7 @@ async def update_order_document(
 
     structural = {
         "document_type_id",
+        "service_type",
         "source_language",
         "target_language",
         "page_count",
@@ -1023,14 +1077,29 @@ async def update_order_document(
     if structural & changes.keys():
         # What is being translated changed, so the old figures describe a
         # different job. Re-price, except what was sent explicitly.
-        ctx = await load_pricing_context(db, session.plan, {document.document_type_id})
-        if document.document_type_id not in ctx.multipliers:
+        oral = document.service_type is ServiceType.ORAL
+        if oral:
+            # Interpreting has no document, copy type or notary.
+            document.document_type_id = None
+            document.copy_type = CopyType.ORIGINAL
+            document.is_notarized = False
+            changes.setdefault("is_notarized", False)
+        elif document.document_type_id is None:
+            raise ValidationError("A written line needs a document type.")
+        ctx = await load_pricing_context(
+            db, session.plan, {document.document_type_id} if document.document_type_id else set()
+        )
+        if (
+            document.document_type_id is not None
+            and document.document_type_id not in ctx.multipliers
+        ):
             raise ValidationError("That document type does not exist.")
         _require_rate(
             ctx,
             document.source_language,
             document.target_language,
             has_price="price" in changes,
+            oral=oral,
         )
         if "copy_type" in changes and "is_notarized" not in changes:
             # A new copy type brings its own notarisation; an earlier manual
@@ -1042,14 +1111,18 @@ async def update_order_document(
         assigned = translator
         if assigned is None and document.translator_id is not None:
             assigned = await db.get(Translator, document.translator_id)
-        default_cost = _translator_default_cost(assigned, document.page_count)
+        default_cost = _translator_default_cost(
+            assigned, document.page_count, document.service_type
+        )
         document.translator_cost = (
             default_cost if default_cost is not None else breakdown.translator_cost
         )
         document.notary_cost = breakdown.notary_cost
     elif "translator_id" in changes and "translator_cost" not in changes and translator:
         # A new translator with a rate of their own brings that rate.
-        default_cost = _translator_default_cost(translator, document.page_count)
+        default_cost = _translator_default_cost(
+            translator, document.page_count, document.service_type
+        )
         if default_cost is not None:
             document.translator_cost = default_cost
 

@@ -342,3 +342,70 @@ def test_every_numeric_column_is_annotated_decimal() -> None:
         "these Numeric columns are not annotated Decimal, so money would be "
         f"handled as float: {offenders}"
     )
+
+
+# ── Oral interpreting ───────────────────────────────────────────────────────
+
+
+def _oral(**overrides: object) -> DocumentPricingInput:
+    from suliko.models.order import ServiceType
+
+    values: dict[str, object] = {
+        "page_count": 30,  # minutes
+        "base_rate_per_page": Decimal("40"),
+        "document_type_multiplier": Decimal("1"),
+        "copy_type": CopyType.ORIGINAL,
+        "urgency": Urgency.STANDARD,
+        "service_type": ServiceType.ORAL,
+        "base_rate_per_minute": Decimal("2.50"),
+    }
+    values.update(overrides)
+    return DocumentPricingInput(**values)  # type: ignore[arg-type]
+
+
+def test_an_oral_line_is_minutes_times_the_per_minute_rate() -> None:
+    b = price_document(_oral())
+    assert b.price == Decimal("75.00")
+    assert b.page_count == 30
+    assert b.base_rate_per_page == Decimal("2.50")  # per unit: here per minute
+    assert not b.used_fallback_rate
+
+
+def test_an_oral_line_ignores_the_per_page_rate_and_the_document_type() -> None:
+    cheap = price_document(
+        _oral(base_rate_per_page=Decimal("1"), document_type_multiplier=Decimal("9"))
+    )
+    assert cheap.price == Decimal("75.00")
+
+
+def test_an_oral_line_is_never_notarised() -> None:
+    b = price_document(_oral(copy_type=CopyType.NOTARY_CERTIFIED, is_notarized=True))
+    assert b.is_notarized is False
+    assert b.notary_cost == Decimal("0.00")
+
+
+def test_urgency_and_the_translator_share_apply_to_oral_work() -> None:
+    cfg = PricingConfig.defaults()
+    b = price_document(_oral(urgency=Urgency.EXPRESS), cfg)
+    assert b.price == Decimal("112.50")  # 75 x 1.5
+    assert b.translator_cost == Decimal("56.25")  # half, the default share
+
+
+def test_no_per_minute_rate_uses_the_flagged_fallback() -> None:
+    b = price_document(_oral(base_rate_per_minute=None))
+    assert b.used_fallback_rate
+    assert b.price == Decimal("60.00")  # 30 x 2
+
+
+def test_a_written_line_is_unchanged_by_the_oral_fields() -> None:
+    b = price_document(
+        DocumentPricingInput(
+            page_count=2,
+            base_rate_per_page=Decimal("40"),
+            document_type_multiplier=Decimal("1"),
+            copy_type=CopyType.ORIGINAL,
+            urgency=Urgency.STANDARD,
+            base_rate_per_minute=Decimal("2.50"),
+        )
+    )
+    assert b.price == Decimal("80.00")

@@ -21,13 +21,13 @@ from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from suliko.api.deps import CurrentSession, Db, require
 from suliko.core.errors import ValidationError
 from suliko.domain.pricing import DocumentPricingInput, quote_order
 from suliko.domain.pricing_context import load_pricing_context
-from suliko.models.order import CopyType, HandoverMethod, Urgency
+from suliko.models.order import CopyType, HandoverMethod, ServiceType, Urgency
 from suliko.security.permissions import Permission
 
 router = APIRouter(prefix="/calculator", tags=["calculator"])
@@ -40,12 +40,26 @@ class QuoteDocument(BaseModel):
 
     source_language: str = Field(min_length=2, max_length=5)
     target_language: str = Field(min_length=2, max_length=5)
-    document_type_id: int
+    #: Left out for an oral line.
+    document_type_id: int | None = None
+    #: Oral: `page_count` is minutes, priced per minute, never notarised.
+    service_type: ServiceType = ServiceType.WRITTEN
     page_count: int = Field(ge=1, le=10_000)
     copy_type: CopyType = CopyType.ORIGINAL
     #: Overrides what the copy type implies — a notarised translation of an
     #: original. None = derive from the copy type.
     is_notarized: bool | None = None
+
+    @model_validator(mode="after")
+    def _kind_rules(self) -> QuoteDocument:
+        if self.service_type is ServiceType.WRITTEN:
+            if self.document_type_id is None:
+                raise ValueError("A written line needs a document type.")
+        else:
+            self.document_type_id = None
+            self.copy_type = CopyType.ORIGINAL
+            self.is_notarized = False
+        return self
 
 
 class QuoteRequest(BaseModel):
@@ -66,8 +80,10 @@ class QuoteLine(BaseModel):
     base_rate_per_page: Decimal
     document_type_multiplier: Decimal
     urgency_multiplier: Decimal
+    #: Pages, or minutes for an oral line.
     page_count: int
     is_notarized: bool
+    service_type: ServiceType
     #: True when the pair has no configured rate and a fallback was used, so
     #: the UI can warn instead of quoting a number nobody agreed to.
     used_fallback_rate: bool
@@ -93,7 +109,7 @@ async def quote(
     session: CurrentSession,
     __: Annotated[object, Depends(require(Permission.ORDERS_READ))],
 ) -> QuoteResponse:
-    type_ids = {d.document_type_id for d in payload.documents}
+    type_ids = {d.document_type_id for d in payload.documents if d.document_type_id is not None}
     # The same loader order creation uses, so the quote and the stored order
     # cannot read the tenant's settings two different ways.
     ctx = await load_pricing_context(db, session.plan, type_ids)
@@ -111,7 +127,13 @@ async def quote(
             # inventing a rate. (Creating the order refuses it without a
             # typed-in price.)
             base_rate_per_page=ctx.rate(d.source_language, d.target_language),
-            document_type_multiplier=ctx.multipliers[d.document_type_id],
+            document_type_multiplier=(
+                ctx.multipliers[d.document_type_id]
+                if d.document_type_id is not None
+                else Decimal("1")
+            ),
+            service_type=d.service_type,
+            base_rate_per_minute=ctx.minute_rate(d.source_language, d.target_language),
             copy_type=d.copy_type,
             urgency=payload.urgency,
             is_notarized=d.is_notarized,
@@ -137,6 +159,7 @@ async def quote(
                 urgency_multiplier=b.urgency_multiplier,
                 page_count=b.page_count,
                 is_notarized=b.is_notarized,
+                service_type=b.service_type,
                 used_fallback_rate=b.used_fallback_rate,
             )
             for b in result.documents

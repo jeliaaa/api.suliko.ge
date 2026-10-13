@@ -24,11 +24,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, case, func, select
 from sqlalchemy.sql import Subquery
 
 from suliko.models.finance import ClientPaymentAllocation, Expense
-from suliko.models.order import Order, OrderDocument, OrderStatusEvent
+from suliko.models.order import Order, OrderDocument, OrderStatusEvent, ServiceType
 
 
 def latest_status_subquery() -> Subquery:
@@ -71,7 +71,16 @@ def document_totals_subquery() -> Subquery:
                 0,
             ).label("gross_profit"),
             func.count().label("document_count"),
-            func.coalesce(func.sum(OrderDocument.page_count), 0).label("page_count"),
+            # Pages: an oral line's count is minutes and does not belong in it.
+            func.coalesce(
+                func.sum(
+                    case(
+                        (OrderDocument.service_type == ServiceType.ORAL, 0),
+                        else_=OrderDocument.page_count,
+                    )
+                ),
+                0,
+            ).label("page_count"),
         )
         .group_by(OrderDocument.order_id)
         .subquery("document_totals")
