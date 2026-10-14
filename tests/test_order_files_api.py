@@ -37,6 +37,7 @@ from suliko.models.order_file import OrderFile
 from suliko.models.portal import FileKind
 from suliko.models.reference import DocumentType
 from suliko.models.tenant import Tenant, TenantStatus
+from suliko.models.translation import DocumentTranslation
 
 ACME, GLOBEX = 1, 2
 
@@ -68,7 +69,16 @@ async def db() -> AsyncIterator[AsyncSession]:
     engine = create_async_engine("sqlite+aiosqlite://", poolclass=StaticPool)
     tables = [
         m.__table__
-        for m in (Tenant, Client, DocumentType, Order, OrderDocument, OrderFile, OrderStatusEvent)
+        for m in (
+            Tenant,
+            Client,
+            DocumentType,
+            Order,
+            OrderDocument,
+            OrderFile,
+            OrderStatusEvent,
+            DocumentTranslation,
+        )
     ]
     async with engine.begin() as conn:
         await conn.run_sync(lambda sync: Base.metadata.create_all(sync, tables=tables))

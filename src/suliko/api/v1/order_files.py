@@ -33,6 +33,7 @@ from suliko.core.errors import AppError, ConflictError, NotFoundError, UpstreamU
 from suliko.domain.order_files import (
     attachment_headers,
     downloadable,
+    editable_file_ids,
     get_document_file,
     list_document_files,
     open_download,
@@ -75,9 +76,12 @@ class StaffFileOut(BaseModel):
     #: Whether a download here will work. False for a vault file once its
     #: working copy is gone (the order closed): then only the vault has it.
     downloadable: bool = True
+    #: Whether the translation page can open it for correcting: see
+    #: `domain.order_files.editable_file_ids`.
+    editable: bool = False
 
 
-def _out(row: OrderFile) -> StaffFileOut:
+def _out(row: OrderFile, editable: bool = False) -> StaffFileOut:
     vault_no = vault_order(row)
     return StaffFileOut(
         id=row.public_id,
@@ -90,7 +94,12 @@ def _out(row: OrderFile) -> StaffFileOut:
         in_vault=vault_no is not None,
         vault_order=vault_no,
         downloadable=downloadable(row),
+        editable=editable,
     )
+
+
+async def _out_of(db: AsyncSession, row: OrderFile) -> StaffFileOut:
+    return _out(row, row.id in await editable_file_ids(db, [row]))
 
 
 class StoredInVaultError(ConflictError):
@@ -136,7 +145,9 @@ async def list_files(
     _: Annotated[object, Depends(require(Permission.ORDERS_READ))],
 ) -> list[StaffFileOut]:
     await _document(db, order_id, document_id)
-    return [_out(row) for row in await list_document_files(db, document_id)]
+    rows = await list_document_files(db, document_id)
+    editable = await editable_file_ids(db, rows)
+    return [_out(row, row.id in editable) for row in rows]
 
 
 @router.post(
@@ -181,7 +192,7 @@ async def upload_file(
         entity_id=order_id,
         after={"document_id": document_id, "kind": kind.value, "file_name": row.file_name},
     )
-    return _out(row)
+    return await _out_of(db, row)
 
 
 @router.get("/{order_id}/documents/{document_id}/files/{file_id}")
@@ -268,7 +279,7 @@ async def update_file(
         row.file_name = _renamed(row.file_name, payload.name)
     after = {"document_id": document_id, "kind": row.kind.value, "file_name": row.file_name}
     if after == before:
-        return _out(row)
+        return await _out_of(db, row)
     await db.flush()
 
     from suliko.core.audit import record
@@ -282,7 +293,7 @@ async def update_file(
         before=before,
         after=after,
     )
-    return _out(row)
+    return await _out_of(db, row)
 
 
 @router.delete(

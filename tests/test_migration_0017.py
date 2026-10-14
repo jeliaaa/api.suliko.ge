@@ -35,8 +35,12 @@ def test_columns_match_the_model(revision: tuple[Any, RecordedOps]) -> None:
     migrated = ops.tables[TABLE]
     declared = Base.metadata.tables[TABLE]
 
-    # A column a LATER revision added (0018's portal requester) is not 0017's.
-    later = {c.name for _, c in import_revision("0018_translation_from_portal.py").NEW_COLUMNS}
+    # A column a LATER revision added (0018's portal requester, 0026's HTML) is not 0017's.
+    later = {
+        c.name
+        for name in ("0018_translation_from_portal.py", "0026_translation_html.py")
+        for _, c in import_revision(name).NEW_COLUMNS
+    }
     assert set(migrated.columns.keys()) == set(declared.columns.keys()) - later
     for name, column in declared.columns.items():
         if name in later:

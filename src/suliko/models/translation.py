@@ -18,7 +18,7 @@ from __future__ import annotations
 import enum
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Index, Integer, String
+from sqlalchemy import DateTime, Enum, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from suliko.db.base import Base, IdMixin, TenantScoped, TimestampMixin, enum_values
@@ -73,6 +73,11 @@ class DocumentTranslation(Base, IdMixin, TenantScoped, TimestampMixin):
     target_language: Mapped[str] = mapped_column(String(5), nullable=False)
     #: The pages suliko.ge measured, which is what it charged.
     page_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: The translation as HTML: what the page that corrects it edits, and what
+    #: the Word file in ``result_file_id`` is built from again on every save.
+    #: NULL for one made before the file became a Word document, whose file
+    #: is the HTML, and for one the HTML of which was too large to keep.
+    html: Mapped[str | None] = mapped_column(Text, default=None)
     #: Why it failed, in a few words, for the person looking at the order.
     error: Mapped[str | None] = mapped_column(String(500), default=None)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)

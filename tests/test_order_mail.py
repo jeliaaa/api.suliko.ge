@@ -53,6 +53,7 @@ from suliko.models.order_file import OrderFile
 from suliko.models.portal import FileKind
 from suliko.models.reference import DocumentType, Language, TenantSettings
 from suliko.models.tenant import Tenant, TenantStatus
+from suliko.models.translation import DocumentTranslation
 from suliko.security.permissions import Permission
 
 ACME, GLOBEX = 1, 2
@@ -143,6 +144,7 @@ async def db() -> AsyncIterator[AsyncSession]:
             OrderDocument,
             OrderFile,
             OrderStatusEvent,
+            DocumentTranslation,
         )
     ]
     async with engine.begin() as conn:

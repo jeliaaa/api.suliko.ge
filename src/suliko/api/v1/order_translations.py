@@ -15,14 +15,20 @@ polls while a job runs). The first look after it finishes brings the result
 over and files it under the document's Translation files, where it is like any
 other file: downloadable, removable, sendable.
 
-The result is HTML. The order's translation page shows it beside the source
-and lets it be corrected; `PUT .../files/{file_id}/content` saves the
-corrected text as a new file and retires the one it replaces, which support
-can still restore for the retention period.
+The result comes back as HTML and is filed as a Word document
+(`domain/translation_docx.py`): that is what a client is sent and a translator
+finishes in Word. The HTML is kept beside it, on the translation's row, because
+it is what the order's translation page edits. The page shows it next to the
+source (`GET .../files/{file_id}/html`); `PUT .../files/{file_id}/content`
+builds the Word file again from the corrected text, files it as a new file and
+retires the one it replaces, which support can still restore for the retention
+period. If the HTML cannot be made into a Word file the HTML itself is filed,
+so a translation that has been paid for is never lost to a conversion.
 """
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -42,7 +48,7 @@ from suliko.api.deps import CurrentSession, Db, require
 from suliko.api.portal_deps import Storage
 from suliko.api.v1.order_files import FileIdPath, StaffFileOut, _document, _out, storage_failure
 from suliko.config import get_settings
-from suliko.core.errors import ConflictError, PayloadTooLargeError, ValidationError
+from suliko.core.errors import ConflictError, NotFoundError, PayloadTooLargeError, ValidationError
 from suliko.domain.order_files import (
     downloadable,
     get_document_file,
@@ -51,6 +57,7 @@ from suliko.domain.order_files import (
     remove_document_file,
     upload_document_file,
 )
+from suliko.domain.translation_docx import DOCX_CONTENT_TYPE, DocxConversionError, html_to_docx
 from suliko.integrations.object_storage import ObjectStorage, StorageError
 from suliko.integrations.suliko_backend import SulikoUnavailableError
 from suliko.integrations.suliko_translate import (
@@ -129,6 +136,10 @@ class TranslateIn(BaseModel):
 
 class SaveContentIn(BaseModel):
     html: str = Field(min_length=1)
+
+
+class TranslationHtmlOut(BaseModel):
+    html: str
 
 
 class TranslationOut(BaseModel):
@@ -498,9 +509,45 @@ def html_document(html: str) -> str:
     return text if _DOCTYPE.match(text) else f"<!doctype html>\n{text}"
 
 
-def _result_name(source_name: str | None, target_language: str) -> str:
+def _result_stem(source_name: str | None, target_language: str) -> str:
     stem = PurePosixPath(source_name or "translation").stem or "translation"
-    return f"{stem[:180]} ({target_language.upper()}).html"
+    return f"{stem[:180]} ({target_language.upper()})"
+
+
+@dataclass(frozen=True, slots=True)
+class TranslationFile:
+    """A translation ready to be filed."""
+
+    name: str
+    content: bytes
+    content_type: str
+    #: The HTML to keep beside a Word file, to be corrected and built again.
+    #: None when the file is the HTML itself, or when it was too large to keep.
+    html: str | None
+
+
+async def make_translation_file(
+    html: str, *, stem: str, language: str, word: bool = True
+) -> TranslationFile:
+    """The translation as the file to store: a Word document, or, when that
+    cannot be made (or is not wanted), the HTML.
+
+    Never raises for a document it cannot convert: the translation has been
+    paid for, and an HTML file the person can still read and correct is better
+    than an error in its place.
+    """
+    text = html_document(html)
+    if word:
+        try:
+            content = await asyncio.to_thread(html_to_docx, text, language=language)
+        except DocxConversionError as exc:
+            log.warning("translation_docx_failed", error=str(exc))
+        else:
+            fits = len(text.encode("utf-8")) <= get_settings().translation_html_max_bytes
+            return TranslationFile(
+                f"{stem}.docx", content, DOCX_CONTENT_TYPE, text if fits else None
+            )
+    return TranslationFile(f"{stem}.html", text.encode("utf-8"), HTML, None)
 
 
 def result_uploader(row: DocumentTranslation) -> str:
@@ -546,6 +593,12 @@ async def _collect(
 
     result = await translator.result(row.suliko_job_id)
     source = await db.get(OrderFile, row.source_file_id) if row.source_file_id else None
+    # Whatever suliko.ge labels it, what it sends is the HTML it built, in UTF-8.
+    made = await make_translation_file(
+        result.content.decode("utf-8-sig", errors="replace"),
+        stem=_result_stem(source.file_name if source else None, row.target_language),
+        language=row.target_language,
+    )
     try:
         stored = await upload_document_file(
             db,
@@ -553,19 +606,16 @@ async def _collect(
             order=order,
             document=document,
             kind=FileKind.TRANSLATION,
-            file_name=_result_name(source.file_name if source else None, row.target_language),
-            # Whatever suliko.ge labels it, what it sends is the HTML it built,
-            # in UTF-8. Kept as a document that says so.
-            content=html_document(result.content.decode("utf-8-sig", errors="replace")).encode(
-                "utf-8"
-            ),
-            content_type=HTML,
+            file_name=made.name,
+            content=made.content,
+            content_type=made.content_type,
             uploaded_by=result_uploader(row),
         )
     except StorageError as exc:
         raise storage_failure(exc) from exc
     row.status = TranslationStatus.COMPLETED
     row.result_file_id = stored.id
+    row.html = made.html
     row.finished_at = datetime.now(UTC)
     await db.flush()
 
@@ -643,6 +693,56 @@ async def list_translations(
 # ── Correcting one ──────────────────────────────────────────────────────────
 
 
+async def _translations_of(db: AsyncSession, file: OrderFile) -> list[DocumentTranslation]:
+    """The translation records whose result is this file (one, in practice)."""
+    return list(
+        (
+            await db.execute(
+                select(DocumentTranslation).where(DocumentTranslation.result_file_id == file.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@router.get(
+    "/{order_id}/documents/{document_id}/files/{file_id}/html",
+    response_model=TranslationHtmlOut,
+)
+async def get_translation_html(
+    order_id: int,
+    document_id: int,
+    file_id: FileIdPath,
+    db: Db,
+    storage: Storage,
+    _: Annotated[object, Depends(require(Permission.ORDERS_READ))],
+) -> TranslationHtmlOut:
+    """A translation as the page that corrects it edits it.
+
+    Kept on the translation's record for a Word file; read from the file for
+    one filed as HTML. Any other file is not for editing here.
+    """
+    await _document(db, order_id, document_id)
+    current = await get_document_file(db, document_id, file_id)
+    if current.kind is not FileKind.TRANSLATION:
+        raise NotFoundError("This file cannot be edited here.")
+    for record in await _translations_of(db, current):
+        if record.html is not None:
+            return TranslationHtmlOut(html=record.html)
+    if (
+        current.content_type != HTML
+        or current.size_bytes > get_settings().translation_html_max_bytes
+    ):
+        raise NotFoundError("This file cannot be edited here.")
+    try:
+        body = await open_download(storage, current)
+        content = b"".join([chunk async for chunk in body])
+    except StorageError as exc:
+        raise storage_failure(exc) from exc
+    return TranslationHtmlOut(html=content.decode("utf-8-sig", errors="replace"))
+
+
 @router.put(
     "/{order_id}/documents/{document_id}/files/{file_id}/content",
     response_model=StaffFileOut,
@@ -659,19 +759,29 @@ async def save_translation(
 ) -> StaffFileOut:
     """Save a corrected translation: a new file in the old one's place.
 
-    Only an HTML translation can be saved this way: it is the one kind of
+    The Word file is built again from the corrected HTML, so a translation
+    filed as HTML before there were Word files becomes one on its first save.
+    Only a translation made here can be saved this way: it is the one kind of
     file Office shows for editing. The file it replaces is removed like any
     other, so it can be restored for the retention period.
     """
     order, document = await _document(db, order_id, document_id)
     current = await get_document_file(db, document_id, file_id)
-    if current.kind is not FileKind.TRANSLATION or current.content_type != HTML:
+    records = await _translations_of(db, current)
+    editable = current.content_type == HTML or any(record.html is not None for record in records)
+    if current.kind is not FileKind.TRANSLATION or not editable:
         raise ConflictError("Only a translation made here can be edited here.")
-
-    content = html_document(payload.html).encode("utf-8")
-    if len(content) > get_settings().translation_html_max_bytes:
+    if len(payload.html.encode("utf-8")) > get_settings().translation_html_max_bytes:
         raise PayloadTooLargeError("This translation is too large to save.")
 
+    # An HTML file with no record behind it has nowhere to keep the HTML a Word
+    # file needs, so it stays HTML as it was.
+    made = await make_translation_file(
+        payload.html,
+        stem=PurePosixPath(current.file_name).stem or "translation",
+        language=records[0].target_language if records else document.target_language,
+        word=bool(records),
+    )
     try:
         stored = await upload_document_file(
             db,
@@ -679,24 +789,23 @@ async def save_translation(
             order=order,
             document=document,
             kind=FileKind.TRANSLATION,
-            file_name=current.file_name,
-            content=content,
-            content_type=HTML,
+            file_name=made.name,
+            content=made.content,
+            content_type=made.content_type,
             uploaded_by=f"user:{session.user_id}",
         )
     except StorageError as exc:
         raise storage_failure(exc) from exc
     await remove_document_file(db, current, removed_by=f"user:{session.user_id}")
     # The translation's record follows its file.
-    await db.execute(
-        update(DocumentTranslation)
-        .where(DocumentTranslation.result_file_id == current.id)
-        .values(result_file_id=stored.id)
-    )
+    for record in records:
+        record.result_file_id = stored.id
+        record.html = made.html
+    await db.flush()
 
-    from suliko.core.audit import record
+    from suliko.core.audit import record as audit
 
-    await record(
+    await audit(
         db,
         session,
         action="order.translation_edited",
@@ -704,4 +813,4 @@ async def save_translation(
         entity_id=order_id,
         after={"document_id": document_id, "file_name": stored.file_name},
     )
-    return _out(stored)
+    return _out(stored, editable=made.html is not None or made.content_type == HTML)

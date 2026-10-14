@@ -1079,7 +1079,7 @@ async def test_the_result_is_filed_as_the_translators_own(
     ).json()
     files = {f["id"]: f for f in order["documents"][0]["files"]}
     result = files[done["result_file_id"]]
-    assert (result["name"], result["kind"]) == ("birth certificate (KA).html", "translation")
+    assert (result["name"], result["kind"]) == ("birth certificate (KA).docx", "translation")
     # Theirs, so they can take it away again.
     assert result["uploaded_by_me"] is True
     response = await client.delete(
