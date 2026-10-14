@@ -1148,10 +1148,12 @@ async def update_order_document(
 
     place = {"interpreting_place", "interpreting_date", "interpreting_time"}
     if place & changes.keys():
-        if document.service_type is not ServiceType.ORAL:
+        if document.service_type is ServiceType.ORAL:
+            for key in place & changes.keys():
+                setattr(document, key, changes[key])
+        elif any(changes[key] is not None for key in place & changes.keys()):
+            # Clearing is fine (a line made written sends nulls); setting is not.
             raise ValidationError("Only an interpreting line has a place.")
-        for key in place & changes.keys():
-            setattr(document, key, changes[key])
 
     if structural & changes.keys():
         # What is being translated changed, so the old figures describe a
