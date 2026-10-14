@@ -35,7 +35,7 @@ import asyncio
 import json
 import re
 import smtplib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from email.headerregistry import Address
 from email.message import EmailMessage
 from typing import Any, Literal
@@ -102,6 +102,11 @@ def is_address(value: str | None) -> bool:
 def _display_name(value: str, limit: int = 80) -> str:
     """A name fit for a From header: one line, no control characters."""
     return _CONTROL_CHARACTERS.sub(" ", value).strip()[:limit]
+
+
+def renamed(sender: Sender, from_name: str) -> Sender:
+    """The same way out, under another display name."""
+    return replace(sender, from_name=_display_name(from_name))
 
 
 def _truthy(value: Any, default: bool) -> bool:
@@ -272,5 +277,6 @@ __all__ = [
     "build_message",
     "deliver",
     "is_address",
+    "renamed",
     "resolve_sender",
 ]
