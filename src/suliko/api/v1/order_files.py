@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, File, Path, UploadFile
 from fastapi import status as http_status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from suliko.api.deps import CurrentSession, Db, require
@@ -31,6 +32,7 @@ from suliko.api.v1._files import read_upload
 from suliko.config import get_settings
 from suliko.core.errors import AppError, ConflictError, NotFoundError, UpstreamUnavailableError
 from suliko.domain.order_files import (
+    FILE_ID_PATTERN,
     attachment_headers,
     downloadable,
     get_document_file,
@@ -50,6 +52,7 @@ from suliko.integrations.object_storage import (
 from suliko.models.order import Order, OrderDocument
 from suliko.models.order_file import OrderFile
 from suliko.models.portal import FileKind
+from suliko.models.translation import DocumentTranslation, TranslationStatus
 from suliko.security.permissions import Permission
 
 log = structlog.get_logger()
@@ -57,6 +60,10 @@ log = structlog.get_logger()
 router = APIRouter(prefix="/orders", tags=["order-files"])
 
 FileIdPath = Annotated[str, Path(pattern=r"^[A-Za-z0-9_-]{8,100}$")]
+
+#: Files linked in one request. An order with more than this many documents
+#: is not one a person links by hand.
+MAX_LINKS = 200
 
 
 class StaffFileOut(BaseModel):
@@ -283,6 +290,126 @@ async def update_file(
         after=after,
     )
     return _out(row)
+
+
+class FileLink(BaseModel):
+    """One file and the document of the order it is to belong to."""
+
+    file_id: str = Field(pattern=FILE_ID_PATTERN.pattern)
+    document_id: int
+
+
+class LinkFilesIn(BaseModel):
+    links: list[FileLink] = Field(min_length=1, max_length=MAX_LINKS)
+
+    @model_validator(mode="after")
+    def _each_file_once(self) -> LinkFilesIn:
+        if len({link.file_id for link in self.links}) != len(self.links):
+            raise ValueError("A file can be linked to one document at a time.")
+        return self
+
+
+class LinkedFileOut(BaseModel):
+    id: str
+    document_id: int
+
+
+@router.post("/{order_id}/files/link", response_model=list[LinkedFileOut])
+async def link_files(
+    order_id: int,
+    payload: LinkFilesIn,
+    db: Db,
+    session: CurrentSession,
+    _: Annotated[object, Depends(require(Permission.ORDERS_WRITE))],
+) -> list[LinkedFileOut]:
+    """Say which document of the order each file belongs to.
+
+    Documents of one order can have different language pairs, and a file is
+    translated (and shown to a translator) as part of the document it is on,
+    so a file on the wrong one has to be moved, not deleted and sent again.
+    Only the row changes: the bytes keep the key they were stored under, which
+    names the document they were uploaded to and is never read back for its
+    meaning.
+
+    All or nothing: if any file in the request cannot move, none does, and the
+    answer names it. Files already on the document they are asked to go to are
+    left alone and left out of the answer.
+    """
+    order = await db.get(Order, order_id)
+    if order is None:
+        raise NotFoundError("Order not found.")
+    document_ids = set(
+        (await db.execute(select(OrderDocument.id).where(OrderDocument.order_id == order_id)))
+        .scalars()
+        .all()
+    )
+    if not {link.document_id for link in payload.links} <= document_ids:
+        raise NotFoundError("Document not found.")
+
+    rows = {
+        row.public_id: row
+        for row in (
+            await db.execute(
+                select(OrderFile).where(
+                    OrderFile.public_id.in_([link.file_id for link in payload.links]),
+                    OrderFile.order_document_id.in_(document_ids),
+                    OrderFile.deleted_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    }
+    if len(rows) != len(payload.links):
+        raise NotFoundError("File not found.")
+
+    moving = [(rows[link.file_id], link.document_id) for link in payload.links]
+    moving = [(row, to) for row, to in moving if row.order_document_id != to]
+    # A job that is still running will file its result under the document the
+    # file was on when it was started.
+    busy = set(
+        (
+            await db.execute(
+                select(DocumentTranslation.source_file_id).where(
+                    DocumentTranslation.source_file_id.in_([row.id for row, _ in moving]),
+                    DocumentTranslation.status == TranslationStatus.PROCESSING,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row, _ in moving:
+        if row.id in busy:
+            raise ConflictError(
+                f"Suliko Translate is working on {row.file_name}. Link it when it has finished."
+            )
+    if not moving:
+        return []
+
+    changes = [
+        {
+            "file_name": row.file_name,
+            "from_document_id": row.order_document_id,
+            "to_document_id": to,
+        }
+        for row, to in moving
+    ]
+    for row, to in moving:
+        row.order_document_id = to
+    await db.flush()
+
+    from suliko.core.audit import record
+
+    await record(
+        db,
+        session,
+        action="order.files_linked",
+        entity_type="order",
+        entity_id=order_id,
+        after={"files": changes},
+    )
+    return [LinkedFileOut(id=row.public_id, document_id=to) for row, to in moving]
 
 
 @router.delete(
