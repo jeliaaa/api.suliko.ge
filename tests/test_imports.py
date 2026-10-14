@@ -513,6 +513,22 @@ async def test_translators_come_with_their_pairs_and_undo_takes_them_away(db: As
 
 
 @pytest.mark.asyncio
+async def test_an_imported_pair_works_both_ways(db: AsyncSession) -> None:
+    """One direction in the file is saved with its reverse, as a pair typed into the form is."""
+    text = "Name,Languages\nMari,ka-en\n"
+    await api.commit(
+        "translators",
+        Upload(csv_bytes(text), "t.csv"),  # type: ignore[arg-type]
+        json.dumps({"name": 0, "language_pairs": 1}),
+        db,
+        _session(),
+        None,
+    )
+    pairs = (await db.execute(select(TranslatorLanguagePair))).scalars().all()
+    assert {(p.source_language, p.target_language) for p in pairs} == {("ka", "en"), ("en", "ka")}
+
+
+@pytest.mark.asyncio
 async def test_an_unknown_kind_is_not_found(db: AsyncSession) -> None:
     from suliko.core.errors import NotFoundError
 
