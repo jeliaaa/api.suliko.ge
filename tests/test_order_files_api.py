@@ -20,13 +20,14 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import UploadFile
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 from starlette.datastructures import Headers
 
 from suliko.api.v1 import order_files
 from suliko.api.v1.order_files import StoredInVaultError
-from suliko.core.errors import NotFoundError, UpstreamUnavailableError
+from suliko.core.errors import ConflictError, NotFoundError, UpstreamUnavailableError
 from suliko.db.base import Base
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
 from suliko.domain.order_files import purge_removed_files, purge_working_copies
@@ -37,7 +38,7 @@ from suliko.models.order_file import OrderFile
 from suliko.models.portal import FileKind
 from suliko.models.reference import DocumentType
 from suliko.models.tenant import Tenant, TenantStatus
-from suliko.models.translation import DocumentTranslation
+from suliko.models.translation import DocumentTranslation, TranslationStatus
 
 ACME, GLOBEX = 1, 2
 
@@ -563,3 +564,250 @@ async def test_a_failed_copy_stops_the_upload_before_the_vault_is_touched(
             None,  # type: ignore[arg-type]
         )  # fmt: skip
     assert vault.calls == []
+
+
+# ── Linking files to documents ──────────────────────────────────────────────
+
+
+async def _more_documents(db: AsyncSession) -> None:
+    """ACME's order 100 gets a second document (English to Russian), and a
+    second order of its own gets one, for the files that must not move."""
+    with bypass_tenant_scope():
+        db.add(
+            Order(
+                id=101,
+                tenant_id=ACME,
+                client_id=ACME,
+                order_date=date(2026, 10, 1),
+                urgency=Urgency.STANDARD,
+            )
+        )
+        await db.flush()
+        for document_id, order_id, source, target in (
+            (1001, 100, "en", "ru"),
+            (1010, 101, "ka", "en"),
+        ):
+            db.add(
+                OrderDocument(
+                    id=document_id,
+                    tenant_id=ACME,
+                    order_id=order_id,
+                    document_type_id=ACME,
+                    source_language=source,
+                    target_language=target,
+                    page_count=1,
+                    copy_type=CopyType.ORIGINAL,
+                    price=Decimal("10"),
+                    translator_cost=Decimal("0"),
+                    notary_cost=Decimal("0"),
+                )
+            )
+        await db.commit()
+
+
+async def _scan(
+    db: AsyncSession, storage: LocalDiskStorage, name: str, document_id: int = 1000
+) -> order_files.StaffFileOut:
+    return await order_files.upload_file(
+        101 if document_id == 1010 else 100,
+        document_id,
+        _upload(name, b"%PDF-1.7 " + name.encode()),
+        db,
+        Staff(7, ACME),
+        storage,
+        None,  # type: ignore[arg-type]
+    )
+
+
+def _links(*pairs: tuple[str, int]) -> order_files.LinkFilesIn:
+    return order_files.LinkFilesIn(
+        links=[order_files.FileLink(file_id=file, document_id=to) for file, to in pairs]
+    )
+
+
+async def test_a_file_is_linked_to_another_document_of_the_order(
+    db: AsyncSession, tmp_path: Path, audit: list[dict[str, Any]]
+) -> None:
+    await _more_documents(db)
+    storage = LocalDiskStorage(str(tmp_path))
+    staff = Staff(7, ACME)
+
+    with tenant_scope(ACME):
+        stays = await _scan(db, storage, "stays.pdf")
+        moves = await _scan(db, storage, "moves.pdf")
+        on_disk = tmp_path / f"tenants/{ACME}/orders/100/documents/1000/{moves.id}"
+
+        linked = await order_files.link_files(
+            100,
+            # The second is already there: nothing to do, and nothing said about it.
+            _links((moves.id, 1001), (stays.id, 1000)),
+            db,
+            staff,
+            None,  # type: ignore[arg-type]
+        )
+
+        assert [(f.id, f.document_id) for f in linked] == [(moves.id, 1001)]
+        first = await order_files.list_files(100, 1000, db, None)  # type: ignore[arg-type]
+        second = await order_files.list_files(100, 1001, db, None)  # type: ignore[arg-type]
+        assert [f.id for f in first] == [stays.id]
+        assert [f.id for f in second] == [moves.id]
+
+        # The bytes did not move: the row says whose they are now.
+        assert on_disk.read_bytes() == b"%PDF-1.7 moves.pdf"
+        response = await order_files.download_file(100, 1001, moves.id, db, storage, None)  # type: ignore[arg-type]
+        assert await _body(response) == b"%PDF-1.7 moves.pdf"
+        # And the old address no longer finds it.
+        with pytest.raises(NotFoundError):
+            await order_files.download_file(100, 1000, moves.id, db, storage, None)  # type: ignore[arg-type]
+
+        entries = [e for e in audit if e["action"] == "order.files_linked"]
+        assert len(entries) == 1
+        assert entries[0]["after"]["files"] == [
+            {"file_name": "moves.pdf", "from_document_id": 1000, "to_document_id": 1001}
+        ]
+
+
+async def test_linking_files_that_are_already_there_records_nothing(
+    db: AsyncSession, tmp_path: Path, audit: list[dict[str, Any]]
+) -> None:
+    await _more_documents(db)
+    storage = LocalDiskStorage(str(tmp_path))
+    with tenant_scope(ACME):
+        scan = await _scan(db, storage, "a.pdf")
+        audit.clear()
+        linked = await order_files.link_files(
+            100,
+            _links((scan.id, 1000)),
+            db,
+            Staff(7, ACME),
+            None,  # type: ignore[arg-type]
+        )
+        assert linked == []
+        assert audit == []
+
+
+async def test_one_file_that_cannot_move_stops_them_all(db: AsyncSession, tmp_path: Path) -> None:
+    await _more_documents(db)
+    storage = LocalDiskStorage(str(tmp_path))
+    staff = Staff(7, ACME)
+    with tenant_scope(ACME):
+        mine = await _scan(db, storage, "mine.pdf")
+        elsewhere = await _scan(db, storage, "other-order.pdf", document_id=1010)
+
+        # A file of another order of the same bureau is not this order's file.
+        with pytest.raises(NotFoundError):
+            await order_files.link_files(
+                100,
+                _links((mine.id, 1001), (elsewhere.id, 1001)),
+                db,
+                staff,
+                None,  # type: ignore[arg-type]
+            )
+        # Nor is another order's document somewhere to put it.
+        with pytest.raises(NotFoundError):
+            await order_files.link_files(100, _links((mine.id, 1010)), db, staff, None)  # type: ignore[arg-type]
+        listed = await order_files.list_files(100, 1000, db, None)  # type: ignore[arg-type]
+        assert [f.id for f in listed] == [mine.id]
+
+
+async def test_a_removed_file_cannot_be_linked(db: AsyncSession, tmp_path: Path) -> None:
+    await _more_documents(db)
+    storage = LocalDiskStorage(str(tmp_path))
+    staff = Staff(7, ACME)
+    with tenant_scope(ACME):
+        gone = await _scan(db, storage, "gone.pdf")
+        await order_files.delete_file(100, 1000, gone.id, db, staff, None)  # type: ignore[arg-type]
+        with pytest.raises(NotFoundError):
+            await order_files.link_files(100, _links((gone.id, 1001)), db, staff, None)  # type: ignore[arg-type]
+
+
+async def test_another_bureau_cannot_link_the_file(db: AsyncSession, tmp_path: Path) -> None:
+    await _more_documents(db)
+    storage = LocalDiskStorage(str(tmp_path))
+    with tenant_scope(ACME):
+        scan = await _scan(db, storage, "a.pdf")
+
+    with tenant_scope(GLOBEX):
+        for order_id, document_id in ((200, 2000), (100, 1001)):
+            with pytest.raises(NotFoundError):
+                await order_files.link_files(
+                    order_id,
+                    _links((scan.id, document_id)),
+                    db,
+                    Staff(2, GLOBEX),
+                    None,  # type: ignore[arg-type]
+                )
+
+    with tenant_scope(ACME):
+        listed = await order_files.list_files(100, 1000, db, None)  # type: ignore[arg-type]
+        assert [f.id for f in listed] == [scan.id]
+
+
+async def test_a_file_being_translated_stays_where_its_result_will_be_filed(
+    db: AsyncSession, tmp_path: Path
+) -> None:
+    await _more_documents(db)
+    storage = LocalDiskStorage(str(tmp_path))
+    staff = Staff(7, ACME)
+    with tenant_scope(ACME):
+        scan = await _scan(db, storage, "scan.pdf")
+        row = (
+            await db.execute(select(OrderFile).where(OrderFile.public_id == scan.id))
+        ).scalar_one()
+        job = DocumentTranslation(
+            public_id="job-1",
+            order_document_id=1000,
+            source_file_id=row.id,
+            status=TranslationStatus.PROCESSING,
+            suliko_job_id="j1",
+            suliko_user_id="u1",
+            target_language="en",
+            page_count=1,
+        )
+        db.add(job)
+        await db.flush()
+
+        links = _links((scan.id, 1001))
+        with pytest.raises(ConflictError, match=r"scan\.pdf"):
+            await order_files.link_files(100, links, db, staff, None)  # type: ignore[arg-type]
+
+        # Once it has finished, it can.
+        job.status = TranslationStatus.COMPLETED
+        await db.flush()
+        linked = await order_files.link_files(100, links, db, staff, None)  # type: ignore[arg-type]
+        assert [f.document_id for f in linked] == [1001]
+
+
+async def test_a_vault_file_can_be_linked_too(db: AsyncSession) -> None:
+    """The vault keeps a file's name and side, not which document it is on."""
+    await _more_documents(db)
+    with tenant_scope(ACME):
+        db.add(
+            OrderFile(
+                public_id="vault-file-0001",
+                order_document_id=1000,
+                kind=FileKind.SOURCE,
+                file_name="archived.pdf",
+                content_type="application/pdf",
+                size_bytes=10,
+                sha256="0" * 64,
+                storage_key="vault/41/vault-file-0001",
+                uploaded_by="user:7",
+            )
+        )
+        await db.flush()
+        linked = await order_files.link_files(
+            100,
+            _links(("vault-file-0001", 1001)),
+            db,
+            Staff(7, ACME),
+            None,  # type: ignore[arg-type]
+        )
+        assert [(f.id, f.document_id) for f in linked] == [("vault-file-0001", 1001)]
+
+
+def test_a_request_to_link_names_each_file_once() -> None:
+    with pytest.raises(ValueError, match="one document at a time"):
+        _links(("file-id-0001", 1000), ("file-id-0001", 1001))
+    with pytest.raises(ValueError, match="at least 1"):
+        order_files.LinkFilesIn(links=[])
