@@ -289,6 +289,26 @@ async def test_the_list_filters_by_a_language_on_either_side(
     assert await names(language="fr") == []
 
 
+async def test_the_list_filters_by_the_kind_of_work(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    await create(maker, name="Written only")
+    await create(maker, name="Oral only", works_written=False, works_oral=True)
+    await create(maker, name="Both", works_oral=True)
+
+    async def names(work: str | None) -> list[str]:
+        with tenant_scope(ACME):
+            async with maker() as db:
+                page = await api.list_translators(db=db, _=None, sort="name", work=work)  # type: ignore[arg-type]
+        assert page.meta.total == len(page.items)
+        return [item.name for item in page.items]
+
+    assert await names(None) == ["Both", "Oral only", "Written only"]
+    assert await names("written") == ["Both", "Written only"]
+    assert await names("oral") == ["Both", "Oral only"]
+    assert await names("both") == ["Both"]
+
+
 async def test_removing_a_translator_removes_its_pairs(
     maker: async_sessionmaker[AsyncSession],
 ) -> None:

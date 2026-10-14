@@ -308,6 +308,10 @@ async def list_translators(
     language: Annotated[str | None, Query(max_length=5)] = None,
     #: A city code: the translators who certify there.
     city: Annotated[str | None, Query(max_length=30)] = None,
+    #: What they take: `written` and `oral` list everyone who does that kind
+    #: of work (someone who does both is in each), `both` only those who do
+    #: both.
+    work: Literal["written", "oral", "both"] | None = None,
     sort: Literal["name", "-name", "id", "-id"] = "-id",
     limit: Annotated[int, Query(ge=1, le=200)] = 20,
     offset: Annotated[int, Query(ge=0)] = 0,
@@ -343,6 +347,11 @@ async def list_translators(
 
     if city and city.strip():
         stmt = stmt.where(Translator.cities.like(f"%,{city.strip().lower()},%"))
+
+    if work in ("written", "both"):
+        stmt = stmt.where(Translator.works_written.is_(True))
+    if work in ("oral", "both"):
+        stmt = stmt.where(Translator.works_oral.is_(True))
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
 
