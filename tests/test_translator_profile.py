@@ -104,10 +104,14 @@ async def maker() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
 
 
 def pair(source: str, target: str, rate: str | None = None) -> api.LanguagePairIn:
+    """One direction exactly as given. That a pair also runs the other way is
+    the rule in ``test_translator_pairs.py``; these tests are about storing,
+    replacing and listing the directions themselves."""
     return api.LanguagePairIn(
         source_language=source,
         target_language=target,
         rate_per_page=Decimal(rate) if rate is not None else None,
+        one_way=True,
     )
 
 

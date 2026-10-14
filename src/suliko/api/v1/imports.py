@@ -50,6 +50,7 @@ from suliko.domain.imports import (
 from suliko.domain.imports_orders import ExistingOrder, OrdersContext
 from suliko.domain.order_files import safe_file_name
 from suliko.domain.statuses import INITIAL_STATUS, STATUS_DEFINITIONS
+from suliko.domain.translator_pairs import Pair, both_ways
 from suliko.models.collaboration import OrderComment
 from suliko.models.directory import Client, ClientType, Translator, TranslatorLanguagePair
 from suliko.models.finance import (
@@ -475,10 +476,13 @@ async def commit(
             translator = Translator(**values, cities=pack(cities))
             db.add(translator)
             await db.flush()
-            for source, target in pairs:
+            # A pair works both ways, as when it is typed into the form.
+            for pair in both_ways(Pair(source, target) for source, target in pairs):
                 db.add(
                     TranslatorLanguagePair(
-                        translator_id=translator.id, source_language=source, target_language=target
+                        translator_id=translator.id,
+                        source_language=pair.source,
+                        target_language=pair.target,
                     )
                 )
             created.append(("translator", translator.id))

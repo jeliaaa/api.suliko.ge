@@ -11,7 +11,9 @@ Follows `clients.py`. The differences that matter:
   translator's portal credentials is a separate, audited action.
 - Language pairs live in their own table (`TranslatorLanguagePair`) and are
   written as a whole: a create or update that sends `language_pairs` replaces
-  the translator's set. They name the bureau's own language codes.
+  the translator's set. They name the bureau's own language codes. A pair
+  works both ways: saving KA to EN also saves EN to KA, unless the pair is
+  sent with `one_way` (`domain/translator_pairs.py`).
 """
 
 from __future__ import annotations
@@ -42,6 +44,7 @@ from suliko.domain.portal import (
     portal_translator_for,
     registration_url,
 )
+from suliko.domain.translator_pairs import Pair, both_ways
 from suliko.integrations.suliko_backend import SulikoBackend, SulikoUser, get_suliko_backend
 from suliko.models.directory import Translator, TranslatorLanguagePair
 from suliko.models.portal import (
@@ -59,7 +62,12 @@ router = APIRouter(prefix="/translators", tags=["translators"])
 
 
 class LanguagePairIn(BaseModel):
-    """One direction a translator works in: from `source` into `target`."""
+    """One direction a translator works in: from `source` into `target`.
+
+    Saved with its reverse (into `source` from `target`) unless `one_way`, or
+    unless the reverse is listed too, in which case that listing, with its own
+    rate, stands.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -68,6 +76,8 @@ class LanguagePairIn(BaseModel):
     #: What they are paid per page for this pair, when it differs from their
     #: default rate.
     rate_per_page: Decimal | None = Field(default=None, ge=0, le=100000)
+    #: Only this direction: do not add the reverse.
+    one_way: bool = False
 
     @model_validator(mode="after")
     def _two_languages(self) -> LanguagePairIn:
@@ -249,8 +259,15 @@ async def _pairs_of(
     return by_translator
 
 
+def _stored_pairs(pairs: list[LanguagePairIn]) -> list[Pair]:
+    """What is written for `pairs`: each with its reverse, unless one way."""
+    return both_ways(
+        Pair(p.source_language, p.target_language, p.rate_per_page, p.one_way) for p in pairs
+    )
+
+
 async def _replace_pairs(db: AsyncSession, translator_id: int, pairs: list[LanguagePairIn]) -> None:
-    """Make the translator's pairs exactly `pairs`.
+    """Make the translator's pairs `pairs`, each with its reverse (see `both_ways`).
 
     Each code must be one of the bureau's languages (active or not: a language
     switched off later must not make an existing translator unsaveable), the
@@ -270,13 +287,13 @@ async def _replace_pairs(db: AsyncSession, translator_id: int, pairs: list[Langu
     await db.execute(
         delete(TranslatorLanguagePair).where(TranslatorLanguagePair.translator_id == translator_id)
     )
-    for pair in pairs:
+    for pair in _stored_pairs(pairs):
         db.add(
             TranslatorLanguagePair(
                 translator_id=translator_id,
-                source_language=pair.source_language,
-                target_language=pair.target_language,
-                rate_per_page=pair.rate_per_page,
+                source_language=pair.source,
+                target_language=pair.target,
+                rate_per_page=pair.rate,
             )
         )
     await db.flush()
@@ -976,7 +993,8 @@ async def update_translator(
         ]
         await _replace_pairs(db, row.id, payload.language_pairs or [])
         changes["language_pairs"] = [
-            {"source": p["source_language"], "target": p["target_language"]} for p in new_pairs
+            {"source": p.source, "target": p.target}
+            for p in _stored_pairs(payload.language_pairs or [])
         ]
 
     from suliko.core.audit import record
