@@ -28,7 +28,6 @@ from suliko.models.order import CopyType, ServiceType, Urgency
 from suliko.models.reference import (
     DocumentType,
     LanguagePairPrice,
-    PricingUnit,
     TenantSettings,
 )
 
@@ -51,9 +50,8 @@ class PricingContext:
     #: document_type_id -> multiplier, for the types that were asked about.
     multipliers: dict[int, Decimal]
     due_days: dict[Urgency, int] = field(default_factory=lambda: dict(DEFAULT_DUE_DAYS))
-    #: Written work counted in characters instead of pages (a bureau setting).
-    count_by_characters: bool = False
-    #: Characters in one standard page, when counting by characters.
+    #: Characters in one standard page, for a line that comes with a character
+    #: count. Whether an order counts that way is the order's choice.
     characters_per_page: int = 1800
 
     def rate(self, source: str, target: str) -> Decimal | None:
@@ -160,7 +158,6 @@ async def load_pricing_context(
         config=config_from_settings(settings, plan),
         rates=rates,
         minute_rates=minute_rates,
-        count_by_characters=bool(settings and settings.pricing_unit is PricingUnit.CHARACTERS),
         characters_per_page=int(settings.characters_per_page) if settings else 1800,
         multipliers=multipliers,
         due_days=due_days_from_settings(settings),

@@ -90,8 +90,9 @@ class ReferenceData(BaseModel):
     #: the frontend's, so they can be translated; these are shown as typed.
     acquisition_sources: list[str] = Field(default_factory=list)
     custom_statuses: list[str] = Field(default_factory=list)
-    #: "pages", or "characters" when the bureau prices written work by the
-    #: characters (with spaces) of each document, `characters_per_page` to a page.
+    #: What a new order is calculated by to begin with: "pages", or
+    #: "characters" (with spaces, `characters_per_page` to a standard page).
+    #: Each order can choose the other; this is only where the form starts.
     pricing_unit: str = "pages"
     characters_per_page: int = 1800
 

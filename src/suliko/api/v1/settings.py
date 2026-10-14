@@ -51,8 +51,9 @@ class GeneralSettings(BaseModel):
     urgency_multiplier_urgent: Decimal
     delivery_fee: Decimal
     default_translator_share: Decimal
-    #: How written work is counted for pricing: pages, or characters (with
-    #: spaces) turned into standard pages of `characters_per_page`.
+    #: What a new order is calculated by to begin with: pages, or characters
+    #: (with spaces) turned into standard pages of `characters_per_page`. Each
+    #: order can choose the other.
     pricing_unit: PricingUnit
     characters_per_page: int
     #: Days from order date to the default due date, per urgency.

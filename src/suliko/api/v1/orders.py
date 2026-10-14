@@ -106,8 +106,10 @@ class OrderDocumentIn(BaseModel):
     source_language: str = Field(min_length=2, max_length=5)
     target_language: str = Field(min_length=2, max_length=5)
     page_count: int = Field(ge=1, le=10_000)
-    #: Characters with spaces, for a bureau that prices by characters. The
-    #: translation is priced from it; `page_count` stays the physical pages.
+    #: Characters with spaces, when the order is calculated by characters (the
+    #: caller's choice per order, not a bureau-wide rule). The translation is
+    #: priced from it; `page_count` stays the physical pages. Left out, the
+    #: line is priced by `page_count`.
     character_count: int | None = Field(default=None, ge=1, le=100_000_000)
     copy_type: CopyType = CopyType.ORIGINAL
     #: Overrides what `copy_type` implies. Staff notarise a translation of an
@@ -760,11 +762,6 @@ async def _document_row(
 ) -> OrderDocument:
     """A priced document row for `order`, overrides applied."""
     oral = item.service_type is ServiceType.ORAL
-    if not oral and ctx.count_by_characters and item.character_count is None:
-        raise ValidationError(
-            "Enter the number of characters (with spaces) for each document: "
-            "this bureau prices by characters."
-        )
     _require_rate(
         ctx,
         item.source_language,
