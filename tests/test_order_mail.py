@@ -16,7 +16,7 @@ import io
 import json
 import smtplib
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from decimal import Decimal
 from email.message import EmailMessage
@@ -51,7 +51,7 @@ from suliko.models.integration import IntegrationCredential, IntegrationProvider
 from suliko.models.order import CopyType, Order, OrderDocument, OrderStatusEvent, Urgency
 from suliko.models.order_file import OrderFile
 from suliko.models.portal import FileKind
-from suliko.models.reference import DocumentType, TenantSettings
+from suliko.models.reference import DocumentType, Language, TenantSettings
 from suliko.models.tenant import Tenant, TenantStatus
 from suliko.security.permissions import Permission
 
@@ -137,6 +137,7 @@ async def db() -> AsyncIterator[AsyncSession]:
             Client,
             Translator,
             DocumentType,
+            Language,
             TenantSettings,
             Order,
             OrderDocument,
@@ -170,11 +171,22 @@ async def db() -> AsyncIterator[AsyncSession]:
                             client_type=ClientType.B2C,
                             email=f"client@{'acme' if tenant_id == ACME else 'globex'}.test",
                         ),
-                        DocumentType(id=tenant_id, tenant_id=tenant_id, name_en="P", name_ka="P"),
+                        DocumentType(
+                            id=tenant_id,
+                            tenant_id=tenant_id,
+                            name_en="Passport",
+                            name_ka="პასპორტი",
+                        ),
                     ]
                 )
             session.add_all(
                 [
+                    Language(
+                        id=1, tenant_id=ACME, code="ka", name_en="Georgian", name_ka="ქართული"
+                    ),
+                    Language(
+                        id=2, tenant_id=ACME, code="en", name_en="English", name_ka="ინგლისური"
+                    ),
                     Translator(id=NINO, tenant_id=ACME, name="Nino", email="nino@example.test"),
                     Translator(id=LEVAN, tenant_id=ACME, name="Levan", email=None),
                     TenantSettings(tenant_id=ACME, default_language="ka", system_email=None),
@@ -188,7 +200,9 @@ async def db() -> AsyncIterator[AsyncSession]:
                         tenant_id=tenant_id,
                         client_id=tenant_id,
                         order_date=date(2026, 10, 1),
-                        urgency=Urgency.STANDARD,
+                        due_date=date(2026, 10, 25),
+                        urgency=Urgency.EXPRESS if tenant_id == ACME else Urgency.STANDARD,
+                        notes="internal: client is slow to pay",
                     )
                 )
             await session.flush()
@@ -298,16 +312,21 @@ async def test_the_client_gets_the_files_from_the_bureau_by_name(
 
     assert (out.recipient, out.files, out.via) == ("client@acme.test", 2, "platform")
     [(used, message)] = outbox
-    assert used is PLATFORM
+    # Suliko's server, with the display name changed to name the order.
+    assert replace(used, from_name=PLATFORM.from_name) == PLATFORM
     assert message["To"] == "client@acme.test"
-    assert message["From"] == "Acme Translations via Suliko <noreply@suliko.ge>"
+    # The bureau and which order, in place of "via Suliko".
+    assert message["From"] == '"Acme Translations, შეკვეთა №1" <noreply@suliko.ge>'
     assert message["Reply-To"] == "office@acme.ge"
     assert _attachments(message) == {"passport-en.pdf": b"%PDF one", "diploma-en.pdf": b"%PDF two"}
 
     body = message.get_body(preferencelist=("plain",)).get_content()  # type: ignore[union-attr]
     # The bureau's default language, the files by name, and the note as written.
     assert "გამარჯობა, Giorgi Client!" in body
-    assert "- passport-en.pdf\n- diploma-en.pdf" in body
+    # The order's facts, then each document with its files under it.
+    assert "ვადა: 25.10.2026\nსასწრაფოობა: ექსპრესი" in body
+    kind = "პასპორტი (ქართული → ინგლისური, 1 გვერდი, ორიგინალი დოკუმენტი)"
+    assert f"{kind}\n- passport-en.pdf\n\n{kind}\n- diploma-en.pdf" in body
     assert "\n\nReady, thank you.\n\n" in body
 
     [entry] = audit
@@ -336,6 +355,9 @@ async def test_the_sender_can_ask_for_english(
     body = message.get_body(preferencelist=("plain",)).get_content()  # type: ignore[union-attr]
     assert body.startswith("Hello Giorgi Client,\n\n")
     assert "To get in touch, reply to this email." in body
+    assert "Due date: 25.10.2026\nUrgency: Express" in body
+    assert "Passport (Georgian → English, 1 page, Original document)\n- a.pdf" in body
+    assert message["From"] == '"Acme Translations, order #1" <noreply@suliko.ge>'
 
 
 async def test_the_email_also_carries_a_plain_html_version_with_everything_escaped(
@@ -399,6 +421,125 @@ async def test_the_html_version_can_be_switched_off(
     assert message.get_body(preferencelist=("html",)) is None
     assert message.get_body(preferencelist=("plain",)) is not None
     assert _attachments(message) == {"a.pdf": b"x"}
+
+
+async def test_the_html_shows_the_order_card_and_each_document_with_its_files(
+    db: AsyncSession,
+    tmp_path: Path,
+    outbox: list[tuple[Sender, EmailMessage]],
+    sender: dict[str, Sender | None],
+) -> None:
+    storage = LocalDiskStorage(str(tmp_path))
+    with tenant_scope(ACME):
+        first = await _put(db, storage, 1000, "passport-en.pdf", b"%PDF one")
+        second = await _put(db, storage, 1000, "stamp.docx", b"two")
+        await _send(db, storage, SendFilesIn(to="client", file_ids=[first, second], language="en"))
+
+    [(_, message)] = outbox
+    html_part = message.get_body(preferencelist=("html",))
+    assert html_part is not None
+    page = html_part.get_content()
+    # The order card: number, due date, and the urgency as a tag.
+    assert "#1</div>" in page
+    assert "25.10.2026" in page
+    assert ">Express</span>" in page
+    # One document, with its type, languages, pages and kind of copy, and both
+    # files under it, each tagged with its type.
+    assert page.count("Passport</div>") == 1
+    assert "Georgian → English &middot; 1 page &middot; Original document" in page
+    assert ">PDF</span>passport-en.pdf" in page
+    assert ">DOCX</span>stamp.docx" in page
+    # Suliko's blue is the only colour added.
+    assert "#3b59f3" in page
+
+
+async def test_a_translator_is_told_the_work_and_never_money_notes_or_the_kind_of_copy(
+    db: AsyncSession,
+    tmp_path: Path,
+    outbox: list[tuple[Sender, EmailMessage]],
+    sender: dict[str, Sender | None],
+) -> None:
+    storage = LocalDiskStorage(str(tmp_path))
+    with tenant_scope(ACME):
+        file_id = await _put(db, storage, 1000, "scan.pdf", b"source", kind=FileKind.SOURCE)
+        await _send(
+            db,
+            storage,
+            SendFilesIn(to="translator", translator_id=NINO, file_ids=[file_id], language="en"),
+        )
+
+    [(_, message)] = outbox
+    plain = message.get_body(preferencelist=("plain",))
+    html_part = message.get_body(preferencelist=("html",))
+    assert plain is not None and html_part is not None
+    for body in (plain.get_content(), html_part.get_content()):
+        # What the work is, and when.
+        assert "Georgian → English" in body
+        assert "25.10.2026" in body
+        assert "Express" in body
+        # What they have no use for, or must not see: the kind of copy, the
+        # price, the bureau's internal note, the client's details.
+        assert "Original document" not in body
+        assert "GEL" not in body and "10.00" not in body
+        assert "slow to pay" not in body
+        assert "client@acme.test" not in body and "Giorgi" not in body
+
+
+async def test_the_bureaus_internal_note_never_reaches_a_client_either(
+    db: AsyncSession,
+    tmp_path: Path,
+    outbox: list[tuple[Sender, EmailMessage]],
+    sender: dict[str, Sender | None],
+) -> None:
+    storage = LocalDiskStorage(str(tmp_path))
+    with tenant_scope(ACME):
+        file_id = await _put(db, storage, 1000, "a.pdf", b"x")
+        await _send(db, storage, SendFilesIn(to="client", file_ids=[file_id]))
+
+    [(_, message)] = outbox
+    for part in message.iter_parts():
+        if part.get_content_type() in ("text/plain", "text/html"):
+            assert "slow to pay" not in part.get_content()
+    assert "slow to pay" not in message.as_string()
+
+
+async def test_a_bureaus_own_server_keeps_the_name_it_was_set_up_with(
+    db: AsyncSession,
+    tmp_path: Path,
+    outbox: list[tuple[Sender, EmailMessage]],
+    sender: dict[str, Sender | None],
+) -> None:
+    sender["sender"] = replace(PLATFORM, via="smtp", from_email="office@acme.ge", from_name="Acme")
+    storage = LocalDiskStorage(str(tmp_path))
+    with tenant_scope(ACME):
+        file_id = await _put(db, storage, 1000, "a.pdf", b"x")
+        await _send(db, storage, SendFilesIn(to="client", file_ids=[file_id], language="en"))
+
+    [(_, message)] = outbox
+    assert message["From"] == "Acme <office@acme.ge>"
+
+
+async def test_a_language_the_bureau_has_not_named_shows_as_its_code(
+    db: AsyncSession,
+    tmp_path: Path,
+    outbox: list[tuple[Sender, EmailMessage]],
+    sender: dict[str, Sender | None],
+) -> None:
+    storage = LocalDiskStorage(str(tmp_path))
+    with tenant_scope(GLOBEX):
+        file_id = await _put(db, storage, 2000, "g.pdf", b"x", tenant_id=GLOBEX)
+        await _send(
+            db,
+            storage,
+            SendFilesIn(to="client", file_ids=[file_id], language="en"),
+            staff=Staff(tenant_id=GLOBEX, tenant_name="Globex"),
+            order_id=200,
+        )
+
+    [(_, message)] = outbox
+    plain = message.get_body(preferencelist=("plain",))
+    assert plain is not None
+    assert "Passport (KA → EN, 1 page, Original document)" in plain.get_content()
 
 
 async def test_a_client_without_an_address_is_said_so_and_nothing_is_sent(

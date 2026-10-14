@@ -26,8 +26,7 @@ is our address and our reputation.
 
 from __future__ import annotations
 
-import html
-from typing import Annotated, Literal, NamedTuple
+from typing import Annotated, Literal
 
 import structlog
 from fastapi import APIRouter, Depends
@@ -47,6 +46,7 @@ from suliko.core.business_mail import (
     build_message,
     deliver,
     is_address,
+    renamed,
     resolve_sender,
 )
 from suliko.core.errors import (
@@ -57,11 +57,20 @@ from suliko.core.errors import (
 )
 from suliko.core.ratelimit import RateLimiter, get_rate_limiter
 from suliko.domain.order_files import FILE_ID_PATTERN, downloadable, open_download
+from suliko.domain.order_mail_message import (
+    Audience,
+    Language,
+    MailDocument,
+    compose,
+    copy_label,
+    sender_name,
+)
 from suliko.integrations.object_storage import StorageError
 from suliko.models.directory import Client, Translator
 from suliko.models.order import Order, OrderDocument
 from suliko.models.order_file import OrderFile
-from suliko.models.reference import TenantSettings
+from suliko.models.reference import DocumentType, TenantSettings
+from suliko.models.reference import Language as LanguageRow
 from suliko.security.permissions import Permission
 from suliko.security.sessions import AuthenticatedSession
 
@@ -69,7 +78,6 @@ log = structlog.get_logger()
 
 router = APIRouter(prefix="/orders", tags=["order-mail"])
 
-Language = Literal["ka", "en"]
 MAX_FILES = 20
 
 
@@ -201,129 +209,82 @@ async def mail_options(
     )
 
 
-# ── The words ───────────────────────────────────────────────────────────────
-
-_SUBJECT: dict[Language, str] = {
-    "en": "Documents for order #{number} from {organisation}",
-    "ka": "დოკუმენტები შეკვეთისთვის №{number}: {organisation}",
-}
-_GREETING: dict[Language, str] = {"en": "Hello {name},", "ka": "გამარჯობა, {name}!"}
-_INTRO: dict[tuple[str, Language], str] = {
-    ("client", "en"): "{organisation} has sent you these files for order #{number}:",
-    ("client", "ka"): "{organisation} გიგზავნით ამ ფაილებს შეკვეთისთვის №{number}:",
-    ("translator", "en"): "{organisation} has sent you these files to work on, order #{number}:",
-    ("translator", "ka"): "{organisation} გიგზავნით ამ ფაილებს სამუშაოდ, შეკვეთა №{number}:",
-}
-_REPLY: dict[Language, str] = {
-    "en": "To get in touch, reply to this email.",
-    "ka": "დასაკავშირებლად უპასუხეთ ამ წერილს.",
-}
-_FILES_LABEL: dict[Language, str] = {"en": "Attached files", "ka": "თანდართული ფაილები"}
-_SENT_THROUGH: dict[Language, str] = {
-    "en": "Sent through Suliko.",
-    "ka": "გაგზავნილია Suliko-ს მეშვეობით.",
-}
-
-# The HTML version is deliberately plain: one column, the system's own fonts,
-# no images, buttons or links. Gmail files mail that looks like a campaign under
-# Promotions or Updates, and this is a person sending files to a person. Colours
-# are left to the reader's client (no page background, no body colour), so it
-# reads the same in dark mode.
-_FONT = (
-    "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Noto Sans Georgian',"
-    "'Helvetica Neue',Arial,sans-serif"
-)
-_MUTED = "#6b7280"
-_LINE = "#d4d4d8"
+# ── What the email says about the order ─────────────────────────────────────
 
 
-class Composed(NamedTuple):
-    subject: str
-    text: str
-    html: str
+async def _documents(
+    db: AsyncSession, rows: list[OrderFile], *, to: Audience, language: Language
+) -> list[MailDocument]:
+    """The documents the files belong to, each with its type, languages, pages
+    and (for a client) its kind of copy, in the order the files were named.
 
-
-def _escape(value: str) -> str:
-    return html.escape(value, quote=True)
-
-
-def _lines(value: str) -> str:
-    """Text as HTML, keeping the sender's own line breaks."""
-    return "<br>".join(_escape(line) for line in value.strip().splitlines())
-
-
-def compose(
-    *,
-    to: Literal["client", "translator"],
-    language: Language,
-    organisation: str,
-    order_number: int,
-    recipient_name: str,
-    file_names: list[str],
-    note: str | None,
-) -> Composed:
-    """Subject, plain-text body and the same words as HTML. The note is the
-    sender's own and goes in as written; everything around it is fixed."""
-    subject = _SUBJECT[language].format(number=order_number, organisation=organisation)
-    note_text = note.strip() if note and note.strip() else None
-
-    parts = [
-        _GREETING[language].format(name=recipient_name),
-        _INTRO[(to, language)].format(organisation=organisation, number=order_number)
-        + "\n"
-        + "\n".join(f"- {name}" for name in file_names),
-    ]
-    if note_text:
-        parts.append(note_text)
-    parts.append(_REPLY[language])
-    text = "\n\n".join(parts) + "\n"
-
-    # Everything that came from a person is escaped; the sentences around it are ours.
-    greeting = _escape(_GREETING[language].format(name=recipient_name))
-    intro = _INTRO[(to, language)].format(
-        organisation=f"<strong>{_escape(organisation)}</strong>",
-        number=f"<strong>{order_number}</strong>",
+    Money is never read here: the email has no use for it, and a translator
+    must not be able to see it however the template changes.
+    """
+    # The files named, by document, in the order they were named. `_files` only
+    # returns files that belong to a document, so the check is for the type.
+    files: dict[int, list[str]] = {}
+    for row in rows:
+        if row.order_document_id is not None:
+            files.setdefault(row.order_document_id, []).append(row.file_name)
+    ids = list(files)
+    documents = {
+        document.id: document
+        for document in (
+            await db.execute(select(OrderDocument).where(OrderDocument.id.in_(ids)))
+        ).scalars()
+    }
+    type_ids = {d.document_type_id for d in documents.values() if d.document_type_id is not None}
+    types = (
+        {
+            kind.id: kind
+            for kind in (
+                await db.execute(select(DocumentType).where(DocumentType.id.in_(type_ids)))
+            ).scalars()
+        }
+        if type_ids
+        else {}
     )
-    rows = "".join(
-        f'<tr><td style="padding:10px 14px;font-size:14px;word-break:break-word;'
-        f'{"" if index == 0 else f"border-top:1px solid {_LINE};"}">{_escape(name)}</td></tr>'
-        for index, name in enumerate(file_names)
-    )
-    note_block = (
-        f'<tr><td style="padding:0 0 20px 0;"><div style="border-left:3px solid {_LINE};'
-        f'padding:2px 0 2px 14px;font-size:15px;line-height:1.55;">{_lines(note_text)}</div>'
-        "</td></tr>"
-        if note_text
-        else ""
-    )
-    cell = f"font-family:{_FONT};font-size:15px;line-height:1.55;"
-    body = (
-        f'<!doctype html><html lang="{language}"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width,initial-scale=1"></head>'
-        '<body style="margin:0;padding:0;">'
-        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
-        '<tr><td align="center" style="padding:24px 16px;">'
-        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
-        f'style="max-width:540px;{cell}">'
-        f'<tr><td style="padding:0 0 18px 0;font-size:13px;font-weight:600;'
-        f'letter-spacing:.02em;color:{_MUTED};border-bottom:1px solid {_LINE};">'
-        f"{_escape(organisation)}</td></tr>"
-        f'<tr><td style="padding:22px 0 8px 0;">{greeting}</td></tr>'
-        f'<tr><td style="padding:0 0 14px 0;">{intro}</td></tr>'
-        '<tr><td style="padding:0 0 20px 0;">'
-        f'<div style="font-size:12px;color:{_MUTED};padding:0 0 6px 2px;">'
-        f"{_FILES_LABEL[language]}</div>"
-        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
-        f'style="border:1px solid {_LINE};border-radius:8px;border-collapse:separate;">'
-        f"{rows}</table></td></tr>"
-        f"{note_block}"
-        f'<tr><td style="padding:0 0 22px 0;color:{_MUTED};font-size:14px;">'
-        f"{_REPLY[language]}</td></tr>"
-        f'<tr><td style="padding:14px 0 0 0;border-top:1px solid {_LINE};font-size:12px;'
-        f'color:{_MUTED};">{_SENT_THROUGH[language]}</td></tr>'
-        "</table></td></tr></table></body></html>"
-    )
-    return Composed(subject=subject, text=text, html=body)
+    codes = {code for d in documents.values() for code in (d.source_language, d.target_language)}
+    languages = {
+        row.code: row
+        for row in (
+            await db.execute(select(LanguageRow).where(LanguageRow.code.in_(codes)))
+        ).scalars()
+    }
+
+    def language_name(code: str) -> str:
+        row = languages.get(code)
+        if row is None:
+            return code.upper()
+        return (row.name_ka if language == "ka" else row.name_en) or code.upper()
+
+    out: list[MailDocument] = []
+    for document_id in ids:
+        document = documents.get(document_id)
+        if document is None:
+            continue
+        kind = types.get(document.document_type_id) if document.document_type_id else None
+        title = ""
+        if kind is not None:
+            title = (kind.name_ka if language == "ka" else kind.name_en) or ""
+        out.append(
+            MailDocument(
+                title=title,
+                route=(
+                    f"{language_name(document.source_language)} → "
+                    f"{language_name(document.target_language)}"
+                ),
+                pages=document.page_count,
+                copy=(
+                    copy_label(document.copy_type.value, document.is_notarized, language)
+                    if to == "client"
+                    else ""
+                ),
+                files=tuple(files[document_id]),
+            )
+        )
+    return out
 
 
 # ── Sending ─────────────────────────────────────────────────────────────────
@@ -442,9 +403,20 @@ async def send_files(
         organisation=session.tenant_name,
         order_number=order.number,
         recipient_name=name,
-        file_names=[row.file_name for row in rows],
+        due_date=order.due_date,
+        urgency=order.urgency.value,
+        documents=await _documents(db, rows, to=payload.to, language=language),
         note=payload.message,
     )
+    if sender.via == "platform":
+        # Our address, so the name says whose message it is and which order:
+        # "Acme, order #12". A bureau's own server keeps the name it was set up with.
+        sender = renamed(
+            sender,
+            sender_name(
+                language=language, organisation=session.tenant_name, order_number=order.number
+            ),
+        )
     await deliver(
         sender,
         build_message(
