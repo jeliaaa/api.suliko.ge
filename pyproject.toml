@@ -31,6 +31,10 @@ dependencies = [
     # Renders the TOTP enrolment URI as a scannable QR in the terminal, so a
     # superuser can be enrolled over SSH or RDP with no GUI.
     "qrcode>=8.0",
+    # The translation as a Word file (domain/translation_docx.py). Brings lxml,
+    # which reads the translation's HTML.
+    "python-docx>=1.1",
+    "lxml>=5.0",
     # IANA timezone data for `zoneinfo`. Linux ships it with the OS; Windows —
     # where this API is deployed — does not, and without it every tenant's
     # "today" falls back to failing. See domain/clock.py.
@@ -102,8 +106,8 @@ disallow_untyped_decorators = false  # FastAPI decorators are untyped
 exclude = ["alembic/versions/"]
 
 [[tool.mypy.overrides]]
-# Neither ships type stubs or a py.typed marker.
-module = ["pyotp.*", "asyncpg.*", "qrcode.*"]
+# None ships type stubs or a py.typed marker.
+module = ["pyotp.*", "asyncpg.*", "qrcode.*", "lxml.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

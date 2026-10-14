@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
+from docx import Document
 from fastapi import UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -41,6 +42,7 @@ from suliko.core.errors import ConflictError, NotFoundError, PayloadTooLargeErro
 from suliko.db.base import Base
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
 from suliko.domain.accounts import UNUSABLE_PASSWORD_HASH
+from suliko.domain.translation_docx import DOCX_CONTENT_TYPE, DocxConversionError
 from suliko.integrations.object_storage import LocalDiskStorage
 from suliko.integrations.suliko_backend import SulikoUnavailableError
 from suliko.integrations.suliko_translate import (
@@ -447,11 +449,13 @@ async def test_looking_reports_progress_and_files_the_result_once(
         files = await order_files.list_files(ORDER, DOCUMENT, db, None)  # type: ignore[arg-type]
         [translation] = [f for f in files if f.kind is FileKind.TRANSLATION]
         assert translation.id == done.result_file_id
+        # A Word document, which is what a client is sent.
         assert (translation.name, translation.content_type) == (
-            "passport scan (EN).html",
-            "text/html",
+            "passport scan (EN).docx",
+            DOCX_CONTENT_TYPE,
         )
         assert translation.uploaded_by == f"suliko:{NINO}"
+        assert translation.editable is True
 
         response = await order_files.download_file(
             ORDER,
@@ -461,11 +465,22 @@ async def test_looking_reports_progress_and_files_the_result_once(
             storage,
             None,  # type: ignore[arg-type]
         )
-        # Kept as a whole document that says which character set it is in:
-        # the file is downloaded and emailed, and opened with nothing else to
-        # go by.
+        # A real Word file, with the translation's words in it.
         kept = b"".join([chunk async for chunk in response.body_iterator])
-        assert kept.decode("utf-8") == (
+        assert kept[:2] == b"PK"
+        assert [p.text for p in Document(io.BytesIO(kept)).paragraphs] == ["გამარჯობა, Hello"]
+
+        # The HTML is kept beside it, as a whole document that says which
+        # character set it is in: it is what the translation page edits.
+        page = await order_translations.get_translation_html(
+            ORDER,
+            DOCUMENT,
+            translation.id,
+            db,
+            storage,
+            None,  # type: ignore[arg-type]
+        )
+        assert page.html == (
             '<!doctype html>\n<html><head><meta charset="utf-8"></head><body>\n'
             '<div style="padding: 4px"><p>გამარჯობა, Hello</p></div>\n'
             "</body></html>"
@@ -553,7 +568,8 @@ async def test_saving_a_correction_replaces_the_file_and_keeps_the_record(
             None,  # type: ignore[arg-type]
         )
         assert saved.id != done.result_file_id
-        assert (saved.name, saved.uploaded_by) == ("passport scan (EN).html", f"user:{NINO}")
+        assert (saved.name, saved.uploaded_by) == ("passport scan (EN).docx", f"user:{NINO}")
+        assert saved.content_type == DOCX_CONTENT_TYPE and saved.editable is True
         response = await order_files.download_file(
             ORDER,
             DOCUMENT,
@@ -562,7 +578,19 @@ async def test_saving_a_correction_replaces_the_file_and_keeps_the_record(
             storage,
             None,  # type: ignore[arg-type]
         )
-        assert b"".join([chunk async for chunk in response.body_iterator]).decode("utf-8") == (
+        # The Word file is built again from what was saved...
+        built = b"".join([chunk async for chunk in response.body_iterator])
+        assert [p.text for p in Document(io.BytesIO(built)).paragraphs] == ["გასწორებული"]
+        # ... and the HTML it was built from is what the page gets back.
+        page = await order_translations.get_translation_html(
+            ORDER,
+            DOCUMENT,
+            saved.id,
+            db,
+            storage,
+            None,  # type: ignore[arg-type]
+        )
+        assert page.html == (
             '<!doctype html>\n<html><head><meta charset="utf-8"></head>'
             "<body><p>გასწორებული</p></body></html>"
         )
@@ -600,6 +628,226 @@ async def test_only_a_translation_made_here_can_be_saved_over(
                     SaveContentIn(html="<p>x</p>"),
                     db,
                     Staff(),  # type: ignore[arg-type]
+                    storage,
+                    None,  # type: ignore[arg-type]
+                )
+
+
+async def _filed_html(
+    db: AsyncSession,
+    storage: LocalDiskStorage,
+    *,
+    with_record: bool,
+    html: str = "<p>ძველი</p>",
+) -> str:
+    """A translation filed the way it was before Word files: an HTML file."""
+    upload = UploadFile(
+        file=io.BytesIO(html.encode()),
+        filename="old (EN).html",
+        headers=Headers({"content-type": "text/html"}),
+    )
+    out = await order_files.upload_file(
+        ORDER,
+        DOCUMENT,
+        upload,
+        db,
+        Staff(),
+        storage,
+        None,  # type: ignore[arg-type]
+        kind=FileKind.TRANSLATION,
+    )
+    if with_record:
+        row = (
+            await db.execute(select(OrderFile).where(OrderFile.public_id == out.id))
+        ).scalar_one()
+        db.add(
+            DocumentTranslation(
+                public_id="old-job-0001",
+                order_document_id=DOCUMENT,
+                status=TranslationStatus.COMPLETED,
+                result_file_id=row.id,
+                suliko_job_id="j",
+                suliko_user_id="u",
+                target_language="en",
+                page_count=1,
+            )
+        )
+        await db.flush()
+    return out.id
+
+
+async def test_a_translation_filed_as_html_is_still_edited_and_becomes_word_on_save(
+    db: AsyncSession, tmp_path: Path
+) -> None:
+    storage = LocalDiskStorage(str(tmp_path))
+    with tenant_scope(ACME):
+        old = await _filed_html(db, storage, with_record=True)
+        [listed] = [
+            f
+            for f in await order_files.list_files(ORDER, DOCUMENT, db, None)  # type: ignore[arg-type]
+            if f.id == old
+        ]
+        assert listed.editable is True
+
+        # The page is given the file's own HTML.
+        page = await order_translations.get_translation_html(
+            ORDER,
+            DOCUMENT,
+            old,
+            db,
+            storage,
+            None,  # type: ignore[arg-type]
+        )
+        assert page.html == "<p>ძველი</p>"
+
+        saved = await order_translations.save_translation(
+            ORDER,
+            DOCUMENT,
+            old,
+            SaveContentIn(html="<p>ახალი</p>"),
+            db,
+            Staff(),  # type: ignore[arg-type]
+            storage,
+            None,  # type: ignore[arg-type]
+        )
+        assert (saved.name, saved.content_type) == ("old (EN).docx", DOCX_CONTENT_TYPE)
+        assert saved.editable is True
+        # From now on the HTML is kept on the record, and found from there.
+        page = await order_translations.get_translation_html(
+            ORDER,
+            DOCUMENT,
+            saved.id,
+            db,
+            storage,
+            None,  # type: ignore[arg-type]
+        )
+        assert "<p>ახალი</p>" in page.html
+
+
+async def test_an_html_translation_with_no_record_stays_html(
+    db: AsyncSession, tmp_path: Path
+) -> None:
+    """There is nowhere to keep the HTML a Word file would be built from."""
+    storage = LocalDiskStorage(str(tmp_path))
+    with tenant_scope(ACME):
+        old = await _filed_html(db, storage, with_record=False)
+        saved = await order_translations.save_translation(
+            ORDER,
+            DOCUMENT,
+            old,
+            SaveContentIn(html="<p>ახალი</p>"),
+            db,
+            Staff(),  # type: ignore[arg-type]
+            storage,
+            None,  # type: ignore[arg-type]
+        )
+        assert (saved.name, saved.content_type) == ("old (EN).html", "text/html")
+        assert saved.editable is True
+
+
+async def test_a_translation_that_cannot_be_made_into_word_is_filed_as_html(
+    db: AsyncSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It has been paid for: it must not be lost to a failed conversion."""
+
+    def fail(*_args: object, **_kwargs: object) -> bytes:
+        raise DocxConversionError("too deeply nested")
+
+    monkeypatch.setattr(order_translations, "html_to_docx", fail)
+    storage = LocalDiskStorage(str(tmp_path))
+    suliko = FakeSuliko(state=JobStatus("completed", 100))
+    with tenant_scope(ACME):
+        file_id = await _source(db, storage)
+        await _translate(db, storage, suliko, file_id)
+        [done] = await _look(db, storage, suliko)
+        assert done.status is TranslationStatus.COMPLETED and done.result_file_id
+        [translation] = [
+            f
+            for f in await order_files.list_files(ORDER, DOCUMENT, db, None)  # type: ignore[arg-type]
+            if f.kind is FileKind.TRANSLATION
+        ]
+        assert (translation.name, translation.content_type) == (
+            "passport scan (EN).html",
+            "text/html",
+        )
+        # Still editable, as the old HTML files are.
+        assert translation.editable is True
+        page = await order_translations.get_translation_html(
+            ORDER,
+            DOCUMENT,
+            translation.id,
+            db,
+            storage,
+            None,  # type: ignore[arg-type]
+        )
+        assert "გამარჯობა, Hello" in page.html
+
+
+async def test_a_translation_too_large_to_keep_as_html_is_a_word_file_only(
+    db: AsyncSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        order_translations, "get_settings", lambda: Settings(translation_html_max_bytes=10)
+    )
+    storage = LocalDiskStorage(str(tmp_path))
+    suliko = FakeSuliko(state=JobStatus("completed", 100))
+    with tenant_scope(ACME):
+        file_id = await _source(db, storage)
+        await _translate(db, storage, suliko, file_id)
+        await _look(db, storage, suliko)
+        [translation] = [
+            f
+            for f in await order_files.list_files(ORDER, DOCUMENT, db, None)  # type: ignore[arg-type]
+            if f.kind is FileKind.TRANSLATION
+        ]
+        assert translation.content_type == DOCX_CONTENT_TYPE
+        assert translation.editable is False
+        with pytest.raises(NotFoundError):
+            await order_translations.get_translation_html(
+                ORDER,
+                DOCUMENT,
+                translation.id,
+                db,
+                storage,
+                None,  # type: ignore[arg-type]
+            )
+
+
+async def test_only_translations_made_here_are_offered_for_editing(
+    db: AsyncSession, tmp_path: Path
+) -> None:
+    storage = LocalDiskStorage(str(tmp_path))
+    with tenant_scope(ACME):
+        source = await _source(db, storage)
+        uploaded = await _source(db, storage, name="done.docx", kind=FileKind.TRANSLATION)
+        files = await order_files.list_files(ORDER, DOCUMENT, db, None)  # type: ignore[arg-type]
+        assert {f.id: f.editable for f in files} == {source: False, uploaded: False}
+        for file_id in (source, uploaded):
+            with pytest.raises(NotFoundError):
+                await order_translations.get_translation_html(
+                    ORDER,
+                    DOCUMENT,
+                    file_id,
+                    db,
+                    storage,
+                    None,  # type: ignore[arg-type]
+                )
+
+
+async def test_another_bureau_cannot_read_a_translation_to_edit_it(
+    db: AsyncSession, tmp_path: Path
+) -> None:
+    storage = LocalDiskStorage(str(tmp_path))
+    with tenant_scope(ACME):
+        old = await _filed_html(db, storage, with_record=True)
+    with tenant_scope(GLOBEX):
+        for order_id, document_id in ((200, 2000), (ORDER, DOCUMENT)):
+            with pytest.raises(NotFoundError):
+                await order_translations.get_translation_html(
+                    order_id,
+                    document_id,
+                    old,
+                    db,
                     storage,
                     None,  # type: ignore[arg-type]
                 )

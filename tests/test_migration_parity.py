@@ -65,6 +65,8 @@ LATER_REVISIONS = (
     "0024_pricing_by_characters.py",
     # import_batches, import_batch_items — see test_migration_0025.py.
     "0025_imports.py",
+    # document_translations.html — see test_migration_0026.py.
+    "0026_translation_html.py",
 )
 
 
