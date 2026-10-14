@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import enum
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -19,6 +19,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    Time,
     UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -194,6 +195,13 @@ class OrderDocument(Base, IdMixin, TenantScoped, TimestampMixin):
     #: characters. The translation is priced from this; ``page_count`` stays
     #: the physical pages, which the notary charges by. Null: priced by pages.
     character_count: Mapped[int | None] = mapped_column(Integer, default=None)
+
+    #: Interpreting only: where it takes place, and when. An address as text
+    #: (a courtroom, an office, a hospital), a date and a time of day as the
+    #: wall clock at that place. All optional; null on a written line.
+    interpreting_place: Mapped[str | None] = mapped_column(String(500), default=None)
+    interpreting_date: Mapped[date | None] = mapped_column(Date, default=None)
+    interpreting_time: Mapped[time | None] = mapped_column(Time, default=None)
 
     copy_type: Mapped[CopyType] = mapped_column(
         Enum(CopyType, name="copy_type", values_callable=enum_values, native_enum=False, length=30),

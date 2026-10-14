@@ -69,6 +69,8 @@ LATER_REVISIONS = (
     "0026_translation_html.py",
     # Data only: the reverse of every translator pair — see test_migration_0027.py.
     "0027_translator_pairs_both_ways.py",
+    # Three columns on order_documents — see test_migration_0028.py.
+    "0028_interpreting_place.py",
 )
 
 

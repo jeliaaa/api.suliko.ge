@@ -573,6 +573,17 @@ def _unit_of(d: OrderDocument) -> Literal["pages", "minutes", "characters"]:
     return "characters" if d.character_count else "pages"
 
 
+def _oral_description(d: OrderDocument, locale: Literal["ka", "en"]) -> str:
+    """The line's name, with where and when it took place in brackets when the
+    line says so: the client is told what they are paying for."""
+    name = "Oral interpreting" if locale == "en" else "ზეპირი თარგმანი"
+    when = d.interpreting_date.strftime("%d.%m.%Y") if d.interpreting_date is not None else None
+    if when is not None and d.interpreting_time is not None:
+        when = f"{when} {d.interpreting_time.strftime('%H:%M')}"
+    details = [part for part in ((d.interpreting_place or "").strip(), when) if part]
+    return f"{name} ({', '.join(details)})" if details else name
+
+
 def _unit_price(d: OrderDocument, characters_per_page: int) -> Decimal:
     """What one unit of the line cost, for display: per page, minute, or
     standard page of characters. Zero units shows the whole amount."""
@@ -648,7 +659,7 @@ async def order_invoice(
     lines = [
         InvoiceLine(
             description=(
-                ("Oral interpreting" if locale == "en" else "ზეპირი თარგმანი")
+                _oral_description(d, locale)
                 if d.service_type is ServiceType.ORAL
                 else d.document_type.name_en
                 if locale == "en" and d.document_type
