@@ -24,7 +24,9 @@ did not leave has to say so, or they will believe the client has the file.
 The message carries files. They are read into memory to be encoded, so the
 caller bounds their total size first (`Settings.document_mail_max_bytes`).
 
-Plain text bodies only, as in `core/mail.py`, and for the same reasons.
+The body is plain text, as in `core/mail.py`, and for the same reasons. A caller
+may add an HTML version of the same words (the documents email does); it is
+always a second alternative, never the only one.
 """
 
 from __future__ import annotations
@@ -205,6 +207,7 @@ def build_message(
     subject: str,
     body: str,
     attachments: list[Attachment],
+    html: str | None = None,
 ) -> EmailMessage:
     message = EmailMessage()
     message["Subject"] = _CONTROL_CHARACTERS.sub(" ", subject).strip()
@@ -214,6 +217,10 @@ def build_message(
     if sender.reply_to:
         message["Reply-To"] = sender.reply_to
     message.set_content(body)
+    if html:
+        # The plain text stays as the first alternative: a reader that cannot
+        # show HTML, and a spam filter comparing the two, both get the same words.
+        message.add_alternative(html, subtype="html")
     for attachment in attachments:
         maintype, _, subtype = attachment.content_type.partition("/")
         message.add_attachment(

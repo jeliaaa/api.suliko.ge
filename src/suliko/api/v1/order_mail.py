@@ -26,7 +26,8 @@ is our address and our reputation.
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+import html
+from typing import Annotated, Literal, NamedTuple
 
 import structlog
 from fastapi import APIRouter, Depends
@@ -217,6 +218,38 @@ _REPLY: dict[Language, str] = {
     "en": "To get in touch, reply to this email.",
     "ka": "დასაკავშირებლად უპასუხეთ ამ წერილს.",
 }
+_FILES_LABEL: dict[Language, str] = {"en": "Attached files", "ka": "თანდართული ფაილები"}
+_SENT_THROUGH: dict[Language, str] = {
+    "en": "Sent through Suliko.",
+    "ka": "გაგზავნილია Suliko-ს მეშვეობით.",
+}
+
+# The HTML version is deliberately plain: one column, the system's own fonts,
+# no images, buttons or links. Gmail files mail that looks like a campaign under
+# Promotions or Updates, and this is a person sending files to a person. Colours
+# are left to the reader's client (no page background, no body colour), so it
+# reads the same in dark mode.
+_FONT = (
+    "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Noto Sans Georgian',"
+    "'Helvetica Neue',Arial,sans-serif"
+)
+_MUTED = "#6b7280"
+_LINE = "#d4d4d8"
+
+
+class Composed(NamedTuple):
+    subject: str
+    text: str
+    html: str
+
+
+def _escape(value: str) -> str:
+    return html.escape(value, quote=True)
+
+
+def _lines(value: str) -> str:
+    """Text as HTML, keeping the sender's own line breaks."""
+    return "<br>".join(_escape(line) for line in value.strip().splitlines())
 
 
 def compose(
@@ -228,20 +261,69 @@ def compose(
     recipient_name: str,
     file_names: list[str],
     note: str | None,
-) -> tuple[str, str]:
-    """Subject and plain-text body. The note is the sender's own and goes in
-    as written; everything around it is fixed."""
+) -> Composed:
+    """Subject, plain-text body and the same words as HTML. The note is the
+    sender's own and goes in as written; everything around it is fixed."""
     subject = _SUBJECT[language].format(number=order_number, organisation=organisation)
+    note_text = note.strip() if note and note.strip() else None
+
     parts = [
         _GREETING[language].format(name=recipient_name),
         _INTRO[(to, language)].format(organisation=organisation, number=order_number)
         + "\n"
         + "\n".join(f"- {name}" for name in file_names),
     ]
-    if note and note.strip():
-        parts.append(note.strip())
+    if note_text:
+        parts.append(note_text)
     parts.append(_REPLY[language])
-    return subject, "\n\n".join(parts) + "\n"
+    text = "\n\n".join(parts) + "\n"
+
+    # Everything that came from a person is escaped; the sentences around it are ours.
+    greeting = _escape(_GREETING[language].format(name=recipient_name))
+    intro = _INTRO[(to, language)].format(
+        organisation=f"<strong>{_escape(organisation)}</strong>",
+        number=f"<strong>{order_number}</strong>",
+    )
+    rows = "".join(
+        f'<tr><td style="padding:10px 14px;font-size:14px;word-break:break-word;'
+        f'{"" if index == 0 else f"border-top:1px solid {_LINE};"}">{_escape(name)}</td></tr>'
+        for index, name in enumerate(file_names)
+    )
+    note_block = (
+        f'<tr><td style="padding:0 0 20px 0;"><div style="border-left:3px solid {_LINE};'
+        f'padding:2px 0 2px 14px;font-size:15px;line-height:1.55;">{_lines(note_text)}</div>'
+        "</td></tr>"
+        if note_text
+        else ""
+    )
+    cell = f"font-family:{_FONT};font-size:15px;line-height:1.55;"
+    body = (
+        f'<!doctype html><html lang="{language}"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1"></head>'
+        '<body style="margin:0;padding:0;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
+        '<tr><td align="center" style="padding:24px 16px;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
+        f'style="max-width:540px;{cell}">'
+        f'<tr><td style="padding:0 0 18px 0;font-size:13px;font-weight:600;'
+        f'letter-spacing:.02em;color:{_MUTED};border-bottom:1px solid {_LINE};">'
+        f"{_escape(organisation)}</td></tr>"
+        f'<tr><td style="padding:22px 0 8px 0;">{greeting}</td></tr>'
+        f'<tr><td style="padding:0 0 14px 0;">{intro}</td></tr>'
+        '<tr><td style="padding:0 0 20px 0;">'
+        f'<div style="font-size:12px;color:{_MUTED};padding:0 0 6px 2px;">'
+        f"{_FILES_LABEL[language]}</div>"
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
+        f'style="border:1px solid {_LINE};border-radius:8px;border-collapse:separate;">'
+        f"{rows}</table></td></tr>"
+        f"{note_block}"
+        f'<tr><td style="padding:0 0 22px 0;color:{_MUTED};font-size:14px;">'
+        f"{_REPLY[language]}</td></tr>"
+        f'<tr><td style="padding:14px 0 0 0;border-top:1px solid {_LINE};font-size:12px;'
+        f'color:{_MUTED};">{_SENT_THROUGH[language]}</td></tr>'
+        "</table></td></tr></table></body></html>"
+    )
+    return Composed(subject=subject, text=text, html=body)
 
 
 # ── Sending ─────────────────────────────────────────────────────────────────
@@ -354,7 +436,7 @@ async def send_files(
     language: Language = payload.language or (
         "en" if settings_row is not None and settings_row.default_language == "en" else "ka"
     )
-    subject, text = compose(
+    composed = compose(
         to=payload.to,
         language=language,
         organisation=session.tenant_name,
@@ -365,7 +447,14 @@ async def send_files(
     )
     await deliver(
         sender,
-        build_message(sender, to=email, subject=subject, body=text, attachments=attachments),
+        build_message(
+            sender,
+            to=email,
+            subject=composed.subject,
+            body=composed.text,
+            html=composed.html if settings.document_mail_html else None,
+            attachments=attachments,
+        ),
     )
     await limiter.record_document_mail(limit_key)
 
