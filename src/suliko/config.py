@@ -103,6 +103,10 @@ class Settings(BaseSettings):
     #: The most the files of one such email may weigh together. Attachments
     #: grow by a third when encoded, and most mail servers stop at 25 MB.
     document_mail_max_bytes: int = 15 * 1024 * 1024
+    #: Send the documents email with a styled HTML version beside the plain
+    #: text. Off sends plain text only, which is what Gmail most readily files
+    #: under Primary: switch it off if the styled one starts landing in Updates.
+    document_mail_html: bool = True
     #: How long an invitation's set-your-password link stays usable.
     invite_link_ttl_hours: int = 168  # 7 days
 

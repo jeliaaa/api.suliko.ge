@@ -338,6 +338,69 @@ async def test_the_sender_can_ask_for_english(
     assert "To get in touch, reply to this email." in body
 
 
+async def test_the_email_also_carries_a_plain_html_version_with_everything_escaped(
+    db: AsyncSession,
+    tmp_path: Path,
+    outbox: list[tuple[Sender, EmailMessage]],
+    sender: dict[str, Sender | None],
+) -> None:
+    storage = LocalDiskStorage(str(tmp_path))
+    with tenant_scope(ACME):
+        file_id = await _put(db, storage, 1000, "a&b.pdf", b"%PDF")
+        client = await db.get(Client, ACME)
+        assert client is not None
+        client.name = "Giorgi <Client>"
+        await db.flush()
+        await _send(
+            db,
+            storage,
+            SendFilesIn(
+                to="client",
+                file_ids=[file_id],
+                language="en",
+                message='Please <b>check</b> it & "sign"\nThank you',
+            ),
+        )
+
+    [(_, message)] = outbox
+    html_part = message.get_body(preferencelist=("html",))
+    assert html_part is not None
+    page = html_part.get_content()
+    # Words that came from a person are escaped, the sender's line breaks kept.
+    assert "Hello Giorgi &lt;Client&gt;," in page
+    assert "a&amp;b.pdf" in page
+    assert "Please &lt;b&gt;check&lt;/b&gt; it &amp; &quot;sign&quot;<br>Thank you" in page
+    assert "<strong>Acme Translations</strong>" in page
+    assert "Sent through Suliko." in page
+    # Nothing that makes a message look like a campaign or a tracker.
+    for marker in ("<img", "href=", "<a ", "<script", "<style", "<link"):
+        assert marker not in page
+    # The plain text is still there, and so are the files.
+    plain = message.get_body(preferencelist=("plain",))
+    assert plain is not None
+    assert plain.get_content().startswith("Hello Giorgi <Client>,\n\n")
+    assert _attachments(message) == {"a&b.pdf": b"%PDF"}
+
+
+async def test_the_html_version_can_be_switched_off(
+    db: AsyncSession,
+    tmp_path: Path,
+    outbox: list[tuple[Sender, EmailMessage]],
+    sender: dict[str, Sender | None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(order_mail, "get_settings", lambda: Settings(document_mail_html=False))
+    storage = LocalDiskStorage(str(tmp_path))
+    with tenant_scope(ACME):
+        file_id = await _put(db, storage, 1000, "a.pdf", b"x")
+        await _send(db, storage, SendFilesIn(to="client", file_ids=[file_id], language="en"))
+
+    [(_, message)] = outbox
+    assert message.get_body(preferencelist=("html",)) is None
+    assert message.get_body(preferencelist=("plain",)) is not None
+    assert _attachments(message) == {"a.pdf": b"x"}
+
+
 async def test_a_client_without_an_address_is_said_so_and_nothing_is_sent(
     db: AsyncSession,
     tmp_path: Path,
