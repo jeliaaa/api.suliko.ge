@@ -13,6 +13,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
     UniqueConstraint,
     false,
     text,
@@ -138,6 +139,24 @@ class AccountDeletionRequest(Base, IdMixin, TimestampMixin):
         ),
         default=DeletionStatus.REQUESTED,
         nullable=False,
+    )
+
+    #: When the team decided (approved or rejected) and who. Null while it waits.
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    decided_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), default=None
+    )
+    #: What the reviewer wrote. Shown to the next reviewer, never to the person.
+    review_note: Mapped[str | None] = mapped_column(Text, default=None)
+    #: When an approved request's data is deleted: the approval plus 30 days.
+    purge_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    #: When the person's data was deleted (the request is then `DONE`).
+    done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    #: Filing the request also switched the person's translator-portal access
+    #: off. Remembered so that cancelling switches back on only what this
+    #: switched off, not something the bureau had already disabled.
+    portal_deactivated: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
     )
 
 

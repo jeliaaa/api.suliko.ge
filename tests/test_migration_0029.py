@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from migration_recorder import RecordedOps, load_revision
+from migration_recorder import RecordedOps, import_revision, load_revision
 from suliko.db.base import TenantScoped
 from suliko.models import AccountDeletionRequest, Base
 
@@ -27,8 +27,12 @@ def test_columns_match_the_model(revision: tuple[Any, RecordedOps]) -> None:
     _, ops = revision
     migrated = ops.tables[TABLE]
     declared = Base.metadata.tables[TABLE]
-    assert set(migrated.columns.keys()) == set(declared.columns.keys())
+    # A column 0030 added (the review record) is not 0029's.
+    later = {c.name for _, c in import_revision("0030_deletion_review.py").NEW_COLUMNS}
+    assert set(migrated.columns.keys()) == set(declared.columns.keys()) - later
     for name, column in declared.columns.items():
+        if name in later:
+            continue
         other = migrated.columns[name]
         assert other.nullable == column.nullable, f"{name}: nullability differs"
         assert str(other.type) == str(column.type), f"{name}: type differs"

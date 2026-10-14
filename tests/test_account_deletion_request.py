@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from fastapi import BackgroundTasks
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from starlette.requests import Request
@@ -40,13 +40,28 @@ from suliko.domain.account_deletion import (
     team_email,
 )
 from suliko.domain.plans import TenantPlan, effective_permissions
+from suliko.models.collaboration import Notification, OrderCommentMention, OrderCommentRead
+from suliko.models.finance import ClientPaymentAllocation, NotaryPayment, TranslatorPayment
+from suliko.models.order import Order, OrderDocument, OrderStatusEvent
+from suliko.models.portal import (
+    PersonalOrder,
+    PersonalOrderFile,
+    PersonalOrderLanguagePair,
+    PortalAccountInvite,
+    PortalTranslator,
+    PortalTranslatorLink,
+)
 from suliko.models.tenant import Tenant, TenantStatus
 from suliko.models.user import (
     Account,
     AccountDeletionRequest,
     DeletionStatus,
+    MfaMethod,
+    MfaRecoveryCode,
+    PasswordResetToken,
     Role,
     User,
+    UserPermissionOverride,
 )
 from suliko.security import login_tickets
 from suliko.security.passwords import hash_password
@@ -55,13 +70,33 @@ from suliko.security.sessions import AuthenticatedSession
 PASSWORD = "correct horse battery"
 ACME, BETA = 1, 2
 NINO, GIORGI = 1, 2
-#: `login_attempts` and `user_sessions` have INET columns SQLite cannot create, so
-#: what is written to them is captured by patching the writer instead.
+#: Everything a person's data can be in. `user_sessions` and `login_attempts` have
+#: INET columns SQLite cannot create, so `_build` gives them just the columns the
+#: code under test reads, as plain tables.
 TABLES = [
     Tenant.__table__,
     Account.__table__,
     AccountDeletionRequest.__table__,
     User.__table__,
+    MfaMethod.__table__,
+    MfaRecoveryCode.__table__,
+    PasswordResetToken.__table__,
+    UserPermissionOverride.__table__,
+    Notification.__table__,
+    OrderCommentMention.__table__,
+    OrderCommentRead.__table__,
+    PortalTranslator.__table__,
+    PortalTranslatorLink.__table__,
+    PortalAccountInvite.__table__,
+    PersonalOrder.__table__,
+    PersonalOrderFile.__table__,
+    PersonalOrderLanguagePair.__table__,
+    Order.__table__,
+    OrderDocument.__table__,
+    OrderStatusEvent.__table__,
+    ClientPaymentAllocation.__table__,
+    TranslatorPayment.__table__,
+    NotaryPayment.__table__,
 ]
 
 
@@ -141,6 +176,12 @@ async def _build(
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as conn:
         await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=TABLES))
+        await conn.execute(
+            text("CREATE TABLE user_sessions (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL)")
+        )
+        await conn.execute(
+            text("CREATE TABLE login_attempts (id INTEGER PRIMARY KEY, username VARCHAR(100))")
+        )
     maker = async_sessionmaker(engine, expire_on_commit=False)
     db = maker()
     with bypass_tenant_scope():
