@@ -783,7 +783,7 @@ async def test_a_translation_that_cannot_be_made_into_word_is_filed_as_html(
         assert "გამარჯობა, Hello" in page.html
 
 
-async def test_a_translation_too_large_to_keep_as_html_is_a_word_file_only(
+async def test_a_translation_too_large_to_keep_as_html_still_opens_in_the_editor(
     db: AsyncSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
@@ -801,7 +801,9 @@ async def test_a_translation_too_large_to_keep_as_html_is_a_word_file_only(
             if f.kind is FileKind.TRANSLATION
         ]
         assert translation.content_type == DOCX_CONTENT_TYPE
-        assert translation.editable is False
+        # The Word editor works on the Word file itself, so it needs no HTML...
+        assert translation.editable is True
+        # ... which is what the old HTML page would have wanted.
         with pytest.raises(NotFoundError):
             await order_translations.get_translation_html(
                 ORDER,
@@ -813,16 +815,17 @@ async def test_a_translation_too_large_to_keep_as_html_is_a_word_file_only(
             )
 
 
-async def test_only_translations_made_here_are_offered_for_editing(
+async def test_only_word_and_html_translations_are_offered_for_editing(
     db: AsyncSession, tmp_path: Path
 ) -> None:
     storage = LocalDiskStorage(str(tmp_path))
     with tenant_scope(ACME):
         source = await _source(db, storage)
-        uploaded = await _source(db, storage, name="done.docx", kind=FileKind.TRANSLATION)
+        pdf = await _source(db, storage, name="done.pdf", kind=FileKind.TRANSLATION)
         files = await order_files.list_files(ORDER, DOCUMENT, db, None)  # type: ignore[arg-type]
-        assert {f.id: f.editable for f in files} == {source: False, uploaded: False}
-        for file_id in (source, uploaded):
+        # A source file, or a PDF translation, is downloaded, not edited.
+        assert {f.id: f.editable for f in files} == {source: False, pdf: False}
+        for file_id in (source, pdf):
             with pytest.raises(NotFoundError):
                 await order_translations.get_translation_html(
                     ORDER,

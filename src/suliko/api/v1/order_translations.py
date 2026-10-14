@@ -813,4 +813,4 @@ async def save_translation(
         entity_id=order_id,
         after={"document_id": document_id, "file_name": stored.file_name},
     )
-    return _out(stored, editable=made.html is not None or made.content_type == HTML)
+    return _out(stored)

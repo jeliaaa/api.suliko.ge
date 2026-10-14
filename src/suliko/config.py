@@ -290,6 +290,11 @@ class Settings(BaseSettings):
     suliko_translate_max_bytes: int = 20 * 1024 * 1024
     #: The most an edited translation may weigh when it is saved back.
     translation_html_max_bytes: int = 5 * 1024 * 1024
+    #: The Word editor (`integrations/word_editor.py`): how long suliko.ge may
+    #: take to open a document for it, and the largest it will be asked to
+    #: open or saved back (suliko.ge's own limit is 25 MB).
+    word_editor_timeout_seconds: float = 60.0
+    word_editor_max_bytes: int = 25 * 1024 * 1024
     #: Where a person resets a suliko.ge password — sent to those who ask to
     #: reset it here, since Office does not hold it.
     suliko_password_reset_url: str = "https://suliko.ge/login"  # noqa: S105 -- a URL

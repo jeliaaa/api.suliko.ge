@@ -47,6 +47,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from suliko.core.errors import NotFoundError
 from suliko.domain.statuses import CLOSED_STATUSES, normalise
+from suliko.domain.translation_docx import DOCX_CONTENT_TYPE
 from suliko.integrations.object_storage import (
     ObjectStorage,
     StorageDownloadUnavailableError,
@@ -57,7 +58,6 @@ from suliko.integrations.object_storage import (
 from suliko.models.order import Order, OrderDocument, OrderStatusEvent
 from suliko.models.order_file import OrderFile
 from suliko.models.portal import FileKind
-from suliko.models.translation import DocumentTranslation
 
 #: Public ids are 22 URL-safe characters; the wider pattern is what the
 #: frontends and the old Drive ids already used, so their routes still match.
@@ -133,31 +133,16 @@ async def list_document_files(db: AsyncSession, document_id: int) -> list[OrderF
     )
 
 
-async def editable_file_ids(db: AsyncSession, files: Iterable[OrderFile]) -> set[int]:
-    """Which of these files the translation page can open for correcting.
+#: What the translation page can open for correcting: a Word document, or an
+#: HTML file (a translation filed before there were Word files, or when its
+#: conversion failed).
+EDITABLE_TRANSLATION_TYPES = frozenset({DOCX_CONTENT_TYPE, "text/html"})
 
-    A translation Suliko Translate made is a Word file with its HTML kept
-    beside it (``document_translations.html``): the page edits that and builds
-    the Word file again on save. One filed before that is itself HTML, and is
-    edited as it is. Any other file, an uploaded translation included, is only
-    downloaded. One query for the whole list.
-    """
-    translations = [file for file in files if file.kind is FileKind.TRANSLATION]
-    if not translations:
-        return set()
-    kept = set(
-        (
-            await db.execute(
-                select(DocumentTranslation.result_file_id).where(
-                    DocumentTranslation.result_file_id.in_([file.id for file in translations]),
-                    DocumentTranslation.html.is_not(None),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    return {file.id for file in translations if file.id in kept or file.content_type == "text/html"}
+
+def is_editable_translation(file: OrderFile) -> bool:
+    """Whether the Word editor can open this file: a Translation file that is
+    a Word document or an HTML file, whoever added it."""
+    return file.kind is FileKind.TRANSLATION and file.content_type in EDITABLE_TRANSLATION_TYPES
 
 
 async def count_files_added_by(

@@ -18,6 +18,7 @@ from suliko.api.v1 import (
     order_files,
     order_mail,
     order_translations,
+    order_word_editor,
     orders,
     platform,
     portal,
@@ -43,6 +44,7 @@ api_router.include_router(orders.router)
 api_router.include_router(order_files.router)
 api_router.include_router(order_mail.router)
 api_router.include_router(order_translations.router)
+api_router.include_router(order_word_editor.router)
 api_router.include_router(calculator.router)
 api_router.include_router(reports.router)
 api_router.include_router(users.router)
