@@ -20,7 +20,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from suliko.config import get_settings
@@ -247,6 +247,43 @@ def personal(options: list[Membership]) -> Membership | None:
     )
 
 
+async def would_strand_organisation(db: AsyncSession, user: User) -> bool:
+    """Whether switching this membership off would leave the organisation with no owner.
+
+    True for the last active owner of an organisation other people still use. A
+    sole user, such as a freelancer's own workspace, strands nobody. Closing your
+    own access and asking for your account to be deleted both stop here: someone
+    else has to be made an owner first.
+    """
+    if user.role is not Role.OWNER:
+        return False
+    with bypass_tenant_scope():
+        others = (
+            await db.scalar(
+                select(func.count())
+                .select_from(User)
+                .where(
+                    User.tenant_id == user.tenant_id,
+                    User.is_active.is_(True),
+                    User.id != user.id,
+                )
+            )
+        ) or 0
+        other_owners = (
+            await db.scalar(
+                select(func.count())
+                .select_from(User)
+                .where(
+                    User.tenant_id == user.tenant_id,
+                    User.role == Role.OWNER,
+                    User.is_active.is_(True),
+                    User.id != user.id,
+                )
+            )
+        ) or 0
+    return others > 0 and other_owners == 0
+
+
 def slug_candidate(name: str) -> str:
     """A URL-safe slug from an organisation name.
 
@@ -409,4 +446,5 @@ __all__ = [
     "upsert_from_suliko",
     "username_for",
     "username_for_account",
+    "would_strand_organisation",
 ]

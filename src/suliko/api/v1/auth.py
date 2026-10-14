@@ -47,6 +47,14 @@ from suliko.core.errors import (
 from suliko.core.ratelimit import RateLimiter, get_rate_limiter
 from suliko.db.session import bind_tenant_guc, get_sessionmaker, session_scope
 from suliko.db.tenancy import bypass_tenant_scope, tenant_scope
+from suliko.domain.account_deletion import (
+    AccountDeletionPendingError,
+    ensure_not_pending_deletion,
+    file_request,
+    organisations_left_without_an_owner,
+    person_email,
+    team_email,
+)
 from suliko.domain.accounts import (
     UNUSABLE_PASSWORD_HASH,
     Membership,
@@ -62,6 +70,7 @@ from suliko.domain.accounts import (
     revoke_account_sessions,
     upsert_from_suliko,
     username_for,
+    would_strand_organisation,
 )
 from suliko.domain.plans import TenantPlan, effective_permissions, effective_plan
 from suliko.domain.portal import registration_url
@@ -239,6 +248,23 @@ async def _record_attempt(
         )
 
 
+async def _refuse_if_deletion_pending(
+    db: AsyncSession, account: Account, name: str, ip: str | None, user_agent: str | None
+) -> None:
+    """Stop a sign-in whose account has asked to be deleted.
+
+    Only after the password was proved, so it tells nothing to someone who merely
+    guessed an address. Logged as a failed attempt but not counted against the
+    person: nothing was guessed wrong.
+    """
+    try:
+        await ensure_not_pending_deletion(db, account.id)
+    except AccountDeletionPendingError:
+        await _record_attempt(db, name, ip, user_agent, False, "deletion_pending")
+        await db.commit()
+        raise
+
+
 def _choice(membership: Membership) -> OrgChoice:
     return OrgChoice(
         tenant_slug=membership.tenant.slug,
@@ -391,6 +417,7 @@ async def login(
             await db.commit()
             raise AuthenticationError("Invalid email, phone or password.")
 
+        await _refuse_if_deletion_pending(db, account, login_key, ip, user_agent)
         await _record_attempt(db, login_key, ip, user_agent, True)
         await limiter.clear_login_failures(account_key)
         options = await _login_options(
@@ -449,6 +476,7 @@ async def sso_exchange(
             await db.commit()
             raise AuthenticationError("Your sign-in has expired. Sign in again.")
 
+        await _refuse_if_deletion_pending(db, account, login_name(account), ip, user_agent)
         await _record_attempt(db, login_name(account), ip, user_agent, True)
         options = await _login_options(
             db, account, login_tickets.issue(account.id, account.password_hash)
@@ -466,6 +494,8 @@ async def _account_from_ticket(db: AsyncSession, ticket: str) -> Account:
     account = await db.get(Account, account_id)
     if account is None or not login_tickets.matches(ticket, account.password_hash):
         raise AuthenticationError("Your sign-in has expired. Sign in again.")
+    # A ticket issued before the request was filed must not outlive it.
+    await ensure_not_pending_deletion(db, account.id)
     return account
 
 
@@ -547,6 +577,9 @@ async def _start_session(
 ) -> LoginResponse:
     """A session for one membership — the second factor and permissions exactly
     as that organisation's row has them."""
+    # Every way of getting a session ends here, so this is where "an account that
+    # asked to be deleted cannot sign in" is held for good, whatever led to it.
+    await ensure_not_pending_deletion(db, account.id)
     user, tenant = membership.user, membership.tenant
 
     # This session may have been opened before we knew which tenant we were
@@ -1477,6 +1510,23 @@ class LeaveRequest(BaseModel):
     current_password: str | None = Field(default=None, max_length=1024)
 
 
+async def _require_own_password(account: Account | None, password: str | None) -> None:
+    """Ask again for the password of an account that has one here.
+
+    For the actions that end someone's access: a session left open on a shared
+    screen should not be enough. An account kept on suliko.ge has no password
+    here to ask for.
+    """
+    if account is None or account.suliko_user_id is not None:
+        return
+    ok = False
+    if password:
+        ok, _ = await verify_and_maybe_rehash_async(password, account.password_hash)
+    if not ok:
+        # 422, not 401: the session is fine, one field is wrong.
+        raise ValidationError("Your current password is not correct.")
+
+
 @router.post("/leave", status_code=status.HTTP_204_NO_CONTENT)
 async def leave_organisation(
     payload: LeaveRequest,
@@ -1503,36 +1553,13 @@ async def leave_organisation(
         raise AuthenticationError("Your account is no longer available.")
 
     account = await db.get(Account, session.account_id) if session.account_id else None
-    if account is not None and account.suliko_user_id is None:
-        ok = False
-        if payload.current_password:
-            ok, _ = await verify_and_maybe_rehash_async(
-                payload.current_password, account.password_hash
-            )
-        if not ok:
-            # 422, not 401: the session is fine, one field is wrong.
-            raise ValidationError("Your current password is not correct.")
+    await _require_own_password(account, payload.current_password)
 
-    if user.role is Role.OWNER:
-        others = (
-            await db.scalar(
-                select(func.count())
-                .select_from(User)
-                .where(User.is_active.is_(True), User.id != user.id)
-            )
-        ) or 0
-        other_owners = (
-            await db.scalar(
-                select(func.count())
-                .select_from(User)
-                .where(User.role == Role.OWNER, User.is_active.is_(True), User.id != user.id)
-            )
-        ) or 0
-        if others > 0 and other_owners == 0:
-            raise ConflictError(
-                "You are the only owner. Make someone else an owner under Users first, "
-                "then you can close your access."
-            )
+    if await would_strand_organisation(db, user):
+        raise ConflictError(
+            "You are the only owner. Make someone else an owner under Users first, "
+            "then you can close your access."
+        )
 
     user.is_active = False
     await db.flush()
@@ -1549,6 +1576,90 @@ async def leave_organisation(
         before={"is_active": True},
         after={"is_active": False},
     )
+
+
+class DeletionRequestPayload(BaseModel):
+    #: As for `LeaveRequest`: the password of an account that has one here.
+    current_password: str | None = Field(default=None, max_length=1024)
+
+
+class DeletionRequestResponse(BaseModel):
+    status: str
+    requested_at: datetime
+
+
+@router.post(
+    "/deletion-request",
+    response_model=DeletionRequestResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def request_account_deletion(
+    payload: DeletionRequestPayload,
+    request: Request,
+    session: CurrentSession,
+    db: Db,
+    background: BackgroundTasks,
+) -> DeletionRequestResponse:
+    """Ask for this person's account to be deleted.
+
+    A request, not the deletion (see `domain/account_deletion.py`): the team
+    reviews it and confirms it only if there are no obligations. The account is
+    closed at once. Every session in every organisation ends, and nobody can
+    sign in to it until the request is cancelled. Nothing else changes, so a
+    cancelled request leaves everything as it was.
+
+    Like closing your own access, it refuses the last owner of an organisation
+    that other people still use, naming each: hand ownership over first. The team
+    and the person are told by email, after the response.
+    """
+    if session.impersonated_by_user_id is not None:
+        raise ValidationError(
+            "You cannot ask for an account to be deleted while acting as someone else."
+        )
+
+    account = await db.get(Account, session.account_id) if session.account_id else None
+    if account is None:
+        raise AuthenticationError("Your account is no longer available.")
+    await _require_own_password(account, payload.current_password)
+
+    stranded = await organisations_left_without_an_owner(db, account.id)
+    if stranded:
+        raise ConflictError(
+            f"You are the only owner of {', '.join(stranded)}, which other people still use. "
+            "Make someone else an owner there first, then ask again.",
+            organisations=stranded,
+        )
+
+    deletion = await file_request(db, account)
+    await revoke_account_sessions(db, account.id)
+
+    from suliko.core.audit import record
+
+    await record(
+        db,
+        session,
+        action="account.deletion_requested",
+        entity_type="account",
+        entity_id=account.id,
+        after={"status": deletion.status.value, "request_id": deletion.id},
+        ip=get_client_ip(request),
+    )
+
+    # After the response, which is after the commit: nobody is told about a
+    # request a rolled-back transaction never filed. `mail.send` never raises.
+    subject, body = team_email(
+        account,
+        deletion,
+        organisation=session.tenant_name,
+        organisation_slug=session.tenant_slug,
+    )
+    background.add_task(mail.send, get_settings().support_email, subject, body)
+    if account.email:
+        subject, body = person_email(account)
+        background.add_task(mail.send, account.email, subject, body)
+
+    log.info("account_deletion_requested", account_id=account.id, request_id=deletion.id)
+    return DeletionRequestResponse(status=deletion.status.value, requested_at=deletion.created_at)
 
 
 # ── Invitations ─────────────────────────────────────────────────────────────

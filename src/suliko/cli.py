@@ -10,6 +10,8 @@
     python -m suliko.cli link-suliko-account --email me@example.com --suliko-login 599123456
     python -m suliko.cli check
     python -m suliko.cli purge-files        # daily: reclaim removed order files
+    python -m suliko.cli deletion-requests  # accounts closed by a request to delete them
+    python -m suliko.cli cancel-deletion-request --id 7
 
 The FIRST superuser is created here. There is no sign-up path, no "first user
 becomes admin" rule, and no way for a tenant's own roles to escalate into it.
@@ -47,7 +49,8 @@ from suliko.db.session import (
     session_scope,
 )
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
-from suliko.domain.accounts import UNUSABLE_PASSWORD_HASH, find_account, normalise_email
+from suliko.domain.account_deletion import open_requests, reject_request
+from suliko.domain.accounts import UNUSABLE_PASSWORD_HASH, find_account, login_name, normalise_email
 from suliko.domain.reference_seed import seed_reference_data
 from suliko.domain.suliko_import import import_users, link_by_hand
 from suliko.integrations.object_storage import (
@@ -399,6 +402,52 @@ async def link_suliko_account(email: str, suliko_login: str) -> None:
     finally:
         await close_suliko_backend()
     ok(message)
+
+
+# ── Account deletion requests ───────────────────────────────────────────────
+
+
+async def deletion_requests() -> None:
+    """List the requests that are keeping an account closed, oldest first."""
+    async with get_sessionmaker()() as db:
+        pending = await open_requests(db)
+    if not pending:
+        say("No account is closed by a deletion request.")
+        return
+    heading("Accounts closed by a deletion request")
+    for item in pending:
+        name = item.account.full_name or login_name(item.account)
+        filed = item.request.created_at.strftime("%Y-%m-%d %H:%M")
+        say(
+            f"  {item.request.id:>5}  {item.request.status.value:<9}  {filed}  "
+            f"{name} <{login_name(item.account)}>"
+        )
+    say("\n  To let one back in: cancel-deletion-request --id <number>")
+
+
+async def cancel_deletion_request(request_id: int) -> None:
+    """Cancel a request, because the person wrote to say so or the review said no.
+
+    Nothing is deleted. The account can sign in again, with every membership as
+    it was.
+    """
+    from suliko.core.audit import record
+
+    async with get_sessionmaker()() as db:
+        try:
+            request = await reject_request(db, request_id)
+        except ValidationError as exc:
+            raise SystemExit(exc.detail) from exc
+        await record(
+            db,
+            None,
+            action="account.deletion_cancelled",
+            entity_type="account",
+            entity_id=request.account_id,
+            after={"status": request.status.value, "request_id": request.id},
+        )
+        await db.commit()
+    ok(f"Request {request_id} is cancelled. The account can sign in again.")
 
 
 # ── Reference data ──────────────────────────────────────────────────────────
@@ -784,6 +833,14 @@ def main() -> None:
     p.add_argument("--email", required=True, help="the existing Office account's email")
     p.add_argument("--suliko-login", required=True, help="their suliko.ge email or phone number")
 
+    sub.add_parser("deletion-requests", help="list the accounts closed by a deletion request")
+
+    p = sub.add_parser(
+        "cancel-deletion-request",
+        help="cancel a deletion request: the account can sign in again, nothing is deleted",
+    )
+    p.add_argument("--id", type=int, required=True, help="the request's number")
+
     args = parser.parse_args()
 
     async def run() -> int:
@@ -811,6 +868,10 @@ def main() -> None:
                     await import_suliko_users(args.dry_run)
                 case "link-suliko-account":
                     await link_suliko_account(args.email, args.suliko_login)
+                case "deletion-requests":
+                    await deletion_requests()
+                case "cancel-deletion-request":
+                    await cancel_deletion_request(args.id)
             return 0
         finally:
             await dispose_engine()

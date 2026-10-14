@@ -106,6 +106,8 @@ LATER_REVISION_TABLES = frozenset(
         # 0025
         "import_batches",
         "import_batch_items",
+        # 0029
+        "account_deletion_requests",
     }
 )
 
