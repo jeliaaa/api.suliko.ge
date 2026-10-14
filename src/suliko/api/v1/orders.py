@@ -24,7 +24,7 @@ frontend hiding a column is presentation, not access control.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
@@ -87,12 +87,22 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 MAX_DOCUMENTS = 50
 NOTES_MAX = 5000
 IDENTIFIER_MAX = 100
+PLACE_MAX = 500
 
 OrdersReader = Annotated[AuthenticatedSession, Depends(require(Permission.ORDERS_READ))]
 OrdersWriter = Annotated[AuthenticatedSession, Depends(require(Permission.ORDERS_WRITE))]
 
 
 # ── Schemas ─────────────────────────────────────────────────────────────────
+
+
+def _has_place(item: Any) -> bool:
+    """Whether a line carries any of where and when it is interpreted."""
+    return bool(
+        (item.interpreting_place or "").strip()
+        or item.interpreting_date is not None
+        or item.interpreting_time is not None
+    )
 
 
 class OrderDocumentIn(BaseModel):
@@ -117,6 +127,11 @@ class OrderDocumentIn(BaseModel):
     is_notarized: bool | None = None
     translator_id: int | None = None
     notary_id: int | None = None
+    #: Interpreting only: where it takes place (an address as text) and when
+    #: (the day and the time of day at that place). All optional.
+    interpreting_place: str | None = Field(default=None, max_length=PLACE_MAX)
+    interpreting_date: date | None = None
+    interpreting_time: time | None = None
 
     #: Override the computed figures. Staff negotiate, translators have their
     #: own rates and notary offices round; the calculated figure is a starting
@@ -130,6 +145,8 @@ class OrderDocumentIn(BaseModel):
         if self.service_type is ServiceType.WRITTEN:
             if self.document_type_id is None:
                 raise ValueError("A written line needs a document type.")
+            if _has_place(self):
+                raise ValueError("Only an interpreting line has a place.")
         else:
             if (
                 self.copy_type is not CopyType.ORIGINAL
@@ -139,6 +156,7 @@ class OrderDocumentIn(BaseModel):
                 raise ValueError("An oral line has no copy type, notarisation or notary.")
             self.document_type_id = None
             self.character_count = None
+            self.interpreting_place = (self.interpreting_place or "").strip() or None
         return self
 
 
@@ -203,6 +221,11 @@ class OrderDocumentUpdate(BaseModel):
     is_notarized: bool | None = None
     translator_id: int | None = None
     notary_id: int | None = None
+    #: Interpreting only. Null (or blank, for the place) clears it. Not part of
+    #: what is priced, so changing it never re-prices the line.
+    interpreting_place: str | None = Field(default=None, max_length=PLACE_MAX)
+    interpreting_date: date | None = None
+    interpreting_time: time | None = None
     price: Money | None = None
     translator_cost: Money | None = None
     notary_cost: Money | None = None
@@ -248,6 +271,10 @@ class OrderDocumentOut(BaseModel):
     page_count: int
     #: Characters with spaces, when the line was priced by characters.
     character_count: int | None = None
+    #: Interpreting only: where and when. Null when not given.
+    interpreting_place: str | None = None
+    interpreting_date: date | None = None
+    interpreting_time: time | None = None
     copy_type: CopyType
     is_notarized: bool
     price: Decimal
@@ -721,6 +748,9 @@ async def _load_detail(
                 target_language=d.target_language,
                 page_count=d.page_count,
                 character_count=d.character_count,
+                interpreting_place=d.interpreting_place,
+                interpreting_date=d.interpreting_date,
+                interpreting_time=d.interpreting_time,
                 copy_type=d.copy_type,
                 is_notarized=d.is_notarized,
                 price=d.price,
@@ -796,6 +826,9 @@ async def _document_row(
         target_language=item.target_language.lower(),
         page_count=item.page_count,
         character_count=item.character_count if oral is False else None,
+        interpreting_place=item.interpreting_place if oral else None,
+        interpreting_date=item.interpreting_date if oral else None,
+        interpreting_time=item.interpreting_time if oral else None,
         copy_type=item.copy_type,
         is_notarized=breakdown.is_notarized,
         price=item.price_override if item.price_override is not None else breakdown.price,
@@ -1077,6 +1110,9 @@ async def update_order_document(
         "is_notarized",
         "document_type_id",
         "character_count",
+        "interpreting_place",
+        "interpreting_date",
+        "interpreting_time",
     }
     for key, value in changes.items():
         if value is None and key not in nullable:
@@ -1093,6 +1129,8 @@ async def update_order_document(
     for key in ("source_language", "target_language"):
         if key in changes:
             changes[key] = str(changes[key]).lower()
+    if "interpreting_place" in changes:
+        changes["interpreting_place"] = (changes["interpreting_place"] or "").strip() or None
 
     structural = {
         "document_type_id",
@@ -1108,6 +1146,13 @@ async def update_order_document(
         if key in structural or key in {"translator_id", "notary_id"}:
             setattr(document, key, value)
 
+    place = {"interpreting_place", "interpreting_date", "interpreting_time"}
+    if place & changes.keys():
+        if document.service_type is not ServiceType.ORAL:
+            raise ValidationError("Only an interpreting line has a place.")
+        for key in place & changes.keys():
+            setattr(document, key, changes[key])
+
     if structural & changes.keys():
         # What is being translated changed, so the old figures describe a
         # different job. Re-price, except what was sent explicitly.
@@ -1118,7 +1163,12 @@ async def update_order_document(
             document.copy_type = CopyType.ORIGINAL
             document.is_notarized = False
             changes.setdefault("is_notarized", False)
-        elif document.document_type_id is None:
+        else:
+            # Only interpreting has a place: a line made written loses it.
+            document.interpreting_place = None
+            document.interpreting_date = None
+            document.interpreting_time = None
+        if not oral and document.document_type_id is None:
             raise ValidationError("A written line needs a document type.")
         ctx = await load_pricing_context(
             db, session.plan, {document.document_type_id} if document.document_type_id else set()
