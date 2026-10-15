@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -2085,6 +2085,170 @@ async def test_the_same_person_cannot_be_invited_twice(
                 await users_api.invite_user(
                     payload, db, session, session, RateLimiter(None), UnconfiguredSulikoBackend()
                 )
+
+
+# ── Sending an invitation again ─────────────────────────────────────────────
+#
+# The link is shown to the inviter once and lasts a week, and a second
+# invitation for the same person is refused. `POST /users/{id}/invitation` is
+# the way out of a lost, expired or misdirected link.
+
+
+async def _invite_existing_account(
+    maker: async_sessionmaker[AsyncSession], backend: Any = None
+) -> Any:
+    from suliko.api.v1 import users as users_api
+
+    async with maker() as db:
+        db.add(
+            Account(
+                email="nino@example.com",
+                full_name="Nino",
+                password_hash="$their-own$",
+                last_login_at=datetime.now(UTC),
+            )
+        )
+        await db.commit()
+    payload = users_api.UserInvite(full_name="Nino", email="nino@example.com", role=Role.STAFF)
+    with tenant_scope(ACME):
+        async with maker() as db:
+            session = _admin_session(ACME)
+            result = await users_api.invite_user(
+                payload,
+                db,
+                session,
+                session,
+                RateLimiter(None),
+                backend or UnconfiguredSulikoBackend(),
+            )
+            await db.commit()
+    return result
+
+
+async def _resend(
+    maker: async_sessionmaker[AsyncSession], user_id: int, backend: Any = None
+) -> Any:
+    from suliko.api.v1 import users as users_api
+
+    with tenant_scope(ACME):
+        async with maker() as db:
+            session = _admin_session(ACME)
+            result = await users_api.resend_invitation(
+                user_id,
+                db,
+                session,
+                session,
+                RateLimiter(None),
+                backend or UnconfiguredSulikoBackend(),
+            )
+            await db.commit()
+    return result
+
+
+async def test_a_resend_gives_a_new_link_and_spends_the_old_one(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
+) -> None:
+    from urllib.parse import parse_qs, urlparse
+
+    from suliko.security import reset_tokens
+
+    first = await _invite_existing_account(maker)
+    second = await _resend(maker, first.user.id)
+
+    assert second.invite_link != first.invite_link
+    assert "/accept-invite?token=" in second.invite_link
+    assert [mail["to"] for mail in sent_mail] == ["nino@example.com", "nino@example.com"]
+    assert second.invite_link in sent_mail[-1]["body"]
+    assert second.invite_link in sent_mail[-1]["html"]
+    assert second.email_sent and second.user.invitation_pending
+
+    def token(link: str) -> str:
+        return parse_qs(urlparse(link).query)["token"][0]
+
+    async with maker() as db:
+        with tenant_scope(ACME):
+            assert (
+                await reset_tokens.consume(
+                    db, token(first.invite_link), purpose=reset_tokens.INVITATION
+                )
+                is None
+            )
+            assert (
+                await reset_tokens.consume(
+                    db, token(second.invite_link), purpose=reset_tokens.INVITATION
+                )
+                is not None
+            )
+
+
+async def test_a_resend_to_someone_who_has_joined_is_refused(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
+) -> None:
+    first = await _invite_existing_account(maker)
+    async with maker() as db:
+        with tenant_scope(ACME):
+            row = await db.get(User, first.user.id)
+            assert row is not None
+            row.invitation_pending = False
+            await db.commit()
+    sent_mail.clear()
+
+    with pytest.raises(ConflictError, match="already joined"):
+        await _resend(maker, first.user.id)
+    assert sent_mail == []
+
+
+async def test_a_resend_to_someone_who_accepted_but_never_registered_says_to_register(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
+) -> None:
+    """The other way an invitation stalls: they clicked accept, then registered
+    under a different sign-in (a phone number), so nothing ever matched."""
+    from suliko_fakes import FakeBackend
+
+    backend = FakeBackend([])
+    from suliko.api.v1 import users as users_api
+
+    payload = users_api.UserInvite(full_name="Tako", email="tako@example.com", role=Role.STAFF)
+    with tenant_scope(ACME):
+        async with maker() as db:
+            session = _admin_session(ACME)
+            first = await users_api.invite_user(
+                payload, db, session, session, RateLimiter(None), backend
+            )
+            await db.commit()
+        async with maker() as db:
+            row = await db.get(User, first.user.id)
+            assert row is not None
+            row.invitation_pending = False  # they accepted
+            await db.commit()
+    assert first.needs_suliko_registration
+
+    again = await _resend(maker, first.user.id, backend)
+
+    assert again.needs_suliko_registration
+    assert "/accept-invite?token=" in again.invite_link
+    assert registration_url() in sent_mail[-1]["body"]
+    assert "Google" in sent_mail[-1]["body"]
+
+
+async def test_a_resend_to_a_switched_off_account_is_refused(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
+) -> None:
+    first = await _invite_existing_account(maker)
+    async with maker() as db:
+        with tenant_scope(ACME):
+            row = await db.get(User, first.user.id)
+            assert row is not None
+            row.is_active = False
+            await db.commit()
+
+    with pytest.raises(ValidationError, match="switched off"):
+        await _resend(maker, first.user.id)
+
+
+async def test_a_resend_for_nobody_is_not_found(maker: async_sessionmaker[AsyncSession]) -> None:
+    with pytest.raises(NotFoundError):
+        await _resend(maker, 9999)
 
 
 # ── Inviting by phone number ────────────────────────────────────────────────

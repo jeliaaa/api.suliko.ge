@@ -855,6 +855,35 @@ async def invite_user(
         },
     )
 
+    return await _deliver_invitation(
+        db,
+        session,
+        limiter,
+        row,
+        tenant_key=tenant_key,
+        existing_account=existing_account,
+        needs_registration=needs_registration,
+        suliko_account=suliko_account,
+    )
+
+
+async def _deliver_invitation(
+    db: Db,
+    session: CurrentSession,
+    limiter: RateLimiter,
+    row: User,
+    *,
+    tenant_key: str,
+    existing_account: bool,
+    needs_registration: bool,
+    suliko_account: SulikoAccountOut,
+) -> InviteOut:
+    """Mint the link, mail it, and say what happened.
+
+    The part an invitation and a resend have in common. Issuing a link spends
+    the one before it (`reset_tokens.issue`), so a resend is also how a link
+    that was lost, or leaked, is taken out of use.
+    """
     settings = get_settings()
     ttl_seconds = settings.invite_link_ttl_hours * 3600
     base = f"{settings.app_url.rstrip('/')}/{session.tenant_locale}"
@@ -867,6 +896,7 @@ async def invite_user(
         token = await reset_tokens.issue(db, row, ttl_seconds=ttl_seconds)
         invite_link = f"{base}/reset-password?token={quote(token, safe='')}&invite=1"
     await limiter.record_invite(tenant_key)
+    member_email = row.email
     email_sent = False
     if member_email is not None:
         message = _invite_email(
@@ -892,6 +922,92 @@ async def invite_user(
         invited_by_phone=member_email is None,
         invite_expires_at=datetime.now(UTC) + timedelta(seconds=ttl_seconds),
         email_sent=email_sent,
+        suliko_account=suliko_account,
+    )
+
+
+@router.post("/{user_id}/invitation", response_model=InviteOut)
+async def resend_invitation(
+    user_id: int,
+    db: Db,
+    session: CurrentSession,
+    _: Annotated[object, Depends(require(Permission.USERS_MANAGE))],
+    limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
+    backend: Annotated[SulikoBackend, Depends(get_suliko_backend)],
+) -> InviteOut:
+    """A fresh invitation link for someone who has not got in yet.
+
+    The link an invitation carries is shown to the inviter once and lasts seven
+    days, and the invite route refuses a second invitation for the same person.
+    So a lost email, a missed week or a link that went to the wrong place used
+    to end with deleting the person and starting again. This issues a new link
+    instead, spends the old one, and mails it again.
+
+    For anyone whose invitation is still open, and for someone who accepted but
+    has not yet registered on suliko.ge, which is the other way an invitation
+    stalls. Not for someone who has joined: there is nothing to send them.
+    """
+    row = await db.get(User, user_id)
+    if row is None:
+        raise NotFoundError("User not found.")
+    _guard_target(session, row)
+    if not row.is_active:
+        raise ValidationError("This account is switched off. Switch it on first.")
+
+    account = await db.get(Account, row.account_id) if row.account_id else None
+    if account is None:
+        raise ValidationError("This person has no account to invite.")
+
+    # Accepted, and nobody has registered under this address on suliko.ge yet.
+    needs_registration = (
+        backend.enabled
+        and account.suliko_user_id is None
+        and account.password_hash == UNUSABLE_PASSWORD_HASH
+    )
+    if not (row.invitation_pending or needs_registration):
+        raise ConflictError("This person has already joined. They can sign in as usual.")
+    # With suliko.ge connected, everyone else is an existing account (linked
+    # there, or an Office-only login) and gets the accept link. Without it the
+    # invitation made a placeholder nobody has used: it gets the set-password link.
+    existing_account = not needs_registration and (
+        account.suliko_user_id is not None
+        or account.last_login_at is not None
+        or account.email_verified_at is not None
+    )
+
+    tenant_key = f"invite:tenant:{session.tenant_id}"
+    if retry := await limiter.check_invite(tenant_key):
+        raise RateLimitedError(
+            "This organisation has sent too many invitations today. Try again tomorrow.",
+            retry_after=retry,
+        )
+
+    suliko_account = (await _invite_status_for(db, [row.id])).get(row.id)
+    if suliko_account is None:
+        # Invited by phone there is no match record: suliko.ge found them by the number.
+        suliko_account = SulikoAccountOut(
+            status="linked" if row.email is None else "pending",
+            matched_display_name=(account.full_name or None) if row.email is None else None,
+        )
+
+    from suliko.core.audit import record
+
+    await record(
+        db,
+        session,
+        action="user.invitation_resent",
+        entity_type="user",
+        entity_id=row.id,
+        after={"existing_account": existing_account, "needs_registration": needs_registration},
+    )
+    return await _deliver_invitation(
+        db,
+        session,
+        limiter,
+        row,
+        tenant_key=tenant_key,
+        existing_account=existing_account,
+        needs_registration=needs_registration,
         suliko_account=suliko_account,
     )
 
