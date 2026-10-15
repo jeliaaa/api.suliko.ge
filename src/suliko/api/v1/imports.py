@@ -648,11 +648,13 @@ async def commit_combined(
     if not judged.count("ok"):
         raise ValidationError("Nothing to import: every row is a duplicate or has an error.")
 
+    # What is counted as created is records, not rows: the orders bring people with them.
+    creates = _creates(judged)
     batch = ImportBatch(
         kind="combined",
         file_name=safe_file_name(file.filename)[:255],
         rows_total=judged.total,
-        created_count=judged.count("ok"),
+        created_count=creates.clients + creates.translators + creates.notaries + creates.orders,
         duplicate_count=judged.count("duplicate"),
         error_count=judged.count("error"),
         created_by_user_id=session.user_id,

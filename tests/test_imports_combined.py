@@ -489,7 +489,7 @@ async def test_preview_counts_each_sheet_and_what_would_be_created_and_saves_not
 @pytest.mark.asyncio
 async def test_commit_saves_the_people_before_the_orders_and_links_them(db: AsyncSession) -> None:
     batch = await commit(db, SAMPLE_1)
-    assert (batch.kind, batch.rows_total, batch.created_count) == ("combined", 41, 35)
+    assert (batch.kind, batch.rows_total, batch.created_count) == ("combined", 41, 36)
     assert (batch.duplicate_count, batch.error_count) == (4, 2)
     assert (await number(db, Client), await number(db, Translator)) == (11, 7)
     assert (await number(db, Notary), await number(db, Order)) == (5, 13)
@@ -519,7 +519,7 @@ async def test_a_flat_sheet_creates_its_clients_translators_and_notaries_and_lin
     batch = await commit(db, SAMPLE_2)
     assert (batch.rows_total, batch.created_count, batch.duplicate_count, batch.error_count) == (
         20,
-        18,
+        34,
         1,
         1,
     )
