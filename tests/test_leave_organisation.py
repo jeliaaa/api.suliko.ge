@@ -86,9 +86,11 @@ async def make_db(users: list[tuple[int, Role, bool]]) -> tuple[Any, AsyncSessio
                 locale="ka",
             )
         )
-        db.add(Account(
-            id=1, email="u1@acme.ge", full_name="User 1", password_hash=hash_password(PASSWORD)
-        ))
+        db.add(
+            Account(
+                id=1, email="u1@acme.ge", full_name="User 1", password_hash=hash_password(PASSWORD)
+            )
+        )
         await db.flush()
         for user_id, role, active in users:
             db.add(

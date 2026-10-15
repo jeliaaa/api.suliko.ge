@@ -58,6 +58,7 @@ from suliko.core.mail_layout import (
     compose,
     fine,
     p,
+    span,
 )
 from suliko.core.ratelimit import RateLimiter, get_rate_limiter
 from suliko.domain.accounts import (
@@ -555,12 +556,12 @@ def _suliko_account_note(*, linked: bool, matched_display_name: str | None) -> C
     if linked:
         matched = f" ({matched_display_name})" if matched_display_name else ""
         return callout(
-            f"This address is already registered on suliko.ge{matched}, "
-            "so there is nothing more to do there."
+            f"ეს მისამართი suliko.ge-ზე უკვე რეგისტრირებულია{matched}, "
+            "ამიტომ იქ დამატებით არაფერი გჭირდებათ."
         )
     return callout(
-        "This invitation also expects a suliko.ge account under this exact "
-        "email address. If you don't have one yet, register here: ",
+        "ამ მოწვევას suliko.ge-ზე ზუსტად ამ ელფოსტით ანგარიშიც სჭირდება. "
+        "თუ ჯერ არ გაქვთ, დარეგისტრირდით აქ: ",
         Link(registration_url(), registration_url()),
     )
 
@@ -580,14 +581,14 @@ def _invite_email(
     address = user.email or ""
     facts = Facts(
         [
-            ("Organisation", tenant_name),
-            ("Invited by", inviter),
-            ("Invitation sent to", address),
+            ("ორგანიზაცია", tenant_name),
+            ("მომწვევი", inviter),
+            ("მოწვევის მისამართი", address),
         ]
     )
     blocks: list[Block] = [
-        p(f"Hello {user.full_name},"),
-        p(Bold(inviter), " has invited you to ", Bold(tenant_name), " on Suliko Office."),
+        p(f"გამარჯობა, {user.full_name}!"),
+        p(Bold(inviter), " გიწვევთ ორგანიზაციაში ", Bold(tenant_name), " (Suliko Office)."),
         facts,
     ]
     if needs_registration:
@@ -599,27 +600,30 @@ def _invite_email(
         # would be a different person to this invitation, so the email says so
         # rather than asking for something the page cannot do.
         blocks += [
-            p("To join, do two things in this order."),
+            p("შესაერთებლად ორი ნაბიჯია, ამ თანმიმდევრობით."),
             Steps(
                 [
                     Step(
                         [
-                            "Register on suliko.ge with Google, using exactly this email address: ",
+                            "დარეგისტრირდით suliko.ge-ზე Google-ით, ზუსტად ამ ელფოსტით: ",
                             Bold(address),
                         ],
-                        Button("Register on suliko.ge", registration_url(), kind="secondary"),
+                        Button("რეგისტრაცია suliko.ge-ზე", registration_url(), kind="secondary"),
                     ),
                     Step(
-                        [f"Then come back and accept the invitation to {tenant_name}."],
-                        Button("Accept invitation", invite_link),
+                        [f"შემდეგ დაბრუნდით და დაადასტურეთ მოწვევა: {tenant_name}."],
+                        Button("მოწვევის დადასტურება", invite_link),
                     ),
                 ]
             ),
-            p(f"After that, open Suliko Office, continue with suliko.ge and choose {tenant_name}."),
+            p(
+                "ამის შემდეგ გახსენით Suliko Office, გააგრძელეთ suliko.ge-ით "
+                f"და აირჩიეთ {tenant_name}."
+            ),
             callout(
-                "Registering with a phone number instead will not connect to this invitation. "
-                f"If you prefer a phone number, register with it first, then ask {inviter} to "
-                "invite that number.",
+                "ტელეფონის ნომრით რეგისტრაცია ამ მოწვევას ვერ დაუკავშირდება. თუ ნომრით "
+                "რეგისტრაციას ამჯობინებთ, ჯერ დარეგისტრირდით ნომრით და შემდეგ სთხოვეთ "
+                f"მომწვევს ({inviter}), რომ ეს ნომერი მოგიწვიოთ.",
                 tone="warning",
             ),
         ]
@@ -628,17 +632,17 @@ def _invite_email(
     else:
         if existing_account:
             blocks += [
-                p(f"Accept the invitation to join {tenant_name}."),
-                Button("Accept invitation", invite_link),
-                p(f"Then sign in to Suliko Office as usual and choose {tenant_name}."),
+                p(f"დაადასტურეთ მოწვევა: {tenant_name}."),
+                Button("მოწვევის დადასტურება", invite_link),
+                p(f"შემდეგ ჩვეულებრივ შედით Suliko Office-ში და აირჩიეთ {tenant_name}."),
             ]
         else:
             blocks += [
-                p("Choose a password to join."),
-                Button("Choose your password", invite_link),
+                p("შესაერთებლად აირჩიეთ პაროლი."),
+                Button("პაროლის არჩევა", invite_link),
                 p(
-                    f"After that, sign in with {address} and that password, "
-                    f"and choose {tenant_name}."
+                    f"ამის შემდეგ შედით ამ მისამართით ({address}) და ახალი პაროლით, "
+                    f"და აირჩიეთ {tenant_name}."
                 ),
             ]
         note = _suliko_account_note(
@@ -648,18 +652,18 @@ def _invite_email(
     if note is not None:
         blocks.append(note)
     blocks += [
-        fine(f"The link works once and expires in {valid_days} days."),
+        fine(f"ბმული მუშაობს ერთხელ და მოქმედია {span(days=valid_days)} განმავლობაში."),
         fine(
-            f"If you were not expecting this, tell {tenant_name} and ignore the "
-            "message. Nothing happens without the link."
+            f"თუ ამას არ ელოდით, შეატყობინეთ ორგანიზაციას ({tenant_name}) და "
+            "უგულებელყავით წერილი. ბმულის გარეშე არაფერი ხდება."
         ),
     ]
     return compose(
-        subject=f"You have been invited to {tenant_name} on Suliko",
-        heading=f"Join {tenant_name}",
-        preheader=f"{inviter} invited you to {tenant_name} on Suliko Office.",
+        subject=f"მოწვევა ორგანიზაციაში {tenant_name}",
+        heading=f"შეუერთდით: {tenant_name}",
+        preheader=f"{inviter} გიწვევთ ორგანიზაციაში {tenant_name} (Suliko Office).",
         blocks=blocks,
-        reason=f"You received this because {tenant_name} invited this address.",
+        reason=f"ამ წერილს იღებთ, რადგან ორგანიზაციამ ({tenant_name}) ეს მისამართი მოიწვია.",
     )
 
 

@@ -471,46 +471,43 @@ def _translator_invite_email(
     hatch — so someone who already has an account under a different-looking
     address still finds their way in.
     """
-    subject = f"{tenant_name} has invited you on Suliko"
-    reason = f"You received this because {tenant_name} invited this address."
+    subject = f"მოწვევა Suliko-ზე: {tenant_name}"
+    reason = f"ამ წერილს იღებთ, რადგან ორგანიზაციამ ({tenant_name}) ეს მისამართი მოიწვია."
     if linked:
         matched = f" ({matched_display_name})" if matched_display_name else ""
         return compose(
             subject=subject,
-            heading=f"{tenant_name} is waiting for you",
-            preheader="Open the Orders tab on suliko.ge. The bureau is already there.",
+            heading=f"{tenant_name} გელოდებათ",
+            preheader="გახსენით შეკვეთების ჩანართი suliko.ge-ზე. ბიურო უკვე იქ არის.",
             blocks=[
-                p(f"Hello {full_name},"),
+                p(f"გამარჯობა, {full_name}!"),
                 p(
                     Bold(tenant_name),
-                    " has invited you to translate for them on Suliko, and it looks "
-                    f"like you already have a suliko.ge account under this address{matched}.",
+                    " გიწვევთ, რომ მათთვის თარგმნოთ Suliko-ზე, და როგორც ჩანს, ამ "
+                    f"მისამართით suliko.ge-ზე ანგარიში უკვე გაქვთ{matched}.",
                 ),
-                p(
-                    "Sign in to suliko.ge and open the Orders tab. "
-                    "The bureau is already waiting for you there."
-                ),
-                Button("Open suliko.ge", get_settings().suliko_site_url),
+                p("შედით suliko.ge-ზე და გახსენით შეკვეთების ჩანართი. ბიურო უკვე იქ გელოდებათ."),
+                Button("suliko.ge-ის გახსნა", get_settings().suliko_site_url),
             ],
             reason=reason,
         )
 
     return compose(
         subject=subject,
-        heading=f"Translate for {tenant_name}",
-        preheader="You need a suliko.ge account with this exact email address.",
+        heading=f"თარგმნეთ ორგანიზაციისთვის: {tenant_name}",
+        preheader="გჭირდებათ suliko.ge-ის ანგარიში ზუსტად ამ ელფოსტით.",
         blocks=[
-            p(f"Hello {full_name},"),
-            p(Bold(tenant_name), " has invited you to translate for them on Suliko."),
-            p("To accept, you need a suliko.ge account using this email address:"),
-            Facts([("Email address", email)]),
-            p("If you don't have one yet, register with it here."),
-            Button("Register on suliko.ge", registration_url()),
+            p(f"გამარჯობა, {full_name}!"),
+            p(Bold(tenant_name), " გიწვევთ, რომ მათთვის თარგმნოთ Suliko-ზე."),
+            p("მოწვევის მისაღებად გჭირდებათ suliko.ge-ის ანგარიში ამ ელფოსტით:"),
+            Facts([("ელფოსტა", email)]),
+            p("თუ ჯერ არ გაქვთ, დარეგისტრირდით აქ."),
+            Button("რეგისტრაცია suliko.ge-ზე", registration_url()),
             callout(
-                "If you already have a suliko.ge account, make sure it uses this exact "
-                "email address, or the matching phone number. The moment it does, "
-                f"{tenant_name} will appear in your Orders tab automatically, with "
-                "nothing further for you to do."
+                "თუ suliko.ge-ზე ანგარიში უკვე გაქვთ, დარწმუნდით, რომ ის ზუსტად ამ "
+                "ელფოსტას ან შესაბამის ტელეფონის ნომერს იყენებს. როგორც კი ასე იქნება, "
+                f"{tenant_name} ავტომატურად გამოჩნდება თქვენს შეკვეთების ჩანართში, "
+                "დამატებითი მოქმედების გარეშე."
             ),
         ],
         reason=reason,

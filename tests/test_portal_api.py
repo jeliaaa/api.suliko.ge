@@ -1537,7 +1537,7 @@ async def test_invite_translator_links_immediately_on_a_matching_account(
 
     assert result.invite_status == "linked"
     assert result.matched_display_name == "Giorgi Kapanadze"
-    assert "Orders tab" in sent_mail[-1]["body"]
+    assert "შეკვეთების ჩანართი" in sent_mail[-1]["body"]
 
     me = (await client.get(f"{API}/portal/me", headers=as_user(GIORGI))).json()
     assert me["organizations"] == [{"slug": "acme", "name": "Acme Translations"}]
@@ -1978,7 +1978,7 @@ async def test_staff_invite_records_the_suliko_account_match(
     assert result.suliko_account.matched_display_name == "Giorgi Kapanadze"
     assert result.user.suliko_account is not None
     assert result.user.suliko_account.status == "linked"
-    assert "already registered on suliko.ge" in sent_mail[-1]["body"]
+    assert "suliko.ge-ზე უკვე რეგისტრირებულია" in sent_mail[-1]["body"]
 
     # The Users list carries the same status, batched the way overrides are.
     with tenant_scope(ACME):
@@ -2561,7 +2561,7 @@ async def test_picking_someone_who_signs_in_with_an_address_emails_that_address(
 
     assert result.invite_status == "linked" and result.email_sent and not result.no_email
     assert [m["to"] for m in sent_mail] == ["gela.b@suliko.ge"]
-    assert "already have a suliko.ge account" in sent_mail[0]["body"]
+    assert "suliko.ge-ზე ანგარიში უკვე გაქვთ" in sent_mail[0]["body"]
 
 
 async def test_an_address_the_bureau_typed_is_where_the_email_goes(

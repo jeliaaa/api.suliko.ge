@@ -223,8 +223,7 @@ async def test_consuming_the_wrong_purpose_is_refused(db: AsyncSession) -> None:
 
     assert await reset_tokens.consume(db, verify_token) is None
     assert (
-        await reset_tokens.consume(db, reset_token, purpose=reset_tokens.EMAIL_VERIFICATION)
-        is None
+        await reset_tokens.consume(db, reset_token, purpose=reset_tokens.EMAIL_VERIFICATION) is None
     )
 
     # Each still works against its own purpose.
@@ -265,6 +264,5 @@ async def test_a_second_link_of_the_same_purpose_still_kills_the_first(
 
     assert await reset_tokens.consume(db, first, purpose=reset_tokens.EMAIL_VERIFICATION) is None
     assert (
-        await reset_tokens.consume(db, second, purpose=reset_tokens.EMAIL_VERIFICATION)
-        is not None
+        await reset_tokens.consume(db, second, purpose=reset_tokens.EMAIL_VERIFICATION) is not None
     )
