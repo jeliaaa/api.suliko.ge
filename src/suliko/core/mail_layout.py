@@ -307,10 +307,15 @@ def _html_block(block: Block, *, rule: bool = False) -> str:
             '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
             'class="line" style="margin:0 0 10px 0;border:1px solid '
             f'{_LINE};border-radius:12px;border-collapse:separate;"><tr>'
+            # The number sits in a table cell with a bgcolor attribute: Gmail
+            # drops the background of a sized div, and a white digit on white
+            # is no digit at all.
             f'<td valign="top" width="52" style="padding:16px 0 16px 16px;">'
-            f'<div style="width:28px;height:28px;border-radius:14px;background:{_ACCENT};'
+            '<table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>'
+            f'<td width="28" height="28" align="center" valign="middle" bgcolor="{_ACCENT}" '
+            f'style="width:28px;height:28px;background:{_ACCENT};border-radius:14px;'
             f"color:#ffffff;font-family:{_FONT};font-size:14px;font-weight:700;"
-            f'line-height:28px;text-align:center;">{number}</div></td>'
+            f'line-height:28px;text-align:center;">{number}</td></tr></table></td>'
             f'<td class="ink" valign="top" style="padding:16px 16px 16px 8px;font-size:15px;'
             f'line-height:1.55;color:{_INK};">{_inline(step.parts)}{action}</td></tr></table>'
         )

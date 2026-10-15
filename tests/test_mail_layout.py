@@ -116,6 +116,17 @@ def test_the_html_can_go_dark_and_narrow() -> None:
     assert 'name="color-scheme"' in html
 
 
+def test_a_step_number_sits_in_a_cell_with_a_background_attribute() -> None:
+    """Gmail drops the background of a sized div, which left a white digit on
+    white (seen in a real inbox, 2026-10-15). A table cell with `bgcolor` stays."""
+    html = _sample().html
+
+    for number in ("1", "2"):
+        assert 'valign="middle" bgcolor="#3b59f3"' in html
+        assert f'text-align:center;">{number}</td>' in html
+    assert '<div style="width:28px' not in html
+
+
 def test_the_html_has_no_images() -> None:
     """Blocked by default in most clients, and a blocked image leaves a hole."""
     assert "<img" not in _sample().html
