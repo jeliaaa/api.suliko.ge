@@ -15,6 +15,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     false,
+    text,
 )
 from sqlalchemy.dialects.postgresql import INET
 from sqlalchemy.orm import Mapped, mapped_column
@@ -76,6 +77,68 @@ class Account(Base, IdMixin, TimestampMixin):
         DateTime(timezone=True), default=None
     )
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class DeletionStatus(enum.StrEnum):
+    """Where a request to delete an account stands."""
+
+    #: Filed. The person's access is closed; nobody has decided yet.
+    REQUESTED = "requested"
+    #: Reviewed and confirmed: no obligations stand in the way.
+    APPROVED = "approved"
+    #: Refused, or withdrawn by the person: the account is open again.
+    REJECTED = "rejected"
+    #: The person's data has been deleted or anonymised.
+    DONE = "done"
+
+
+#: The statuses that keep an account closed. A rejected request frees it.
+OPEN_DELETION_STATUSES: tuple[DeletionStatus, ...] = (
+    DeletionStatus.REQUESTED,
+    DeletionStatus.APPROVED,
+)
+
+
+class AccountDeletionRequest(Base, IdMixin, TimestampMixin):
+    """A person's request to have their account deleted.
+
+    Platform-level like ``accounts``: the request is about the person, not about
+    one organisation they belong to, and the team that reviews it looks across
+    all of them. ``created_at`` is when it was filed.
+
+    While a request is open (`OPEN_DELETION_STATUSES`) the account cannot sign
+    in anywhere — see `domain/account_deletion.py`. Nothing else is touched:
+    memberships keep their own state, so a rejected request leaves everything as
+    it was.
+    """
+
+    __tablename__ = "account_deletion_requests"
+    __table_args__ = (
+        # One open request per person. The handler checks first; this is what
+        # holds when two tabs press the button at the same moment.
+        Index(
+            "uq_account_deletion_requests_open",
+            "account_id",
+            unique=True,
+            postgresql_where=text("status IN ('requested', 'approved')"),
+            sqlite_where=text("status IN ('requested', 'approved')"),
+        ),
+    )
+
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    status: Mapped[DeletionStatus] = mapped_column(
+        Enum(
+            DeletionStatus,
+            name="deletion_status",
+            values_callable=enum_values,
+            native_enum=False,
+            length=20,
+        ),
+        default=DeletionStatus.REQUESTED,
+        nullable=False,
+    )
 
 
 class User(Base, IdMixin, TenantScoped, TimestampMixin):

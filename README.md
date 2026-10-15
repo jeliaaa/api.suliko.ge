@@ -79,6 +79,22 @@ the bytes after `FILE_RETENTION_DAYS` (30). Until then support can restore it by
 (no RLS): the portal must find a translator's bureaus before any tenant is bound. Everything read
 *inside* a bureau still goes through `tenant_scope`. See `models/portal.py`.
 
+## Deleting an account
+
+"Delete account" on the Account page files a request (`POST /auth/deletion-request`, table
+`account_deletion_requests`). It deletes nothing. The account is closed at once: every session
+ends, and while the request is open (`requested` or `approved`) nobody can sign in to it, by
+password, through suliko.ge, or from the chooser (`domain/account_deletion.py`). Memberships are
+left as they were, so cancelling puts everything back. The team is emailed at `SUPPORT_EMAIL`
+(default `info@suliko.ge`) and the person gets a confirmation telling them to write there to cancel.
+
+To cancel one, because the person wrote to say so:
+
+    python -m suliko.cli deletion-requests              # who is waiting
+    python -m suliko.cli cancel-deletion-request --id 7
+
+Reviewing requests, approving them and the deletion itself are not built yet.
+
 ## Stack
 
 Python 3.13 · FastAPI · Pydantic v2 · SQLAlchemy 2.0 (async) · asyncpg · Alembic ·

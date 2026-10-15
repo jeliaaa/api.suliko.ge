@@ -71,6 +71,8 @@ LATER_REVISIONS = (
     "0027_translator_pairs_both_ways.py",
     # Three columns on order_documents — see test_migration_0028.py.
     "0028_interpreting_place.py",
+    # account_deletion_requests, a platform table — see test_migration_0029.py.
+    "0029_account_deletion_requests.py",
 )
 
 

@@ -33,6 +33,7 @@ from suliko.models.reference import DocumentType, Language, LanguagePairPrice, T
 from suliko.models.tenant import Tenant, TenantStatus
 from suliko.models.user import (
     Account,
+    AccountDeletionRequest,
     MfaMethod,
     Role,
     User,
@@ -44,6 +45,8 @@ from suliko.security.passwords import verify_password
 TABLES = [
     Tenant.__table__,
     Account.__table__,
+    # Read by every way of starting a session: see `ensure_not_pending_deletion`.
+    AccountDeletionRequest.__table__,
     User.__table__,
     TenantSettings.__table__,
     Language.__table__,

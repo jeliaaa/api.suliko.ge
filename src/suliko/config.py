@@ -258,6 +258,11 @@ class Settings(BaseSettings):
     #: Sending happens in a worker thread; this bounds how long it can block one.
     smtp_timeout_seconds: int = 20
 
+    #: Where people write to us, and where we are told things that need a human:
+    #: a request to delete an account lands here, and the person is told to write
+    #: here to cancel it.
+    support_email: str = "info@suliko.ge"
+
     #: Public base URL of the frontend. Password-reset links are built from it.
     #:
     #: NEVER derived from a request header. `Host` is attacker-controlled, and

@@ -69,7 +69,10 @@ from suliko.models.reference import (
 from suliko.models.tenant import Tenant, TenantStatus
 from suliko.models.translation import DocumentTranslation, TranslationStatus
 from suliko.models.user import (
+    OPEN_DELETION_STATUSES,
     Account,
+    AccountDeletionRequest,
+    DeletionStatus,
     LoginAttempt,
     MfaMethod,
     MfaRecoveryCode,
@@ -81,7 +84,9 @@ from suliko.models.user import (
 )
 
 __all__ = [
+    "OPEN_DELETION_STATUSES",
     "Account",
+    "AccountDeletionRequest",
     "ActorType",
     "AuditLog",
     "Base",
@@ -94,6 +99,7 @@ __all__ = [
     "CompanyBankAccount",
     "CopyType",
     "CustomOption",
+    "DeletionStatus",
     "DocumentTranslation",
     "DocumentType",
     "Expense",
