@@ -2258,6 +2258,329 @@ async def test_a_resend_for_nobody_is_not_found(maker: async_sessionmaker[AsyncS
         await _resend(maker, 9999)
 
 
+# ── Moving a stalled invitation to the right sign-in ────────────────────────
+#
+# An invitation made for an address stalls when the person registers on
+# suliko.ge with a phone number. `attach_suliko_account` moves the membership
+# to the account of the number the manager confirms, instead of deleting the
+# person and inviting again.
+
+TAKO_PHONE = "599123456"
+
+
+async def _stalled(
+    maker: async_sessionmaker[AsyncSession], backend: Any, *, email: str = "tako@example.com"
+) -> tuple[int, int]:
+    """An invitation to an address that was accepted and went nowhere.
+
+    Returns the member's id and the id of the placeholder account the
+    invitation made for the address.
+    """
+    from suliko.api.v1 import users as users_api
+
+    payload = users_api.UserInvite(full_name="Tako Petashvili", email=email, role=Role.STAFF)
+    session = _admin_session(ACME)
+    with tenant_scope(ACME):
+        async with maker() as db:
+            invited = await users_api.invite_user(
+                payload, db, session, session, RateLimiter(None), backend
+            )
+            row = await db.get(User, invited.user.id)
+            assert row is not None and row.account_id is not None
+            row.invitation_pending = False  # they accepted
+            placeholder = row.account_id
+            await db.commit()
+    assert invited.needs_suliko_registration
+    return invited.user.id, placeholder
+
+
+async def _attach(
+    maker: async_sessionmaker[AsyncSession],
+    backend: Any,
+    user_id: int,
+    login: str,
+    session: AuthenticatedSession | None = None,
+) -> Any:
+    from suliko.api.v1 import users as users_api
+
+    session = session or _admin_session(ACME)
+    with tenant_scope(ACME):
+        async with maker() as db:
+            moved = await users_api.attach_suliko_account(
+                user_id, users_api.AttachAccount(login=login), db, session, session, backend
+            )
+            await db.commit()
+    return moved
+
+
+async def test_a_stalled_invitation_moves_to_the_account_of_the_number(
+    maker: async_sessionmaker[AsyncSession], audit: list[dict[str, Any]]
+) -> None:
+    from suliko.domain.accounts import memberships, upsert_from_suliko
+
+    tako = person("g-tako", TAKO_PHONE, "Tako", "Petashvili")
+    backend = FakeBackend([tako])
+    member, placeholder = await _stalled(maker, backend)
+
+    moved = await _attach(maker, backend, member, "599 12 34 56")
+
+    # Same membership, same role, now answering to the number.
+    assert moved.id == member and moved.role is Role.STAFF
+    assert (moved.username, moved.email, moved.phone) == (TAKO_PHONE, None, TAKO_PHONE)
+    assert [e["action"] for e in audit][-1] == "user.account_attached"
+    async with maker() as db:
+        # The address the invitation made an account for is free again.
+        assert await db.get(Account, placeholder) is None
+        # And when Tako signs in as who they are, the organisation is there.
+        signed_in = await upsert_from_suliko(db, tako)
+        assert not signed_in.created
+        assert [m.tenant.id for m in await memberships(db, signed_in.account.id)] == [ACME]
+
+
+async def test_a_stalled_invitation_can_move_to_a_different_address(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Google, but under another address than the one invited."""
+    other = person("g-tako", "tako.work@example.com", "Tako", "Petashvili")
+    backend = FakeBackend([other])
+    member, _ = await _stalled(maker, backend)
+
+    moved = await _attach(maker, backend, member, "Tako.Work@example.com")
+
+    assert (moved.username, moved.email) == ("tako.work@example.com", "tako.work@example.com")
+
+
+async def test_attaching_the_address_that_was_invited_just_links_it(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """They did register with Google after all: nothing moves, the account is linked."""
+    google = person("g-tako", "tako@example.com", "Tako", "Petashvili")
+    backend = FakeBackend([google])
+    member, placeholder = await _stalled(maker, FakeBackend([]))
+
+    moved = await _attach(maker, backend, member, "tako@example.com")
+
+    assert moved.id == member
+    async with maker() as db:
+        account = await db.get(Account, placeholder)
+        assert account is not None and account.suliko_user_id == "g-tako"
+
+
+async def test_a_number_nobody_registered_is_refused(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    backend = FakeBackend([])
+    member, placeholder = await _stalled(maker, backend)
+
+    with pytest.raises(ValidationError, match="nobody who signs in"):
+        await _attach(maker, backend, member, TAKO_PHONE)
+    assert await _membership_account_of(maker, member) == placeholder
+
+
+async def test_someone_with_a_working_sign_in_is_not_moved(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Invited by number, so already on their own account: nothing to attach."""
+    tako = person("g-tako", TAKO_PHONE, "Tako", "Petashvili")
+    backend = FakeBackend([tako, person("g-nino", "577000111", "Nino", "B")])
+    from suliko.api.v1 import users as users_api
+
+    session = _admin_session(ACME)
+    with tenant_scope(ACME):
+        async with maker() as db:
+            invited = await users_api.invite_user(
+                users_api.UserInvite(full_name="Tako", phone=TAKO_PHONE, role=Role.STAFF),
+                db,
+                session,
+                session,
+                RateLimiter(None),
+                backend,
+            )
+            await db.commit()
+
+    with pytest.raises(ConflictError, match="working sign-in"):
+        await _attach(maker, backend, invited.user.id, "577000111")
+
+
+async def test_a_person_already_in_the_organisation_is_not_attached_twice(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    from suliko.api.v1 import users as users_api
+
+    tako = person("g-tako", TAKO_PHONE, "Tako", "Petashvili")
+    backend = FakeBackend([tako])
+    stalled, placeholder = await _stalled(maker, backend)
+    session = _admin_session(ACME)
+    with tenant_scope(ACME):
+        async with maker() as db:  # Tako is already here, by number
+            await users_api.invite_user(
+                users_api.UserInvite(full_name="Tako", phone=TAKO_PHONE, role=Role.STAFF),
+                db,
+                session,
+                session,
+                RateLimiter(None),
+                backend,
+            )
+            await db.commit()
+
+    with pytest.raises(ConflictError, match="already in this organisation"):
+        await _attach(maker, backend, stalled, TAKO_PHONE)
+    assert await _membership_account_of(maker, stalled) == placeholder
+
+
+async def test_a_manager_cannot_attach_for_someone_above_them(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    boss = await _add_member(maker, Role.ADMIN, "boss")
+
+    with pytest.raises(PermissionDeniedError):
+        await _attach(maker, FakeBackend([]), boss, TAKO_PHONE, _manager_session(ACME))
+
+
+async def test_nothing_is_attached_while_suliko_is_not_connected(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    member = await _add_member(maker, Role.STAFF, "plain")
+
+    with pytest.raises(ValidationError, match="not connected"):
+        await _attach(maker, UnconfiguredSulikoBackend(), member, TAKO_PHONE)
+
+
+async def test_the_placeholder_stays_when_the_database_says_it_is_still_in_use(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Another organisation invited the same address and this request cannot see
+    its rows, so the foreign key decides: the move still happens, the account stays."""
+    tako = person("g-tako", TAKO_PHONE, "Tako", "Petashvili")
+    backend = FakeBackend([tako])
+    member, placeholder = await _stalled(maker, backend)
+    async with maker() as db:
+        with tenant_scope(GLOBEX):
+            db.add(
+                User(
+                    tenant_id=GLOBEX,
+                    account_id=placeholder,
+                    username="tako@example.com",
+                    email="tako@example.com",
+                    full_name="Tako",
+                    password_hash="!",
+                    role=Role.STAFF,
+                    invitation_pending=True,
+                )
+            )
+            await db.commit()
+    engine = maker.kw["bind"]
+    async with engine.connect() as conn:
+        await conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+
+    moved = await _attach(maker, backend, member, TAKO_PHONE)
+
+    assert moved.username == TAKO_PHONE
+    async with maker() as db:
+        assert await db.get(Account, placeholder) is not None
+
+
+async def _membership_account_of(maker: async_sessionmaker[AsyncSession], user_id: int) -> int:
+    async with maker() as db:
+        with bypass_tenant_scope():
+            row = await db.get(User, user_id)
+            assert row is not None and row.account_id is not None
+            return row.account_id
+
+
+# ── The Users list says where each person is ────────────────────────────────
+
+
+async def test_the_users_list_can_be_filtered_by_where_each_person_is(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    from suliko.api.v1 import users as users_api
+
+    async with maker() as db:
+        with tenant_scope(ACME):
+            for name, pending, signed_in in (
+                ("invited", True, False),
+                ("waiting", False, False),
+                ("joined", False, True),
+            ):
+                db.add(
+                    User(
+                        tenant_id=ACME,
+                        username=f"{name}@example.com",
+                        email=f"{name}@example.com",
+                        full_name=name.title(),
+                        password_hash="x",
+                        role=Role.STAFF,
+                        is_active=True,
+                        invitation_pending=pending,
+                        last_login_at=datetime.now(UTC) if signed_in else None,
+                    )
+                )
+            await db.commit()
+
+    async def listed(state: Any) -> set[str]:
+        with tenant_scope(ACME):
+            async with maker() as db:
+                session = _admin_session(ACME)
+                page = await users_api.list_users(db, session, session, state=state)
+        return {u.username for u in page.items}
+
+    assert await listed("invited") == {"invited@example.com"}
+    assert await listed("not_signed_in") == {"waiting@example.com"}
+    assert await listed("signed_in") == {"joined@example.com"}
+    assert {"invited@example.com", "waiting@example.com", "joined@example.com"} <= await listed(
+        None
+    )
+
+
+# ── A slow mail server no longer holds the invitation ───────────────────────
+
+
+async def test_a_slow_mail_server_does_not_hold_the_invitation_and_the_mail_still_goes(
+    maker: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first resends after the 15 October deploy ended on an error page although
+    the email went out: the request waited on SMTP for longer than its host allowed."""
+    import asyncio
+
+    from suliko.api.v1 import users as users_api
+    from suliko.core import mail as mail_module
+
+    delivered: list[str] = []
+    release = asyncio.Event()
+
+    async def slow_send(to: str, subject: str, body: str, html: str | None = None) -> Any:
+        await release.wait()
+        delivered.append(to)
+        return mail_module.MailResult(delivered=True, reason="sent")
+
+    monkeypatch.setattr(mail_module, "send", slow_send)
+    monkeypatch.setattr(users_api, "EMAIL_WAIT_SECONDS", 0.05)
+
+    invited = await _invite_as(maker, _admin_session(ACME), Role.STAFF, "slow@example.com")
+
+    # Answered without it: the link is there, nobody claims the mail left.
+    assert invited.invite_link
+    assert invited.email_sent is False and invited.email_pending is True
+    assert delivered == []
+
+    release.set()
+    for _ in range(100):
+        if delivered:
+            break
+        await asyncio.sleep(0.01)
+    assert delivered == ["slow@example.com"]
+    assert not users_api._still_sending
+
+
+async def test_a_fast_mail_server_is_reported_as_sent(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
+) -> None:
+    invited = await _invite_as(maker, _admin_session(ACME), Role.STAFF, "fast@example.com")
+
+    assert invited.email_sent is True and invited.email_pending is False
+
+
 # ── A Manager invites, up to Manager ────────────────────────────────────────
 #
 # `users.invite` (decided 2026-10-15): invite up to your own role, send an
