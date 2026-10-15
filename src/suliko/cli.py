@@ -12,6 +12,7 @@
     python -m suliko.cli purge-files        # daily: reclaim removed order files
     python -m suliko.cli deletion-requests  # accounts closed by a request to delete them
     python -m suliko.cli cancel-deletion-request --id 7
+    python -m suliko.cli purge-accounts     # daily: delete the data of approved requests
 
 The FIRST superuser is created here. There is no sign-up path, no "first user
 becomes admin" rule, and no way for a tenant's own roles to escalate into it.
@@ -49,7 +50,14 @@ from suliko.db.session import (
     session_scope,
 )
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
-from suliko.domain.account_deletion import open_requests, reject_request
+from suliko.domain.account_deletion import (
+    DELETION_GRACE_DAYS,
+    done_email,
+    due_for_purge,
+    open_requests,
+    purge_account,
+    reject_request,
+)
 from suliko.domain.accounts import UNUSABLE_PASSWORD_HASH, find_account, login_name, normalise_email
 from suliko.domain.reference_seed import seed_reference_data
 from suliko.domain.suliko_import import import_users, link_by_hand
@@ -67,7 +75,14 @@ from suliko.integrations.suliko_backend import (
 from suliko.models.directory import Client, ClientType  # noqa: F401 — registry
 from suliko.models.reference import TenantSettings
 from suliko.models.tenant import Tenant, TenantStatus
-from suliko.models.user import Account, MfaMethod, MfaRecoveryCode, Role, User
+from suliko.models.user import (
+    Account,
+    AccountDeletionRequest,
+    MfaMethod,
+    MfaRecoveryCode,
+    Role,
+    User,
+)
 from suliko.security import totp as totp_service
 from suliko.security.passwords import hash_password, hash_token, validate_password_strength
 
@@ -448,6 +463,49 @@ async def cancel_deletion_request(request_id: int) -> None:
         )
         await db.commit()
     ok(f"Request {request_id} is cancelled. The account can sign in again.")
+
+
+async def purge_accounts() -> int:
+    """Delete the data of every approved request whose waiting time is over.
+
+    Run daily. Each request is its own transaction, so one that fails does not
+    undo or hold up the others; the person is told once their data is gone, at the
+    address they had. Exit status 1 if any failed, for the scheduler to notice.
+    """
+    from suliko.core import mail
+    from suliko.core.audit import record
+
+    async with get_sessionmaker()() as db:
+        due = [request.id for request in await due_for_purge(db)]
+    if not due:
+        say(f"Nothing to delete: no approved request is {DELETION_GRACE_DAYS} days old yet.")
+        return 0
+
+    failed = 0
+    for request_id in due:
+        try:
+            async with get_sessionmaker()() as db:
+                request = await db.get(AccountDeletionRequest, request_id)
+                assert request is not None
+                address, name = await purge_account(db, request)
+                await record(
+                    db,
+                    None,
+                    action="account.deleted",
+                    entity_type="account",
+                    entity_id=request.account_id,
+                    after={"request_id": request_id},
+                )
+                await db.commit()
+        except Exception as exc:  # one failure must not stop the rest
+            failed += 1
+            fail(f"request {request_id}: {type(exc).__name__}: {exc}")
+            continue
+        ok(f"request {request_id}: deleted")
+        if address:
+            subject, body = done_email(name)
+            await mail.send(address, subject, body)
+    return 1 if failed else 0
 
 
 # ── Reference data ──────────────────────────────────────────────────────────
@@ -834,6 +892,10 @@ def main() -> None:
     p.add_argument("--suliko-login", required=True, help="their suliko.ge email or phone number")
 
     sub.add_parser("deletion-requests", help="list the accounts closed by a deletion request")
+    sub.add_parser(
+        "purge-accounts",
+        help="delete the data of approved deletion requests whose waiting time is over",
+    )
 
     p = sub.add_parser(
         "cancel-deletion-request",
@@ -872,6 +934,8 @@ def main() -> None:
                     await deletion_requests()
                 case "cancel-deletion-request":
                     await cancel_deletion_request(args.id)
+                case "purge-accounts":
+                    return await purge_accounts()
             return 0
         finally:
             await dispose_engine()

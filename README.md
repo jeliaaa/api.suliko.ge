@@ -82,18 +82,30 @@ the bytes after `FILE_RETENTION_DAYS` (30). Until then support can restore it by
 ## Deleting an account
 
 "Delete account" on the Account page files a request (`POST /auth/deletion-request`, table
-`account_deletion_requests`). It deletes nothing. The account is closed at once: every session
-ends, and while the request is open (`requested` or `approved`) nobody can sign in to it, by
-password, through suliko.ge, or from the chooser (`domain/account_deletion.py`). Memberships are
-left as they were, so cancelling puts everything back. The team is emailed at `SUPPORT_EMAIL`
-(default `info@suliko.ge`) and the person gets a confirmation telling them to write there to cancel.
+`account_deletion_requests`). It deletes nothing yet. The account is closed at once: every session
+ends, the translator-portal access is switched off, and while the request is open (`requested` or
+`approved`) nobody can sign in to it, by password, through suliko.ge, or from the chooser
+(`domain/account_deletion.py`). Memberships are left as they were, so cancelling puts everything
+back. The team is emailed at `SUPPORT_EMAIL` (default `info@suliko.ge`) and the person gets a
+confirmation telling them to write there to cancel.
 
-To cancel one, because the person wrote to say so:
+Superusers review the requests in the admin console (`GET /platform/deletion-requests`):
 
-    python -m suliko.cli deletion-requests              # who is waiting
-    python -m suliko.cli cancel-deletion-request --id 7
+- Each shows what the person has in Office (`findings`): an organisation they are the last owner of
+  (blocks approval), open and unpaid orders in an organisation only they use, and what bureaus still
+  owe them as a translator. A suliko.ge balance is not visible from here: check it on suliko.ge.
+- **Approve** (`POST .../approve`) starts the 30 days. Findings other than the owner one need
+  `acknowledged`. The person is emailed the date.
+- **Reject** (`POST .../reject`) ends it, whatever its state: the account opens again and the person
+  is emailed. `python -m suliko.cli cancel-deletion-request --id 7` does the same from the server.
 
-Reviewing requests, approving them and the deletion itself are not built yet.
+Thirty days after approval `python -m suliko.cli purge-accounts` (schedule it daily, like
+`purge-files`) deletes the person's data: the account and each membership lose name, address, phone
+and password and cannot sign in, sessions, second factors, notifications and mentions go, and so do
+their translator-portal record, links and personal orders. Orders, clients, invoices and payments
+stay with the organisation, their author shown as "Deleted user". An organisation the person alone
+owns is not deleted: that is a separate request. `python -m suliko.cli deletion-requests` lists who
+is waiting.
 
 ## Stack
 

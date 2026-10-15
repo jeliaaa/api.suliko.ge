@@ -73,6 +73,8 @@ LATER_REVISIONS = (
     "0028_interpreting_place.py",
     # account_deletion_requests, a platform table — see test_migration_0029.py.
     "0029_account_deletion_requests.py",
+    # Six columns on account_deletion_requests — see test_migration_0030.py.
+    "0030_deletion_review.py",
 )
 
 

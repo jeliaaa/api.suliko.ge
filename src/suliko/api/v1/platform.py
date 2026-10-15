@@ -65,12 +65,13 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Query
 from fastapi import status as http_status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy import case, delete, func, or_, select
 
 from suliko.api.deps import Db, require
+from suliko.core import mail
 from suliko.core.errors import (
     ConflictError,
     NotFoundError,
@@ -78,6 +79,16 @@ from suliko.core.errors import (
 )
 from suliko.db.session import bind_tenant_guc
 from suliko.db.tenancy import bypass_tenant_scope, tenant_scope
+from suliko.domain.account_deletion import (
+    OpenRequest,
+    approve_request,
+    approved_email,
+    findings,
+    open_requests,
+    recent_decided_requests,
+    reject_request,
+    rejected_email,
+)
 from suliko.domain.accounts import (
     UNUSABLE_PASSWORD_HASH,
     SulikoAccountConflictError,
@@ -94,7 +105,13 @@ from suliko.models.order import Order, OrderDocument
 from suliko.models.order_file import OrderFile
 from suliko.models.reference import Language, LanguagePairPrice
 from suliko.models.tenant import Tenant, TenantStatus
-from suliko.models.user import Account, Role, User, UserPermissionOverride
+from suliko.models.user import (
+    Account,
+    AccountDeletionRequest,
+    Role,
+    User,
+    UserPermissionOverride,
+)
 from suliko.security.passwords import (
     generate_one_time_password,
     hash_password_async,
@@ -948,6 +965,197 @@ async def revoke_superuser(user_id: int, db: Db, session: Superuser) -> None:
     await revoke_all_for_user(db, row.id)
     with bypass_tenant_scope():
         await db.delete(row)
+
+
+# ── Requests to delete an account ───────────────────────────────────────────
+#
+# A person presses "Delete account" (`POST /auth/deletion-request`); their
+# account is closed and the request waits here. The team looks at what the
+# person has in Office (`findings`), then confirms it, which starts the 30 days
+# before their data is deleted (`suliko purge-accounts`), or rejects it, which
+# opens the account again. Each outcome is emailed to the person.
+
+
+class DeletionFindingOut(BaseModel):
+    code: str
+    organisation: str
+    count: int | None
+    amount: Decimal | None
+    blocking: bool
+
+
+class DeletionRequestOut(BaseModel):
+    id: int
+    status: str
+    requested_at: datetime
+    decided_at: datetime | None
+    purge_after: datetime | None
+    done_at: datetime | None
+    review_note: str | None
+    name: str
+    #: What they sign in with: the address, else the phone.
+    login: str
+    email: str | None
+    phone: str | None
+    signs_in_with_suliko: bool
+    #: The organisations they are an active member of.
+    organisations: list[str]
+    #: Empty for a request that is over: nothing is left to weigh.
+    findings: list[DeletionFindingOut]
+
+
+class DeletionRequestList(BaseModel):
+    #: Waiting or approved, oldest first.
+    open: list[DeletionRequestOut]
+    #: The latest that are over, newest first.
+    decided: list[DeletionRequestOut]
+
+
+class DeletionApproval(BaseModel):
+    note: str | None = Field(default=None, max_length=2000)
+    #: The reviewer looked at the findings. Required when there are any.
+    acknowledged: bool = False
+
+
+class DeletionRejection(BaseModel):
+    note: str | None = Field(default=None, max_length=2000)
+
+
+async def _deletion_out(db: Db, item: OpenRequest, *, weigh: bool) -> DeletionRequestOut:
+    request, account = item.request, item.account
+    with bypass_tenant_scope():
+        organisations = list(
+            (
+                await db.execute(
+                    select(Tenant.display_name)
+                    .join(User, User.tenant_id == Tenant.id)
+                    .where(User.account_id == account.id, User.is_active.is_(True))
+                    .order_by(Tenant.display_name)
+                )
+            ).scalars()
+        )
+    found = await findings(db, account.id) if weigh else []
+    return DeletionRequestOut(
+        id=request.id,
+        status=request.status.value,
+        requested_at=request.created_at,
+        decided_at=request.decided_at,
+        purge_after=request.purge_after,
+        done_at=request.done_at,
+        review_note=request.review_note,
+        name=account.full_name,
+        login=login_name(account),
+        email=account.email,
+        phone=account.phone,
+        signs_in_with_suliko=account.suliko_user_id is not None,
+        organisations=organisations,
+        findings=[
+            DeletionFindingOut(
+                code=f.code,
+                organisation=f.organisation,
+                count=f.count,
+                amount=f.amount,
+                blocking=f.blocking,
+            )
+            for f in found
+        ],
+    )
+
+
+async def _existing_deletion_request(db: Db, request_id: int) -> OpenRequest:
+    row = (
+        await db.execute(
+            select(AccountDeletionRequest, Account)
+            .join(Account, Account.id == AccountDeletionRequest.account_id)
+            .where(AccountDeletionRequest.id == request_id)
+        )
+    ).first()
+    if row is None:
+        raise NotFoundError("Deletion request not found.")
+    return OpenRequest(row[0], row[1])
+
+
+@router.get("/deletion-requests", response_model=DeletionRequestList)
+async def list_deletion_requests(db: Db, _: Superuser) -> DeletionRequestList:
+    """The requests waiting for a decision, and the latest that are over."""
+    waiting = [await _deletion_out(db, item, weigh=True) for item in await open_requests(db)]
+    over = [
+        await _deletion_out(db, item, weigh=False) for item in await recent_decided_requests(db)
+    ]
+    return DeletionRequestList(open=waiting, decided=over)
+
+
+@router.post("/deletion-requests/{request_id}/approve", response_model=DeletionRequestOut)
+async def approve_deletion_request(
+    request_id: int,
+    payload: DeletionApproval,
+    db: Db,
+    session: Superuser,
+    background: BackgroundTasks,
+) -> DeletionRequestOut:
+    """Confirm a request: the person is told, and their data is deleted in 30 days.
+
+    Refused when an organisation would be left without an owner. Anything else
+    the findings show needs `acknowledged`, so a click cannot approve past them.
+    """
+    item = await _existing_deletion_request(db, request_id)
+    request = await approve_request(
+        db,
+        request_id,
+        decided_by_user_id=session.user_id,
+        note=payload.note,
+        acknowledged=payload.acknowledged,
+    )
+
+    from suliko.core.audit import record
+
+    await record(
+        db,
+        session,
+        action="platform.deletion_approved",
+        entity_type="account",
+        entity_id=item.account.id,
+        after={"request_id": request.id, "purge_after": request.purge_after},
+    )
+    if item.account.email:
+        subject, body = approved_email(item.account, request)
+        background.add_task(mail.send, item.account.email, subject, body)
+    await db.refresh(request)
+    return await _deletion_out(db, item, weigh=False)
+
+
+@router.post("/deletion-requests/{request_id}/reject", response_model=DeletionRequestOut)
+async def reject_deletion_request(
+    request_id: int,
+    payload: DeletionRejection,
+    db: Db,
+    session: Superuser,
+    background: BackgroundTasks,
+) -> DeletionRequestOut:
+    """End a request without deleting anything: the account is open again.
+
+    The review said no, or the person wrote to cancel. They are told.
+    """
+    item = await _existing_deletion_request(db, request_id)
+    request = await reject_request(
+        db, request_id, decided_by_user_id=session.user_id, note=payload.note
+    )
+
+    from suliko.core.audit import record
+
+    await record(
+        db,
+        session,
+        action="platform.deletion_rejected",
+        entity_type="account",
+        entity_id=item.account.id,
+        after={"request_id": request.id},
+    )
+    if item.account.email:
+        subject, body = rejected_email(item.account)
+        background.add_task(mail.send, item.account.email, subject, body)
+    await db.refresh(request)
+    return await _deletion_out(db, item, weigh=False)
 
 
 # ── The platform, in total ──────────────────────────────────────────────────
