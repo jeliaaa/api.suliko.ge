@@ -167,6 +167,14 @@ def portal_secret() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def no_resend_cooldown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests that send again in a row are not about the cooldown; the ones that are set it."""
+    from suliko.api.v1 import users as users_api
+
+    monkeypatch.setattr(users_api, "RESEND_COOLDOWN_SECONDS", 0)
+
+
+@pytest.fixture(autouse=True)
 def audit(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     """audit_log uses JSONB and INET, which SQLite cannot create — record the
     calls instead, so tests can still assert that auditing happened."""
@@ -2579,6 +2587,56 @@ async def test_a_fast_mail_server_is_reported_as_sent(
     invited = await _invite_as(maker, _admin_session(ACME), Role.STAFF, "fast@example.com")
 
     assert invited.email_sent is True and invited.email_pending is False
+
+
+# ── Sending again: a cooldown, and a history ────────────────────────────────
+
+
+async def test_a_second_resend_within_a_minute_is_refused_with_how_long_to_wait(
+    maker: async_sessionmaker[AsyncSession],
+    sent_mail: list[dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from suliko.api.v1 import users as users_api
+    from suliko.core.errors import RateLimitedError
+
+    monkeypatch.setattr(users_api, "RESEND_COOLDOWN_SECONDS", 60)
+    first = await _invite_existing_account(maker)
+    sent_mail.clear()
+
+    with pytest.raises(RateLimitedError) as refused:
+        await _resend(maker, first.user.id)
+
+    assert 0 < refused.value.retry_after <= 60
+    assert sent_mail == []
+
+
+async def test_the_members_page_says_how_many_links_were_sent_and_when(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
+) -> None:
+    from suliko.api.v1 import users as users_api
+
+    first = await _invite_existing_account(maker)
+    await _resend(maker, first.user.id)
+
+    with tenant_scope(ACME):
+        async with maker() as db:
+            session = _admin_session(ACME)
+            page = await users_api.get_user(first.user.id, db, session, session)
+            listed = await users_api.list_users(db, session, session)
+
+    assert page.invitation_count == 2
+    assert page.invitation_last_sent_at is not None
+    # The list does not pay for it: one query per row would be a slow Users screen.
+    assert all(u.invitation_count == 0 for u in listed.items)
+
+
+def test_a_dead_invitation_link_has_a_code_the_app_can_translate() -> None:
+    from suliko.api.v1.auth import InvitationLinkInvalidError
+
+    error = InvitationLinkInvalidError("x")
+    assert error.error_code == "invitation_link_invalid"
+    assert error.status_code == 422
 
 
 # ── A Manager invites, up to Manager ────────────────────────────────────────
