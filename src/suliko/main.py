@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from suliko import __version__
 from suliko.api.v1.router import api_router
 from suliko.config import get_settings
+from suliko.core import build_info
 from suliko.core.errors import install_error_handlers
 from suliko.core.gateway import GatewayMiddleware
 from suliko.db.session import dispose_engine
@@ -131,7 +132,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             ),
         )
 
-    structlog.get_logger().info("startup", version=__version__, environment=settings.environment)
+    structlog.get_logger().info(
+        "startup",
+        version=__version__,
+        commit=build_info.commit(),
+        environment=settings.environment,
+    )
     yield
     await close_object_storage()
     await close_suliko_backend()
@@ -177,7 +183,18 @@ def create_app() -> FastAPI:
 
     @app.get("/health", tags=["meta"], include_in_schema=False)
     async def health() -> dict[str, str]:
-        return {"status": "ok", "version": __version__}
+        """Is the process up, and which code is it.
+
+        `commit` is the commit the process STARTED on (`core/build_info.py`),
+        so a deploy is confirmed by opening this URL: the hash should be the
+        one just pulled, and `started_at` later than the pull.
+        """
+        return {
+            "status": "ok",
+            "version": __version__,
+            "commit": build_info.commit(),
+            "started_at": build_info.STARTED_AT,
+        }
 
     @app.get("/health/ready", tags=["meta"], include_in_schema=False)
     async def ready() -> JSONResponse:

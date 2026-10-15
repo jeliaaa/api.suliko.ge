@@ -73,8 +73,9 @@ def phone_variants(raw: str) -> list[str]:
 
     suliko.ge keeps a phone sign-in exactly as it was typed at registration, so
     "599 12 34 56", "+995599123456" and "0599123456" may all be one person. We
-    cannot know which form is stored, so a search tries each. Fewer than six
-    digits is not a number: the typed text alone, so junk matches nothing.
+    cannot know which form is stored, so a search tries each, whichever of them
+    was typed. Fewer than six digits is not a number: the typed text alone, so
+    junk matches nothing.
     """
     stripped = raw.strip()
     digits = "".join(ch for ch in stripped if ch.isdigit())
@@ -84,7 +85,11 @@ def phone_variants(raw: str) -> list[str]:
     if len(local) == 10 and local.startswith("05"):
         local = local[1:]
     variants: list[str] = []
-    for candidate in (stripped, digits, local, f"+995{local}", f"995{local}"):
+    # The form with the trunk zero is only offered for a nine-digit number, which
+    # is what a Georgian mobile is. It used to be missing: someone who registered
+    # as 0599123456 was never found by typing 599123456 or +995 599 12 34 56.
+    trunk = f"0{local}" if len(local) == 9 else local
+    for candidate in (stripped, digits, local, trunk, f"+995{local}", f"995{local}"):
         if candidate not in variants:
             variants.append(candidate)
     return variants

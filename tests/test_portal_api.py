@@ -39,6 +39,7 @@ from suliko.core.errors import (
 from suliko.core.ratelimit import RateLimiter
 from suliko.db.base import Base
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
+from suliko.domain.accounts import memberships, upsert_from_suliko
 from suliko.domain.plans import TenantPlan
 from suliko.domain.portal import registration_url
 from suliko.integrations.object_storage import (
@@ -2907,3 +2908,139 @@ def test_a_short_value_is_hidden_without_giving_away_its_length() -> None:
     assert _mask_phone("") is None and _mask_phone(None) is None
     assert _mask_email("a@b.ge") == "a***@b.ge"
     assert _mask_email("") is None and _mask_email(None) is None
+
+
+# ── Which sign-up reaches an invitation ─────────────────────────────────────
+#
+# The root cause of the invitations that stalled (2026-10-15). Office matches
+# an invitation on the sign-in name suliko.ge proved at registration, and the
+# registration page offers a phone number or Google: only Google proves an
+# address. These pin all the outcomes end to end, through the real invite
+# handler, so the rule cannot drift without a test saying so.
+
+
+async def _invite_with(
+    maker: async_sessionmaker[AsyncSession], backend: FakeBackend, **who: Any
+) -> Any:
+    from suliko.api.v1 import users as users_api
+
+    payload = users_api.UserInvite(full_name="Tako Petashvili", role=Role.STAFF, **who)
+    session = _admin_session(ACME)
+    with tenant_scope(ACME):
+        async with maker() as db:
+            result = await users_api.invite_user(
+                payload, db, session, session, RateLimiter(None), backend
+            )
+            await db.commit()
+    return result
+
+
+async def _accept_link(maker: async_sessionmaker[AsyncSession], user_id: int) -> None:
+    """What spending the emailed link does to the membership."""
+    async with maker() as db:
+        with tenant_scope(ACME):
+            row = await db.get(User, user_id)
+            assert row is not None
+            row.invitation_pending = False
+            await db.commit()
+
+
+async def _membership_account(maker: async_sessionmaker[AsyncSession], user_id: int) -> int | None:
+    async with maker() as db:
+        with bypass_tenant_scope():
+            row = await db.get(User, user_id)
+            assert row is not None
+            return row.account_id
+
+
+async def test_a_google_sign_up_with_the_invited_address_takes_over_the_invitation(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    invited = await _invite_with(maker, FakeBackend([]), email="tako@example.com")
+    assert invited.needs_suliko_registration
+    await _accept_link(maker, invited.user.id)
+    placeholder = await _membership_account(maker, invited.user.id)
+
+    async with maker() as db:
+        # suliko.ge proved tako@example.com (a Google sign-up): that is the user name.
+        signed_up = await upsert_from_suliko(
+            db, person("g-tako", "Tako@Example.com", "Tako", "Petashvili")
+        )
+
+        assert signed_up.linked_existing and not signed_up.created
+        assert signed_up.account.id == placeholder
+        entered = await memberships(db, signed_up.account.id)
+    assert [m.tenant.id for m in entered] == [ACME]
+
+
+async def test_a_phone_sign_up_never_reaches_an_invitation_made_for_an_address(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Tako's case: accepted the email, registered by phone, sees no organisation."""
+    invited = await _invite_with(maker, FakeBackend([]), email="tako@example.com")
+    await _accept_link(maker, invited.user.id)
+    placeholder = await _membership_account(maker, invited.user.id)
+
+    async with maker() as db:
+        signed_up = await upsert_from_suliko(
+            db, person("g-tako", "599123456", "Tako", "Petashvili")
+        )
+
+        # A different account, and the organisation is not on it.
+        assert signed_up.created
+        assert signed_up.account.id != placeholder
+        assert await memberships(db, signed_up.account.id) == []
+        # The invitation waits where it was, unlinked, for an address nobody proved.
+        stranded = await db.get(Account, placeholder)
+        assert stranded is not None
+        assert stranded.suliko_user_id is None
+    assert await _membership_account(maker, invited.user.id) == placeholder
+
+
+async def test_inviting_the_number_reaches_the_phone_sign_up(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The way out of the case above: invite the number they registered with."""
+    tako = person("g-tako", "599123456", "Tako", "Petashvili")
+    invited = await _invite_with(maker, FakeBackend([tako]), phone="599123456")
+    assert invited.invited_by_phone and invited.user.email is None
+    await _accept_link(maker, invited.user.id)
+
+    async with maker() as db:
+        signed_in = await upsert_from_suliko(db, tako)
+
+        assert not signed_in.created and not signed_in.linked_existing
+        assert signed_in.account.id == await _membership_account(maker, invited.user.id)
+        entered = await memberships(db, signed_in.account.id)
+    assert [m.tenant.id for m in entered] == [ACME]
+
+
+@pytest.mark.parametrize(
+    "stored, typed",
+    [
+        ("+995599123456", "599 12 34 56"),
+        ("0599123456", "+995 599 12 34 56"),
+        ("599123456", "0599123456"),
+    ],
+)
+async def test_a_number_is_found_however_it_was_written_at_registration(
+    maker: async_sessionmaker[AsyncSession], stored: str, typed: str
+) -> None:
+    """suliko.ge keeps the number exactly as typed, so the invitation tries each form."""
+    tako = person("g-tako", stored, "Tako", "Petashvili")
+    invited = await _invite_with(maker, FakeBackend([tako]), phone=typed)
+    await _accept_link(maker, invited.user.id)
+
+    async with maker() as db:
+        signed_in = await upsert_from_suliko(db, tako)
+
+        assert signed_in.account.id == await _membership_account(maker, invited.user.id)
+        assert [m.tenant.id for m in await memberships(db, signed_in.account.id)] == [ACME]
+
+
+async def test_a_number_nobody_registered_cannot_be_invited(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Nothing to write to and nobody to match: refused, not a stranded placeholder."""
+    with pytest.raises(ValidationError, match=r"No suliko\.ge account uses this number"):
+        await _invite_with(maker, FakeBackend([]), phone="599123456")
