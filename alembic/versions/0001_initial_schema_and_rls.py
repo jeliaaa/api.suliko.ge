@@ -111,6 +111,8 @@ LATER_REVISION_TABLES = frozenset(
         # 0031
         "billing_packages",
         "billing_invoices",
+        # 0032
+        "invoice_templates",
     }
 )
 

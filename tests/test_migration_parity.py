@@ -78,6 +78,8 @@ LATER_REVISIONS = (
     # billing_packages, billing_invoices and tenants.package_tier — see
     # test_migration_0031.py.
     "0031_order_packages.py",
+    # invoice_templates, a bureau's own invoice file — see test_migration_0032.py.
+    "0032_invoice_templates.py",
 )
 
 

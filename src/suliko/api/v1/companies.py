@@ -60,6 +60,7 @@ from suliko.models.invoice import Invoice
 from suliko.models.order import Order, OrderDocument, ServiceType
 from suliko.models.reference import Company, CompanyBankAccount, Language
 from suliko.security.permissions import Permission
+from suliko.security.sessions import AuthenticatedSession
 
 router = APIRouter(prefix="/companies", tags=["companies"])
 
@@ -601,6 +602,12 @@ async def order_invoice(
     db: Db,
     session: Annotated[CurrentSession, Depends(require(Permission.ORDERS_READ))],
     locale: Literal["ka", "en"] = "ka",
+) -> InvoiceOut:
+    return await build_invoice(db, session, order_id, locale)
+
+
+async def build_invoice(
+    db: AsyncSession, session: AuthenticatedSession, order_id: int, locale: Literal["ka", "en"]
 ) -> InvoiceOut:
     """Assemble an invoice for one order.
 

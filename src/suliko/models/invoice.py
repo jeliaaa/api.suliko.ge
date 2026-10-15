@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import date
 
-from sqlalchemy import Date, ForeignKey, String, UniqueConstraint
+from sqlalchemy import Date, ForeignKey, Integer, LargeBinary, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from suliko.db.base import Base, IdMixin, TenantScoped, TimestampMixin
@@ -31,3 +31,19 @@ class Invoice(Base, IdMixin, TenantScoped, TimestampMixin):
     #: bureau, and it does not reveal how many invoices it has issued.
     number: Mapped[str] = mapped_column(String(20), nullable=False)
     issued_on: Mapped[date] = mapped_column(Date, nullable=False)
+
+
+class InvoiceTemplate(Base, IdMixin, TenantScoped, TimestampMixin):
+    """The bureau's own invoice, a Word file with ``{{placeholders}}``.
+
+    One per bureau. Kept in the table, not in file storage: it is at most 2 MB,
+    and the Order Vault backend can write files but never read them back.
+    Without one, invoices use Suliko Office's own layout.
+    """
+
+    __tablename__ = "invoice_templates"
+    __table_args__ = (UniqueConstraint("tenant_id", name="uq_invoice_templates_tenant"),)
+
+    file_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)

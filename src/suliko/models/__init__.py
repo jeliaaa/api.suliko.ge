@@ -36,7 +36,7 @@ from suliko.models.finance import (
 )
 from suliko.models.imports import ImportBatch, ImportBatchItem
 from suliko.models.integration import IntegrationCredential, IntegrationProvider
-from suliko.models.invoice import Invoice
+from suliko.models.invoice import Invoice, InvoiceTemplate
 from suliko.models.order import (
     CopyType,
     HandoverMethod,
@@ -116,6 +116,7 @@ __all__ = [
     "InviteKind",
     "InviteStatus",
     "Invoice",
+    "InvoiceTemplate",
     "Language",
     "LanguagePairPrice",
     "LoginAttempt",
