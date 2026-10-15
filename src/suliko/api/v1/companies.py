@@ -56,7 +56,7 @@ from suliko.domain.invoice_numbers import new_invoice_number
 from suliko.domain.orders import base_order_query
 from suliko.domain.pricing_context import tenant_settings
 from suliko.models.directory import Client, ClientType
-from suliko.models.invoice import Invoice
+from suliko.models.invoice import Invoice, InvoiceTemplate
 from suliko.models.order import Order, OrderDocument, ServiceType
 from suliko.models.reference import Company, CompanyBankAccount, Language
 from suliko.security.permissions import Permission
@@ -186,6 +186,9 @@ class InvoiceOut(BaseModel):
     total: Decimal
     paid: Decimal
     balance_due: Decimal
+    #: The bureau has uploaded its own invoice file, so Word can be downloaded in it
+    #: (`GET /orders/{id}/invoice.docx`).
+    has_template: bool = False
     currency: str = "GEL"
 
 
@@ -711,6 +714,7 @@ async def build_invoice(
             )
 
     issued = await _issued_invoice(db, order.id, today_in(session.timezone))
+    has_template = (await db.scalar(select(InvoiceTemplate.id).limit(1))) is not None
 
     return InvoiceOut(
         number=issued.number,
@@ -751,4 +755,5 @@ async def build_invoice(
         total=total,
         paid=paid,
         balance_due=total - paid,
+        has_template=has_template,
     )
