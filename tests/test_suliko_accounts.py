@@ -776,10 +776,10 @@ def test_production_refuses_a_half_configured_suliko(
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        ("599123456", ["599123456", "+995599123456", "995599123456"]),
+        ("599123456", ["599123456", "0599123456", "+995599123456", "995599123456"]),
         (
             "+995 599 12 34 56",
-            ["+995 599 12 34 56", "995599123456", "599123456", "+995599123456"],
+            ["+995 599 12 34 56", "995599123456", "599123456", "0599123456", "+995599123456"],
         ),
         ("0599123456", ["0599123456", "599123456", "+995599123456", "995599123456"]),
         ("12345", ["12345"]),
@@ -796,11 +796,15 @@ def test_a_phone_number_is_tried_in_each_form_it_may_be_stored(
 async def test_a_phone_account_is_found_however_the_number_is_typed(db: AsyncSession) -> None:
     plain = (await upsert_from_suliko(db, person("g2", "599123456", "Gela", ""))).account
     prefixed = (await upsert_from_suliko(db, person("g3", "+995577000111", "Tako", ""))).account
+    trunk = (await upsert_from_suliko(db, person("g4", "0555000222", "Nino", ""))).account
 
     for typed in ("599123456", "+995 599 12 34 56", "0599123456", "995599123456"):
         assert await find_account_by_login(db, typed) is plain
     # Stored with the country code, typed without it.
     assert await find_account_by_login(db, "577 00 01 11") is prefixed
+    # Stored with the trunk zero, typed any other way.
+    for typed in ("555000222", "+995 555 00 02 22", "0555000222", "995555000222"):
+        assert await find_account_by_login(db, typed) is trunk
     assert await find_account_by_login(db, "599123457") is None
 
 
