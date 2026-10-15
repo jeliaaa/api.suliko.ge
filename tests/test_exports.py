@@ -48,7 +48,7 @@ def _session(role: Role = Role.OWNER) -> AuthenticatedSession:
 
 
 def test_formula_cells_are_defused_and_numbers_are_not() -> None:
-    assert exports.safe_cell('=HYPERLINK("x")') == '\'=HYPERLINK("x")'
+    assert exports.safe_cell("=HYPERLINK(\"x\")") == "'=HYPERLINK(\"x\")"
     assert exports.safe_cell("+995 555") == "'+995 555"
     assert exports.safe_cell("@SUM(A1)") == "'@SUM(A1)"
     assert exports.safe_cell("ნინო") == "ნინო"
@@ -148,3 +148,4 @@ async def test_orders_export_has_no_profit_column_without_reports_profit(
     assert "Profit" not in header
     assert header.split(",")[-1] == "Overdue"
     assert row.endswith(",yes")
+

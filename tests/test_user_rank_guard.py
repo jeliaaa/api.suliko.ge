@@ -279,8 +279,12 @@ async def test_saving_access_keeps_what_the_editor_does_not_hold(
         permissions=effective_permissions(Role.ADMIN, TenantPlan.BUREAU, {"finance.refund": False}),
     )
     staff_now = effective_permissions(Role.STAFF, TenantPlan.BUREAU, {"finance.refund": True})
-    submitted = sorted(p.value for p in staff_now | {P.FINANCE_READ} if p is not P.FINANCE_REFUND)
-    out = await users.update_user(STAFF, users.UserUpdate(permissions=submitted), db, admin, None)
+    submitted = sorted(
+        p.value for p in staff_now | {P.FINANCE_READ} if p is not P.FINANCE_REFUND
+    )
+    out = await users.update_user(
+        STAFF, users.UserUpdate(permissions=submitted), db, admin, None
+    )
 
     assert P.FINANCE_REFUND.value in out.permissions
     assert P.FINANCE_READ.value in out.permissions
