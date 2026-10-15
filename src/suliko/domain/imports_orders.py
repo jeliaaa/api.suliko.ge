@@ -9,6 +9,13 @@ A row that is judged ``ok`` may carry a new client. Each new client gets a
 placeholder ref (``new:0``, ``new:1``, ...) in the order they first appear, so a
 later row for the same person reuses it, and a row that turns out bad never
 leaves a client behind.
+
+A row may also name a translator and a notary. They are matched to the bureau's
+own (or to ones an earlier sheet of the same import creates) by name, then by
+phone. A name nobody knows is left unassigned with a warning, unless the import
+has no sheet of translators (``create_translators``) or of notaries
+(``create_notaries``) to say who they are: then the person is created, under a ref
+(``newt:0``, ``newn:0``) just like a new client, and only once the row is accepted.
 """
 
 from __future__ import annotations
@@ -22,18 +29,25 @@ from typing import Any
 from suliko.domain.imports import (
     _COMPANY_MARKS,
     ExistingPerson,
+    RefCounter,
     RowResult,
     Seen,
     Sheet,
     _common,
     cell_text,
+    clean_phone,
     parse_date,
     parse_int,
     parse_pairs,
     parse_rate,
+    phone_key,
 )
 
 OrderKey = tuple[Any, ...]
+
+#: Who a row's translator or notary is: the record's id, or the ref of one this
+#: import creates, and its name.
+PersonRef = tuple[int | str, str]
 
 
 @dataclass
@@ -58,8 +72,28 @@ class OrdersContext:
     document_types: dict[str, tuple[int, str]] = field(default_factory=dict)
     #: Used, with a warning, when the sheet gives no type or one not recognised.
     default_document_type: tuple[int, str] | None = None
-    #: Translator names (case-folded) to (id, name).
-    translators: dict[str, tuple[int, str]] = field(default_factory=dict)
+    #: Translator names (case-folded) to (id or ref, name).
+    translators: dict[str, PersonRef] = field(default_factory=dict)
+    #: The same by phone (`phone_key`), for a row that gives a phone and a different spelling.
+    translators_by_phone: dict[str, PersonRef] = field(default_factory=dict)
+    #: Notaries, the same two ways.
+    notaries: dict[str, PersonRef] = field(default_factory=dict)
+    notaries_by_phone: dict[str, PersonRef] = field(default_factory=dict)
+    #: Create a translator or a notary a row names and nobody knows, instead of
+    #: leaving the order unassigned.
+    create_translators: bool = False
+    create_notaries: bool = False
+    #: What this import creates that rows point at: ref -> what to save.
+    new_translators: dict[str, dict[str, Any]] = field(default_factory=dict)
+    new_notaries: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: One counter per kind of new record for the whole import, so several sheets
+    #: share them.
+    client_refs: RefCounter = field(default_factory=lambda: RefCounter("new"))
+    translator_refs: RefCounter = field(default_factory=lambda: RefCounter("newt"))
+    notary_refs: RefCounter = field(default_factory=lambda: RefCounter("newn"))
+    #: Orders already known, so a second orders sheet sees the first's rows too.
+    #: Filled from `existing_orders` the first time it is needed.
+    known_orders: dict[tuple[Any, ...], str] | None = None
     #: A status as typed (a stored key, a label, one of the bureau's own) to the
     #: value to store, or None.
     status_lookup: Callable[[str], str | None] = lambda _text: None
@@ -78,6 +112,51 @@ def order_key(
     return (client, order_date, source, target, pages, price, (identifier or "").casefold())
 
 
+def remember_person(
+    by_name: dict[str, PersonRef],
+    by_phone: dict[str, PersonRef],
+    ref: int | str | None,
+    name: str,
+    phone: str | None,
+) -> None:
+    """Let a row of orders find this person by name or by phone. The first spelling wins."""
+    name = name.strip()
+    if ref is None or not name:
+        return
+    person = (ref, name)
+    by_name.setdefault(name.casefold(), person)
+    if key := phone_key(phone):
+        by_phone.setdefault(key, person)
+
+
+def _find_person(
+    by_name: dict[str, PersonRef], by_phone: dict[str, PersonRef], name: str, phone: str | None
+) -> PersonRef | None:
+    """By name first, then by phone: the same person is not always spelled the same."""
+    if name and (found := by_name.get(name.casefold())):
+        return found
+    key = phone_key(phone)
+    return by_phone.get(key) if key else None
+
+
+def _create_person(
+    created: dict[str, dict[str, Any]],
+    by_name: dict[str, PersonRef],
+    by_phone: dict[str, PersonRef],
+    refs: RefCounter,
+    name: str,
+    phone: str | None,
+) -> PersonRef:
+    """A person the sheet names and nobody knows: they get a ref, and later rows find them."""
+    ref = next(refs)
+    created[ref] = {"name": name[:255], "phone": phone, "pairs": []}
+    person = (ref, name)
+    by_name[name.casefold()] = person
+    if key := phone_key(phone):
+        by_phone[key] = person
+    return person
+
+
 def _raw(cells: list[Any], mapping: dict[str, int], key: str) -> Any:
     index = mapping.get(key)
     if index is None or index >= len(cells):
@@ -92,23 +171,21 @@ def _text(cells: list[Any], mapping: dict[str, int], key: str) -> str:
 def judge_orders(
     sheet: Sheet, mapping: dict[str, int], seen: Seen, ctx: OrdersContext
 ) -> list[RowResult]:
-    known: dict[OrderKey, str] = {
-        order_key(
-            o.client_id,
-            o.order_date,
-            o.source_language,
-            o.target_language,
-            o.page_count,
-            o.price,
-            o.identifier,
-        ): o.label
-        for o in ctx.existing_orders
-    }
-    new_clients = [0]
-    return [
-        _judge_order(number, cells, mapping, seen, ctx, known, new_clients)
-        for number, cells in sheet.rows
-    ]
+    if ctx.known_orders is None:
+        ctx.known_orders = {
+            order_key(
+                o.client_id,
+                o.order_date,
+                o.source_language,
+                o.target_language,
+                o.page_count,
+                o.price,
+                o.identifier,
+            ): o.label
+            for o in ctx.existing_orders
+        }
+    known = ctx.known_orders
+    return [_judge_order(number, cells, mapping, seen, ctx, known) for number, cells in sheet.rows]
 
 
 def _judge_order(
@@ -118,7 +195,6 @@ def _judge_order(
     seen: Seen,
     ctx: OrdersContext,
     known: dict[OrderKey, str],
-    new_clients: list[int],
 ) -> RowResult:
     result = RowResult(row=number, status="ok")
 
@@ -178,14 +254,30 @@ def _judge_order(
         return fail(f"The price {price_text!r} is not an amount." if price_text else "No price.")
 
     translator_text = _text(cells, mapping, "translator")
-    translator = ctx.translators.get(translator_text.casefold()) if translator_text else None
-    if translator_text and translator is None:
+    translator_phone = clean_phone(_text(cells, mapping, "translator_phone"))
+    translator = _find_person(
+        ctx.translators, ctx.translators_by_phone, translator_text, translator_phone
+    )
+    new_translator = bool(translator_text) and translator is None and ctx.create_translators
+    if translator_text and translator is None and not ctx.create_translators:
         result.warnings.append(f"Translator {translator_text[:30]!r} not found: left unassigned.")
 
     cost_text = _text(cells, mapping, "translator_cost")
     translator_cost = parse_rate(cost_text) if cost_text else None
     if cost_text and translator_cost is None:
         result.warnings.append(f"Translator cost left out: {cost_text[:20]!r} is not an amount.")
+
+    notary_text = _text(cells, mapping, "notary")
+    notary_phone = clean_phone(_text(cells, mapping, "notary_phone"))
+    notary = _find_person(ctx.notaries, ctx.notaries_by_phone, notary_text, notary_phone)
+    new_notary = bool(notary_text) and notary is None and ctx.create_notaries
+    if notary_text and notary is None and not ctx.create_notaries:
+        result.warnings.append(f"Notary {notary_text[:30]!r} not found: left unassigned.")
+
+    notary_cost_text = _text(cells, mapping, "notary_cost")
+    notary_cost = parse_rate(notary_cost_text) if notary_cost_text else None
+    if notary_cost_text and notary_cost is None:
+        result.warnings.append(f"Notary cost left out: {notary_cost_text[:20]!r} is not an amount.")
 
     status_text = _text(cells, mapping, "status")
     status = ctx.status_lookup(status_text) if status_text else None
@@ -238,7 +330,7 @@ def _judge_order(
             return fail("No client name, and no phone, email or ID number that matches a client.")
         if len(name) > 255:
             return fail("The client name is longer than 255 characters.")
-        client_ref = f"new:{new_clients[0]}"
+        client_ref = ctx.client_refs.peek()
         client_label = name
         new_client = {
             "name": name,
@@ -259,8 +351,31 @@ def _judge_order(
 
     # ── Accepted: from here the row is real ─────────────────────────────────
     known[key] = f"row {number}"
+    if new_translator:
+        translator = _create_person(
+            ctx.new_translators,
+            ctx.translators,
+            ctx.translators_by_phone,
+            ctx.translator_refs,
+            translator_text,
+            translator_phone,
+        )
+    if new_notary:
+        notary = _create_person(
+            ctx.new_notaries,
+            ctx.notaries,
+            ctx.notaries_by_phone,
+            ctx.notary_refs,
+            notary_text,
+            notary_phone,
+        )
+    if translator is not None and translator[0] in ctx.new_translators:
+        # A translator made from the sheet works the pairs the sheet shows them in.
+        pairs = ctx.new_translators[str(translator[0])]["pairs"]
+        if (source, target) not in pairs:
+            pairs.append((source, target))
     if new_client is not None:
-        new_clients[0] += 1
+        next(ctx.client_refs)
         seen.add(
             ExistingPerson(
                 label=name,
@@ -283,6 +398,8 @@ def _judge_order(
         "price": price,
         "translator_id": translator[0] if translator else None,
         "translator_cost": translator_cost or Decimal("0"),
+        "notary_id": notary[0] if notary else None,
+        "notary_cost": notary_cost or Decimal("0"),
         "status": status,
         "paid": paid,
         "identifier": identifier,

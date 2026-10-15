@@ -27,10 +27,12 @@ from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant
 from suliko.domain import imports as engine
 from suliko.domain.plans import TenantPlan
 from suliko.models.collaboration import OrderComment
-from suliko.models.directory import Client, Translator, TranslatorLanguagePair
+from suliko.models.directory import Client, Notary, Translator, TranslatorLanguagePair
 from suliko.models.finance import (
     ClientPayment,
     ClientPaymentAllocation,
+    NotaryPayment,
+    NotaryPaymentAllocation,
     PaymentMethod,
     TranslatorPayment,
     TranslatorPaymentAllocation,
@@ -294,6 +296,9 @@ MODELS = (
     Client,
     Translator,
     TranslatorLanguagePair,
+    Notary,
+    NotaryPayment,
+    NotaryPaymentAllocation,
     ImportBatch,
     ImportBatchItem,
     Order,

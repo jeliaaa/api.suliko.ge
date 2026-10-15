@@ -26,6 +26,8 @@ dependencies = [
     "python-multipart>=0.0.18",
     # Reading the spreadsheets bureaus import (api/v1/imports.py).
     "openpyxl>=3.1",
+    # The old .xls files bureaus still keep their books in (api/v1/imports.py).
+    "xlrd>=2.0.1",
     "httpx>=0.28",
     "email-validator>=2.2",
     # Renders the TOTP enrolment URI as a scannable QR in the terminal, so a
@@ -107,7 +109,7 @@ exclude = ["alembic/versions/"]
 
 [[tool.mypy.overrides]]
 # None ships type stubs or a py.typed marker.
-module = ["pyotp.*", "asyncpg.*", "qrcode.*", "lxml.*"]
+module = ["pyotp.*", "asyncpg.*", "qrcode.*", "lxml.*", "xlrd.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
