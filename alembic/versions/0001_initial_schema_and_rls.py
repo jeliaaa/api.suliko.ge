@@ -108,6 +108,9 @@ LATER_REVISION_TABLES = frozenset(
         "import_batch_items",
         # 0029
         "account_deletion_requests",
+        # 0031
+        "billing_packages",
+        "billing_invoices",
     }
 )
 

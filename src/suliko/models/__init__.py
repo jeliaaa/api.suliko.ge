@@ -7,6 +7,7 @@ which silently produces a migration that drops nothing and creates nothing.
 
 from suliko.db.base import Base
 from suliko.models.audit import ActorType, AuditLog
+from suliko.models.billing import BillingInvoice, BillingInvoiceStatus, BillingPackage
 from suliko.models.cms import PageStatus, ServicePage, SiteString
 from suliko.models.collaboration import (
     Notification,
@@ -90,6 +91,9 @@ __all__ = [
     "ActorType",
     "AuditLog",
     "Base",
+    "BillingInvoice",
+    "BillingInvoiceStatus",
+    "BillingPackage",
     "Client",
     "ClientPayment",
     "ClientPaymentAllocation",

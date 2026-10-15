@@ -9,7 +9,7 @@ from __future__ import annotations
 import enum
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, String, false
+from sqlalchemy import Boolean, DateTime, Enum, SmallInteger, String, false
 from sqlalchemy.orm import Mapped, mapped_column
 
 from suliko.db.base import Base, IdMixin, TimestampMixin, enum_values
@@ -50,6 +50,12 @@ class Tenant(Base, IdMixin, TimestampMixin):
         nullable=False,
     )
     plan: Mapped[str | None] = mapped_column(String(50), default=None)
+    #: Which order package the bureau's monthly fee is (`models.billing`): 1, 2 or
+    #: 3. Not `plan`, which is the kind of account. Every tenant starts on 1, and
+    #: only a superuser changes it.
+    package_tier: Mapped[int] = mapped_column(
+        SmallInteger, default=1, server_default="1", nullable=False
+    )
     locale: Mapped[str] = mapped_column(String(5), default="ka", nullable=False)
     #: IANA zone name. "Today" — an order's default date, what is overdue,
     #: which month a payment falls in — is a calendar question, and answering

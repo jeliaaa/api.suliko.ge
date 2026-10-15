@@ -75,6 +75,9 @@ LATER_REVISIONS = (
     "0029_account_deletion_requests.py",
     # Six columns on account_deletion_requests — see test_migration_0030.py.
     "0030_deletion_review.py",
+    # billing_packages, billing_invoices and tenants.package_tier — see
+    # test_migration_0031.py.
+    "0031_order_packages.py",
 )
 
 
