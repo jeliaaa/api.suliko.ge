@@ -44,7 +44,7 @@ from suliko.core.errors import (
     RateLimitedError,
     ValidationError,
 )
-from suliko.core.mail_layout import Bold, Button, Email, Link, callout, compose, fine, p
+from suliko.core.mail_layout import Bold, Button, Email, Link, callout, compose, fine, p, span
 from suliko.core.ratelimit import RateLimiter, get_rate_limiter
 from suliko.db.session import bind_tenant_guc, get_sessionmaker, session_scope
 from suliko.db.tenancy import bypass_tenant_scope, tenant_scope
@@ -509,21 +509,21 @@ async def login_options(payload: TicketRequest) -> LoginOptions:
 def _personal_enabled_email(account: Account, link: str) -> Email:
     """The notice that a personal workspace now exists for this account."""
     return compose(
-        subject="Your personal Suliko account is enabled",
-        heading="Your personal account is ready",
-        preheader="It is yours alone: your own clients, orders and prices.",
+        subject="თქვენი პირადი ანგარიში ჩართულია",
+        heading="პირადი ანგარიში მზად არის",
+        preheader="ის მხოლოდ თქვენია: საკუთარი კლიენტები, შეკვეთები და ფასები.",
         blocks=[
-            p(f"Hello {account.full_name or login_name(account)},"),
+            p(f"გამარჯობა, {account.full_name or login_name(account)}!"),
             p(
-                "Your personal Suliko account is now enabled, on the Freelancer plan. "
-                "It is yours alone: your own clients, orders and prices, separate from "
-                "any bureau you work with."
+                "თქვენი პირადი Suliko ანგარიში ჩაირთო Freelancer პაკეტით. "
+                "ის მხოლოდ თქვენია: საკუთარი კლიენტები, შეკვეთები და ფასები, "
+                "ბიუროებისგან, რომლებთანაც მუშაობთ, განცალკევებით."
             ),
-            p("Open it any time from the organisation switcher, or sign in here."),
-            Button("Open Suliko Office", link),
-            fine("If you did not do this, sign in and change your password."),
+            p("გახსენით ის ორგანიზაციის გადამრთველიდან ან შედით აქედან."),
+            Button("Suliko Office-ის გახსნა", link),
+            fine("თუ ეს თქვენ არ გაგიკეთებიათ, შედით და შეცვალეთ პაროლი."),
         ],
-        reason="You received this because a personal account was enabled for this address.",
+        reason="ამ წერილს იღებთ, რადგან ამ მისამართზე პირადი ანგარიში ჩაირთო.",
     )
 
 
@@ -960,28 +960,28 @@ def _existing_account(plan: str | None, display_name: str) -> dict[str, str]:
 
 def _verification_email(user: User, tenant: Tenant, link: str, ttl_hours: int) -> Email:
     """The signup's "is this address really yours" link."""
-    days = ttl_hours // 24
-    validity = f"{days} day{'s' if days != 1 else ''}" if days else f"{ttl_hours} hours"
+    validity = span(days=ttl_hours // 24, hours=ttl_hours)
     return compose(
-        subject="Confirm your email for Suliko",
-        heading="Confirm your email address",
-        preheader=f"One step to finish setting up {tenant.display_name}.",
+        subject="ელფოსტის დადასტურება: Suliko",
+        heading="დაადასტურეთ ელფოსტა",
+        preheader=f"ერთი ნაბიჯი დარჩა: {tenant.display_name}.",
         blocks=[
-            p(f"Hello {user.full_name or user.username},"),
+            p(f"გამარჯობა, {user.full_name or user.username}!"),
             p(
-                "Welcome to Suliko. Confirm this address to finish setting up ",
+                "კეთილი იყოს თქვენი მობრძანება Suliko-ში. დაადასტურეთ ეს მისამართი, "
+                "რომ დასრულდეს ორგანიზაციის მოწყობა: ",
                 Bold(tenant.display_name),
                 ".",
             ),
-            Button("Confirm email address", link),
+            Button("ელფოსტის დადასტურება", link),
             fine(
-                f"The link works once and expires in {validity}. Nothing about your "
-                "account is on hold while you do this. It is only so we know this "
-                "address is really yours."
+                f"ბმული მუშაობს ერთხელ და მოქმედია {validity} განმავლობაში. "
+                "თქვენი ანგარიში ამის გამო არსად ჩერდება: ეს მხოლოდ იმისთვისაა, "
+                "რომ ვიცოდეთ, ეს მისამართი ნამდვილად თქვენია."
             ),
-            fine("If you did not sign up for Suliko, you can ignore this email."),
+            fine("თუ Suliko-ში არ დარეგისტრირებულხართ, უგულებელყავით ეს წერილი."),
         ],
-        reason="You received this because this address was used to sign up for Suliko.",
+        reason="ამ წერილს იღებთ, რადგან ეს მისამართი Suliko-ში რეგისტრაციისას მიუთითეს.",
     )
 
 
@@ -1278,58 +1278,56 @@ class ChangePasswordRequest(BaseModel):
 
 def _reset_email(account: Account, link: str, ttl_minutes: int) -> Email:
     """The link that lets someone choose a new password of their own."""
-    hours = ttl_minutes // 60
-    validity = f"{hours} hour{'s' if hours != 1 else ''}" if hours else f"{ttl_minutes} minutes"
+    validity = span(hours=ttl_minutes // 60, minutes=ttl_minutes)
     return compose(
-        subject="Reset your Suliko password",
-        heading="Reset your password",
-        preheader="Choose a new password. The link works once.",
+        subject="პაროლის აღდგენა: Suliko",
+        heading="პაროლის აღდგენა",
+        preheader="აირჩიეთ ახალი პაროლი. ბმული მხოლოდ ერთხელ მუშაობს.",
         blocks=[
-            p(f"Hello {account.full_name or account.email},"),
+            p(f"გამარჯობა, {account.full_name or account.email}!"),
             p(
-                "Someone asked to reset the password for your Suliko account (",
+                "ვიღაცამ მოითხოვა თქვენი Suliko ანგარიშის (",
                 Bold(account.email or ""),
-                "). Open the link below to choose a new one.",
+                ") პაროლის აღდგენა. ახალი პაროლის ასარჩევად გახსენით ქვემოთ მოცემული ბმული.",
             ),
-            Button("Choose a new password", link),
+            Button("ახალი პაროლის არჩევა", link),
             fine(
-                f"The link works once and expires in {validity}. The new password "
-                "is the one you sign in with everywhere, in every organisation you "
-                "belong to."
+                f"ბმული მუშაობს ერთხელ და მოქმედია {validity} განმავლობაში. ახალი პაროლი "
+                "ერთია ყველა ორგანიზაციისთვის, რომელშიც ხართ."
             ),
             callout(
-                "If this wasn't you, you can ignore this email. Your password has "
-                "not changed. Nobody can use this link without opening it."
+                "თუ ეს თქვენ არ იყავით, უგულებელყავით ეს წერილი. თქვენი პაროლი არ "
+                "შეცვლილა. ბმულის გახსნის გარეშე მისი გამოყენება შეუძლებელია."
             ),
         ],
-        reason="You received this because a password reset was requested for this address.",
+        reason="ამ წერილს იღებთ, რადგან ამ მისამართზე პაროლის აღდგენა მოითხოვეს.",
     )
 
 
 def _suliko_password_email(account: Account, reset_url: str) -> Email:
     """For someone whose password lives on suliko.ge: where to reset it."""
     return compose(
-        subject="Reset your Suliko password",
-        heading="Reset your password on suliko.ge",
-        preheader="Your password is kept on suliko.ge. Reset it there.",
+        subject="პაროლის აღდგენა: Suliko",
+        heading="პაროლის აღდგენა suliko.ge-ზე",
+        preheader="თქვენი პაროლი suliko.ge-ზე ინახება. იქ აღადგინეთ.",
         blocks=[
-            p(f"Hello {account.full_name or login_name(account)},"),
+            p(f"გამარჯობა, {account.full_name or login_name(account)}!"),
             p(
-                "Someone asked to reset the password for your Suliko Office account (",
+                "ვიღაცამ მოითხოვა თქვენი Suliko Office ანგარიშის (",
                 Bold(login_name(account)),
-                "). Your password is kept on suliko.ge, and Suliko Office signs you in "
-                "with it, so it is changed there.",
+                ") პაროლის აღდგენა. თქვენი პაროლი suliko.ge-ზე ინახება და Suliko Office "
+                "შესასვლელად სწორედ მას იყენებს, ამიტომ იგი იქვე იცვლება.",
             ),
-            Button("Reset password on suliko.ge", reset_url),
-            p("Then sign in to Suliko Office with the new password."),
+            Button("პაროლის აღდგენა suliko.ge-ზე", reset_url),
+            p("შემდეგ Suliko Office-ში შედით ახალი პაროლით."),
             callout(
-                "No suliko.ge account yet? Register with exactly this email address, "
-                "then sign in here: ",
+                "suliko.ge-ზე ანგარიში ჯერ არ გაქვთ? დარეგისტრირდით Google-ით, ზუსტად "
+                "ამ ელფოსტით, და შემდეგ შედით აქედან: ",
                 Link(registration_url(), registration_url()),
             ),
-            fine("If this wasn't you, you can ignore this email. Nothing has changed."),
+            fine("თუ ეს თქვენ არ იყავით, უგულებელყავით ეს წერილი. არაფერი შეცვლილა."),
         ],
-        reason="You received this because a password reset was requested for this address.",
+        reason="ამ წერილს იღებთ, რადგან ამ მისამართზე პაროლის აღდგენა მოითხოვეს.",
     )
 
 

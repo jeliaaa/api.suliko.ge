@@ -741,15 +741,15 @@ def test_the_note_to_the_team_says_what_to_check_and_how_to_cancel() -> None:
     message = team_email(account, request, organisation="Acme", organisation_slug="acme")
     subject, body = message.subject, message.text
 
-    assert subject == "Account deletion request: Nino Beridze"
+    assert subject == "ანგარიშის წაშლის მოთხოვნა: Nino Beridze"
     for expected in (
         "nino@acme.ge",
         "abc-123",
         "2026-10-15 09:30 UTC",
-        "unpaid invoices",
-        "payouts owed to a translator",
-        "only owner",
-        f"{DELETION_GRACE_DAYS} days",
+        "გადაუხდელი ინვოისები",
+        "თარჯიმნისთვის გადასახდელი თანხები",
+        "ერთადერთი მფლობელიც",
+        f"{DELETION_GRACE_DAYS} დღეში",
         "cancel-deletion-request --id 41",
     ):
         assert expected in body, expected
@@ -758,10 +758,10 @@ def test_the_note_to_the_team_says_what_to_check_and_how_to_cancel() -> None:
 def test_the_note_to_the_person_promises_only_what_the_flow_does() -> None:
     message = person_email(Account(id=7, email="n@x.ge", full_name="Nino", password_hash="!"))
     subject, body = message.subject, message.text
-    assert "delete" in subject
-    assert "Hello Nino," in body
-    assert f"{DELETION_GRACE_DAYS} days" in body
-    assert "Write to info@suliko.ge" in body
+    assert "წაშლის მოთხოვნა" in subject
+    assert "გამარჯობა, Nino!" in body
+    assert f"{DELETION_GRACE_DAYS} დღეში" in body
+    assert "მოგვწერეთ: info@suliko.ge" in body
     assert "—" not in body  # no em dashes in Suliko copy
 
 

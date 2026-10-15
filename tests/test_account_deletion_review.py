@@ -688,8 +688,8 @@ async def test_the_command_deletes_what_is_due_and_tells_the_person(
         assert request.status is DeletionStatus.DONE
     (to, subject, body) = told[0]
     assert to == "nino@acme.ge"
-    assert "deleted" in subject
-    assert "Hello Nino Beridze," in body
+    assert "წაიშალა" in subject
+    assert "გამარჯობა, Nino Beridze!" in body
 
     # A second run has nothing left to do.
     told.clear()
@@ -765,7 +765,7 @@ def test_the_person_is_told_when_it_will_happen_and_how_to_stop_it() -> None:
     )
     message = approved_email(account, request)
     subject, body = message.subject, message.text
-    assert "deleted" in subject
+    assert "წაიშლება" in subject
     assert "2026-11-14" in body
     assert "info@suliko.ge" in body
     assert "—" not in body
@@ -775,16 +775,16 @@ def test_the_person_is_told_when_it_will_happen_and_how_to_stop_it() -> None:
 def test_the_person_is_told_the_request_ended_and_they_can_sign_in() -> None:
     message = rejected_email(Account(id=7, email="n@x.ge", full_name="Nino", password_hash="!"))
     subject, body = message.subject, message.text
-    assert "open again" in subject
-    assert "sign in again" in body
+    assert "ისევ ღიაა" in subject
+    assert "შეგიძლიათ შეხვიდეთ" in body
     assert "—" not in body
 
 
 def test_the_person_is_told_it_is_done() -> None:
     message = done_email("Nino")
     subject, body = message.subject, message.text
-    assert "has been deleted" in subject
-    assert "Hello Nino," in body
+    assert "წაიშალა" in subject
+    assert "გამარჯობა, Nino!" in body
     assert "—" not in body
 
 
@@ -844,7 +844,7 @@ async def test_approving_over_the_api_audits_tells_the_person_and_answers_with_t
     (task,) = background.tasks
     assert task.func is mail.send
     assert task.args[0] == "nino@acme.ge"
-    assert "will be deleted" in task.args[1]
+    assert "წაიშლება" in task.args[1]
 
 
 @pytest.mark.asyncio
@@ -899,7 +899,7 @@ async def test_rejecting_over_the_api_reopens_tells_the_person_and_audits(
     assert entry["action"] == "platform.deletion_rejected"
     (task,) = background.tasks
     assert task.args[0] == "nino@acme.ge"
-    assert "open again" in task.args[1]
+    assert "ისევ ღიაა" in task.args[1]
 
 
 @pytest.mark.asyncio

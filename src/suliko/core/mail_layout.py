@@ -25,6 +25,14 @@ cannot show HTML, and a spam filter comparing the two, get the same words.
 - Links are always shown as text as well as behind the button, so a person can
   check where a link goes before opening it, and still use it when the button
   is stripped.
+
+## Language
+
+Georgian, because that is the market (decided 2026-10-15). The words the layout
+adds itself live in the two constants below; the sentences are each message's
+own. Georgian has no capitals and no bold weight worth shipping, so the
+wordmark (Latin, the brand) is the only uppercase text and nothing else is
+letter-spaced.
 """
 
 from __future__ import annotations
@@ -55,6 +63,24 @@ _FONT = (
 _MONO = "ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"
 
 PRODUCT = "Suliko"
+#: Under a button: where to copy the link from when the button is stripped.
+COPY_LINK = "ან დააკოპირეთ ეს ბმული ბრაუზერში:"
+#: The document's language, for screen readers and hyphenation.
+LANG = "ka"
+
+
+def span(*, days: int = 0, hours: int = 0, minutes: int = 0) -> str:
+    """How long a link lasts, as "7 დღის", "1 საათის" or "30 წუთის".
+
+    The genitive, which is what "for ... " (`... განმავლობაში`) wants, and the
+    noun stays singular after a number in Georgian, so there is no plural to
+    get wrong. The largest unit that is set wins.
+    """
+    if days:
+        return f"{days} დღის"
+    if hours:
+        return f"{hours} საათის"
+    return f"{minutes} წუთის"
 
 
 class Email(NamedTuple):
@@ -242,7 +268,7 @@ def _button_html(button: Button) -> str:
         )
     link_line = (
         f'<div class="muted" style="padding:10px 0 0 0;font-size:12px;line-height:1.5;'
-        f'color:{_MUTED};">Or copy this link into your browser:<br>'
+        f'color:{_MUTED};">{COPY_LINK}<br>'
         f'<a class="link" href="{_esc(button.url)}" style="font-family:{_MONO};'
         f'font-size:12px;color:{_ACCENT};word-break:break-all;">{_esc(button.url)}</a></div>'
         if button.show_link
@@ -367,7 +393,7 @@ def _wrap(heading: str, preheader: str, blocks: Sequence[Block], reason: str | N
         f'<div class="muted" style="padding:0 0 6px 0;">{_esc(reason)}</div>' if reason else ""
     )
     return (
-        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        f'<!doctype html><html lang="{LANG}"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
         '<meta name="color-scheme" content="light dark">'
         '<meta name="supported-color-schemes" content="light dark">'
@@ -440,4 +466,5 @@ __all__ = [
     "compose",
     "fine",
     "p",
+    "span",
 ]

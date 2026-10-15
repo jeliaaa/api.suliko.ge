@@ -178,15 +178,21 @@ def test_the_reset_mail_carries_the_link_and_its_lifetime() -> None:
     message = _reset_email(account, link, 60)
     subject, body = message.subject, message.text
 
-    assert "password" in subject.lower()
+    assert "პაროლის აღდგენა" in subject
     assert link in body
-    assert "1 hour" in body
+    assert "1 საათის განმავლობაში" in body
     assert account.email in body
     # One password for every organisation — the mail says so.
-    assert "every organisation" in body
+    assert "ყველა ორგანიზაციისთვის" in body
     # Says what to do if it wasn't you, because most recipients of an
     # unexpected reset mail did not ask for it.
-    assert "ignore" in body.lower()
+    assert "უგულებელყავით" in body
+
+
+def test_a_reset_that_lasts_under_an_hour_is_told_in_minutes() -> None:
+    body = _reset_email(_account(), "https://example.test/x", 30).text
+
+    assert "30 წუთის განმავლობაში" in body
 
 
 def test_the_reset_mail_never_carries_a_password() -> None:
@@ -207,9 +213,9 @@ def test_the_verification_mail_carries_the_link_and_its_lifetime() -> None:
     message = _verification_email(user, tenant, link, 72)
     subject, body = message.subject, message.text
 
-    assert "confirm" in subject.lower()
+    assert "ელფოსტის დადასტურება" in subject
     assert link in body
-    assert "3 days" in body
+    assert "3 დღის განმავლობაში" in body
     assert tenant.display_name in body
 
 
@@ -220,7 +226,7 @@ def test_the_verification_mail_says_nothing_is_blocked_on_it() -> None:
 
     body = _verification_email(user, tenant, "https://example.test/x", 72).text
 
-    assert "on hold" in body.lower() or "not on hold" in body.lower()
+    assert "არსად ჩერდება" in body
 
 
 def test_the_verification_mail_never_carries_a_password() -> None:
@@ -237,4 +243,4 @@ def test_the_verification_mail_never_carries_a_password() -> None:
 def test_verification_ttl_under_a_day_is_shown_in_hours() -> None:
     user, tenant = _people()
     body = _verification_email(user, tenant, "https://example.test/x", 6).text
-    assert "6 hours" in body
+    assert "6 საათის განმავლობაში" in body

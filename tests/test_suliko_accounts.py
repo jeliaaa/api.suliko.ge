@@ -400,7 +400,7 @@ def test_the_suliko_reset_email_says_where_to_go_and_offers_no_local_link() -> N
 
     for version in (message.text, message.html):
         assert "https://suliko.ge/login" in version
-        assert "kept on suliko.ge" in version
+        assert "suliko.ge-ზე ინახება" in version
         # Someone who has not registered there yet is pointed at registration.
         assert "https://suliko.ge/sign-in?mode=register" in version
         assert "reset-password" not in version
@@ -514,11 +514,13 @@ def test_the_invitation_to_a_stranger_says_to_register_first() -> None:
         assert "https://suliko.ge/sign-in?mode=register" in version
         assert "accept-invite?token=T" in version
         assert "new@suliko.ge" in version
-        assert version.index("Register on suliko.ge") < version.index("accept-invite")
+        assert version.index("რეგისტრაცია suliko.ge-ზე") < version.index("accept-invite")
         # The one-time-password flow is gone for them.
-        assert "Choose your password" not in version
+        assert "პაროლის არჩევა" not in version
         assert "reset-password" not in version
-    assert "exactly this email address: new@suliko.ge" in message.text
+        # What they are told about a phone sign-up, in the email as in the text.
+        assert "ტელეფონის ნომრით რეგისტრაცია ამ მოწვევას ვერ დაუკავშირდება" in version
+    assert "Google-ით, ზუსტად ამ ელფოსტით: new@suliko.ge" in message.text
 
 
 def test_the_other_invitations_are_as_they_were() -> None:
@@ -530,11 +532,11 @@ def test_the_other_invitations_are_as_they_were() -> None:
         _invitee(), "Acme", "L", "Boss", 7, existing_account=False, **kwargs
     )
 
-    assert "Accept the invitation to join Acme" in existing.text
-    assert "Accept invitation" in existing.html
-    assert "Choose your password" in fresh.text
-    assert "Choose your password" in fresh.html
-    assert "expires in 7 days" in existing.text
+    assert "დაადასტურეთ მოწვევა: Acme" in existing.text
+    assert "მოწვევის დადასტურება" in existing.html
+    assert "პაროლის არჩევა" in fresh.text
+    assert "პაროლის არჩევა" in fresh.html
+    assert "7 დღის განმავლობაში" in existing.text
 
 
 def test_invite_resolves_people_through_suliko_before_creating_a_placeholder() -> None:

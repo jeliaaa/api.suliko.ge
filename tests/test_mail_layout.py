@@ -24,6 +24,7 @@ from suliko.core.mail_layout import (
     compose,
     fine,
     p,
+    span,
 )
 from suliko.domain import account_deletion as deletion
 from suliko.models.tenant import Tenant, TenantStatus
@@ -210,8 +211,37 @@ def test_the_plain_text_says_nothing_the_html_does_not() -> None:
 
 def test_every_email_says_why_it_was_sent() -> None:
     for name, email in _every_email().items():
-        assert "You received this because" in email.text, name
-        assert "You received this because" in email.html, name
+        assert "ამ წერილს იღებთ" in email.text, name
+        assert "ამ წერილს იღებთ" in email.html, name
+
+
+def _letters(text: str) -> tuple[int, int]:
+    """Georgian and Latin letters in a message."""
+    georgian = sum(0x10A0 <= ord(char) <= 0x10FF for char in text)
+    latin = sum(char.isascii() and char.isalpha() for char in text)
+    return georgian, latin
+
+
+def test_every_email_is_in_georgian() -> None:
+    """The market is Georgian (decided 2026-10-15). What stays Latin is the
+    brand, the product, addresses, links and commands, so the Georgian letters
+    must clearly outnumber the Latin ones in the sentences."""
+    for name, email in _every_email().items():
+        assert 'lang="ka"' in email.html, name
+        assert any(0x10A0 <= ord(char) <= 0x10FF for char in email.subject), name
+        # Without addresses and links, which are Latin by nature.
+        prose = re.sub(r"https?://\S+|\S+@\S+|\bpython -m \S+.*", "", email.text)
+        georgian, latin = _letters(prose)
+        assert georgian > 3 * latin, (name, georgian, latin)
+
+
+def test_how_long_a_link_lasts_is_told_in_georgian() -> None:
+    assert span(days=7) == "7 დღის"
+    assert span(hours=1) == "1 საათის"
+    assert span(minutes=30) == "30 წუთის"
+    # The largest unit that is set wins.
+    assert span(days=3, hours=72) == "3 დღის"
+    assert span(hours=0, minutes=45) == "45 წუთის"
 
 
 def test_every_email_has_one_obvious_thing_to_do_or_nothing_to_do() -> None:

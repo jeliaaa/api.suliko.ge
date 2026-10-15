@@ -675,7 +675,7 @@ async def purge_account(
 
 
 def _when(moment: datetime | None) -> str:
-    return moment.strftime("%Y-%m-%d %H:%M UTC") if moment else "just now"
+    return moment.strftime("%Y-%m-%d %H:%M UTC") if moment else "ახლახან"
 
 
 def team_email(
@@ -688,37 +688,44 @@ def team_email(
     """The note to the team that a request has arrived."""
     name = account.full_name or login_name(account)
     return compose(
-        subject=f"Account deletion request: {name}",
-        heading="Account deletion request",
-        preheader=f"{name} asked for their account to be deleted. Access is closed.",
+        subject=f"ანგარიშის წაშლის მოთხოვნა: {name}",
+        heading="ანგარიშის წაშლის მოთხოვნა",
+        preheader=f"{name}: ანგარიშის წაშლა მოითხოვეს. წვდომა დახურულია.",
         blocks=[
             p(
                 Bold(name),
-                " has asked for their Suliko Office account to be deleted. Their access is closed.",
+                " ითხოვს Suliko Office-ის ანგარიშის წაშლას. მისი წვდომა დახურულია.",
             ),
             Facts(
                 [
-                    ("Name", name),
-                    ("Email", account.email or "(none)"),
-                    ("Phone", account.phone or "(none)"),
-                    ("suliko.ge id", str(account.suliko_user_id or "(an Office-only account)")),
-                    ("Asked from", f"{organisation} ({organisation_slug})"),
-                    ("Request", f"{request.id}, filed {_when(request.created_at)}"),
+                    ("სახელი", name),
+                    ("ელფოსტა", account.email or "(არ აქვს)"),
+                    ("ტელეფონი", account.phone or "(არ აქვს)"),
+                    (
+                        "suliko.ge id",
+                        str(account.suliko_user_id or "(მხოლოდ Office-ის ანგარიში)"),
+                    ),
+                    ("მოთხოვნა გაიგზავნა", f"{organisation} ({organisation_slug})"),
+                    ("მოთხოვნა", f"{request.id}, შეიქმნა: {_when(request.created_at)}"),
                 ]
             ),
             p(
-                "Confirm it only if they have no obligations: unpaid invoices or orders "
-                "in progress, payouts owed to a translator, an organisation they are the "
-                "only owner of, or a suliko.ge balance owed. Once confirmed, the account "
-                f"is deleted within {DELETION_GRACE_DAYS} days."
+                "დაადასტურეთ მხოლოდ იმ შემთხვევაში, თუ მას ვალდებულებები არ აქვს: "
+                "გადაუხდელი ინვოისები ან მიმდინარე შეკვეთები, თარჯიმნისთვის გადასახდელი "
+                "თანხები, ორგანიზაცია, რომლის ერთადერთი მფლობელიც ის არის, ან "
+                "suliko.ge-ზე გადასახდელი ბალანსი. დადასტურებიდან "
+                f"{DELETION_GRACE_DAYS} დღეში ანგარიში წაიშლება."
             ),
-            Button("Review in the admin console", f"{get_settings().app_url.rstrip('/')}/admin"),
+            Button(
+                "გახსენით ადმინისტრატორის კონსოლი",
+                f"{get_settings().app_url.rstrip('/')}/admin",
+            ),
             callout(
-                "If they write to cancel, reject it in the console, or run on the API server: ",
+                "თუ ის გაუქმებას მოგწერთ, უარყავით მოთხოვნა კონსოლში ან გაუშვით API სერვერზე: ",
                 Bold(f"python -m suliko.cli cancel-deletion-request --id {request.id}"),
             ),
         ],
-        reason="You received this because you are on the Suliko team.",
+        reason="ამ წერილს იღებთ, როგორც Suliko-ს გუნდის წევრი.",
     )
 
 
@@ -726,30 +733,31 @@ def person_email(account: Account) -> Email:
     """The confirmation to the person who asked."""
     support = get_settings().support_email
     return compose(
-        subject="We have your request to delete your Suliko account",
-        heading="We have your request",
-        preheader="Your access is closed while we review it.",
+        subject="მივიღეთ თქვენი Suliko ანგარიშის წაშლის მოთხოვნა",
+        heading="მოთხოვნა მივიღეთ",
+        preheader="განხილვის დროს თქვენი წვდომა დახურულია.",
         blocks=[
-            p(f"Hello {account.full_name or login_name(account)},"),
+            p(f"გამარჯობა, {account.full_name or login_name(account)}!"),
             p(
-                "We have your request to delete your Suliko Office account, and your "
-                "access is closed from now on."
+                "მივიღეთ თქვენი მოთხოვნა Suliko Office-ის ანგარიშის წაშლაზე. "
+                "თქვენი წვდომა ამიერიდან დახურულია."
             ),
             p(
-                "We look at every request. We confirm it only if you have no obligations, "
-                "for example unpaid invoices, orders in progress, payouts still owed to a "
-                "translator, or an organisation you are the only owner of. Once it is "
-                f"confirmed, your account is deleted within {DELETION_GRACE_DAYS} days. "
-                "Orders, clients and invoices stay with the organisation they belong to."
+                "ჩვენ ყოველ მოთხოვნას ვათვალიერებთ და ვადასტურებთ მხოლოდ მაშინ, თუ "
+                "ვალდებულებები არ გაქვთ, მაგალითად: გადაუხდელი ინვოისები, მიმდინარე "
+                "შეკვეთები, თარჯიმნისთვის გადასახდელი თანხები ან ორგანიზაცია, რომლის "
+                "ერთადერთი მფლობელიც ხართ. დადასტურებიდან "
+                f"{DELETION_GRACE_DAYS} დღეში თქვენი ანგარიში წაიშლება. შეკვეთები, "
+                "კლიენტები და ინვოისები რჩება იმ ორგანიზაციასთან, რომელსაც ეკუთვნის."
             ),
             callout(
-                "Changed your mind? Write to ",
+                "გადაიფიქრეთ? მოგვწერეთ: ",
                 Link(support, f"mailto:{support}"),
-                " and we will cancel the request and open your account again.",
+                ". მოთხოვნას გავაუქმებთ და თქვენს ანგარიშს ისევ გავხსნით.",
             ),
-            fine("If you did not ask for this, write to us straight away."),
+            fine("თუ ეს თქვენ არ მოგითხოვიათ, დაუყოვნებლივ მოგვწერეთ."),
         ],
-        reason="You received this because an account deletion was requested for this address.",
+        reason="ამ წერილს იღებთ, რადგან ამ მისამართზე ანგარიშის წაშლა მოითხოვეს.",
     )
 
 
@@ -758,24 +766,25 @@ def approved_email(account: Account, request: AccountDeletionRequest) -> Email:
     support = get_settings().support_email
     name = account.full_name or login_name(account)
     return compose(
-        subject="Your Suliko account will be deleted",
-        heading="Your deletion is confirmed",
-        preheader=f"Your account will be deleted on {_when(request.purge_after)}.",
+        subject="თქვენი Suliko ანგარიში წაიშლება",
+        heading="წაშლა დადასტურებულია",
+        preheader=f"თქვენი ანგარიში წაიშლება: {_when(request.purge_after)}.",
         blocks=[
-            p(f"Hello {name},"),
+            p(f"გამარჯობა, {name}!"),
             p(
-                "We have confirmed your request to delete your Suliko Office account. "
-                "Your account and personal details will be deleted on ",
+                "დავადასტურეთ თქვენი Suliko Office-ის ანგარიშის წაშლის მოთხოვნა. "
+                "თქვენი ანგარიში და პირადი მონაცემები წაიშლება: ",
                 Bold(_when(request.purge_after)),
-                ". Orders, clients and invoices stay with the organisation they belong to.",
+                ". შეკვეთები, კლიენტები და ინვოისები რჩება იმ ორგანიზაციასთან, რომელსაც ეკუთვნის.",
             ),
             callout(
-                "Until then your account stays closed. If you change your mind, write to ",
+                "ამ დრომდე თქვენი ანგარიში დახურული რჩება. თუ გადაიფიქრებთ, ამ თარიღამდე "
+                "მოგვწერეთ: ",
                 Link(support, f"mailto:{support}"),
-                " before that date and we will cancel the deletion.",
+                ". წაშლას გავაუქმებთ.",
             ),
         ],
-        reason="You received this because you asked for your account to be deleted.",
+        reason="ამ წერილს იღებთ, რადგან თქვენ მოითხოვეთ ანგარიშის წაშლა.",
     )
 
 
@@ -784,37 +793,37 @@ def rejected_email(account: Account) -> Email:
     support = get_settings().support_email
     name = account.full_name or login_name(account)
     return compose(
-        subject="Your Suliko account is open again",
-        heading="Your account is open again",
-        preheader="Nothing was deleted. You can sign in as before.",
+        subject="თქვენი Suliko ანგარიში ისევ ღიაა",
+        heading="ანგარიში ისევ ღიაა",
+        preheader="არაფერი წაშლილა. შეგიძლიათ ჩვეულებრივ შეხვიდეთ.",
         blocks=[
-            p(f"Hello {name},"),
+            p(f"გამარჯობა, {name}!"),
             p(
-                "Your request to delete your Suliko Office account has been cancelled. "
-                "Nothing was deleted, and you can sign in again as before."
+                "თქვენი Suliko Office-ის ანგარიშის წაშლის მოთხოვნა გაუქმდა. "
+                "არაფერი წაშლილა და ჩვეულებრივ შეგიძლიათ შეხვიდეთ."
             ),
-            fine("If you have questions, write to ", Link(support, f"mailto:{support}"), "."),
+            fine("კითხვები გაქვთ? მოგვწერეთ: ", Link(support, f"mailto:{support}"), "."),
         ],
-        reason="You received this because you asked for your account to be deleted.",
+        reason="ამ წერილს იღებთ, რადგან თქვენ მოითხოვეთ ანგარიშის წაშლა.",
     )
 
 
 def done_email(name: str) -> Email:
     """Telling the person the deletion has happened."""
     return compose(
-        subject="Your Suliko account has been deleted",
-        heading="Your account has been deleted",
-        preheader="Your name, contact details and sign-in are gone.",
+        subject="თქვენი Suliko ანგარიში წაიშალა",
+        heading="ანგარიში წაიშალა",
+        preheader="თქვენი სახელი, საკონტაქტო მონაცემები და შესვლა აღარ არსებობს.",
         blocks=[
-            p(f"Hello {name},"),
+            p(f"გამარჯობა, {name}!"),
             p(
-                "Your Suliko Office account has been deleted, as you asked. Your name, "
-                "contact details and sign-in are gone. Orders, clients and invoices stay "
-                "with the organisation they belong to."
+                "თქვენი Suliko Office-ის ანგარიში წაიშალა, როგორც ითხოვეთ. თქვენი "
+                "სახელი, საკონტაქტო მონაცემები და შესვლა აღარ არსებობს. შეკვეთები, "
+                "კლიენტები და ინვოისები რჩება იმ ორგანიზაციასთან, რომელსაც ეკუთვნის."
             ),
-            p("Thank you for using Suliko Office."),
+            p("გმადლობთ, რომ იყენებდით Suliko Office-ს."),
         ],
-        reason="You received this because you asked for your account to be deleted.",
+        reason="ამ წერილს იღებთ, რადგან თქვენ მოითხოვეთ ანგარიშის წაშლა.",
     )
 
 
