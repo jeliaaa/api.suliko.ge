@@ -227,6 +227,12 @@ def effective_permissions(
         else:
             granted.discard(permission)
 
+    # Managing people includes inviting them, whichever way each came about.
+    # Without this an admin an owner un-ticked `users.invite` for would keep
+    # `users.manage` and lose the Users screen's invite page.
+    if Permission.USERS_MANAGE in granted:
+        granted.add(Permission.USERS_INVITE)
+
     return frozenset(granted) & permissions_for_plan(plan)
 
 

@@ -437,11 +437,53 @@ def _guard_target(session: CurrentSession, row: User) -> None:
         raise PermissionDeniedError("You cannot change an account at or above your own role.")
 
 
+async def _guard_resend(db: Db, session: CurrentSession, row: User) -> None:
+    """`_guard_target`, except that you may send your own invitation again.
+
+    The rank guard stops acting on an equal rank (a Manager on another
+    Manager), which would leave a Manager unable to resend an invitation to
+    the very Manager they invited. So: if the guard refuses, the person who
+    recorded the invitation (`PortalAccountInvite.invited_by_user_id`) may
+    still go ahead, provided the invitee is not above them and is not a
+    superuser. Everyone else needs the rank.
+    """
+    try:
+        _guard_target(session, row)
+    except PermissionDeniedError:
+        if row.role is Role.SUPERUSER or RANK[row.role] > RANK[session.role]:
+            raise
+        sent_it = await db.scalar(
+            select(PortalAccountInvite.id)
+            .where(
+                PortalAccountInvite.kind == InviteKind.STAFF,
+                PortalAccountInvite.user_id == row.id,
+                PortalAccountInvite.invited_by_user_id == session.user_id,
+            )
+            .limit(1)
+        )
+        if sent_it is None:
+            raise
+
+
+def _sees_everyone(session: CurrentSession) -> bool:
+    """Whether this person manages users, and so sees every member.
+
+    Someone with only `users.invite` (a Manager, say) sees the members at or
+    below their own rank, read-only: enough to track an invitation and send it
+    again, and it does not show them who runs the organisation.
+    """
+    return Permission.USERS_MANAGE in session.permissions
+
+
+def _visible_roles(session: CurrentSession) -> list[Role]:
+    return [role for role, rank in RANK.items() if rank <= RANK[session.role]]
+
+
 @router.get("", response_model=UserPage)
 async def list_users(
     db: Db,
     session: CurrentSession,
-    _: Annotated[object, Depends(require(Permission.USERS_MANAGE))],
+    _: Annotated[object, Depends(require(Permission.USERS_INVITE))],
     search: Annotated[str | None, Query(max_length=255)] = None,
     role: Role | None = None,
     is_active: bool | None = None,
@@ -450,6 +492,8 @@ async def list_users(
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> UserPage:
     stmt = select(User)
+    if not _sees_everyone(session):
+        stmt = stmt.where(User.role.in_(_visible_roles(session)))
 
     if search:
         pattern = f"%{search}%"
@@ -498,7 +542,7 @@ class AccountLookup(BaseModel):
 async def lookup_account(
     db: Db,
     session: CurrentSession,
-    _: Annotated[object, Depends(require(Permission.USERS_MANAGE))],
+    _: Annotated[object, Depends(require(Permission.USERS_INVITE))],
     backend: Annotated[SulikoBackend, Depends(get_suliko_backend)],
     identifier: Annotated[str | None, Query(max_length=255)] = None,
     email: Annotated[str | None, Query(max_length=255)] = None,
@@ -507,9 +551,9 @@ async def lookup_account(
 
     `email` is the old name for `identifier`, still accepted.
 
-    Behind `users.manage`, like the invite it leads to: it tells an
-    organisation's administrator whether someone has an account, which is the
-    whole point of searching before inviting.
+    Behind `users.invite`, like the invite it leads to: it tells whoever may
+    invite whether someone has an account, which is the whole point of
+    searching before inviting.
 
     Someone registered on suliko.ge who has never opened Suliko Office has no
     account here yet, but is still found: suliko.ge is asked, and nothing is
@@ -672,11 +716,16 @@ async def invite_user(
     payload: UserInvite,
     db: Db,
     session: CurrentSession,
-    _: Annotated[object, Depends(require(Permission.USERS_MANAGE))],
+    _: Annotated[object, Depends(require(Permission.USERS_INVITE))],
     limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
     backend: Annotated[SulikoBackend, Depends(get_suliko_backend)],
 ) -> InviteOut:
-    """Invite someone into the organisation.
+    """Invite someone into the organisation, up to your own role.
+
+    A Manager invites staff and managers; an Admin up to admin; an Owner
+    anyone but a superuser (`_guard_assignable`). What the invitee may do
+    starts from the role and can never exceed what the inviter holds
+    (`_guard_grantable`).
 
     Someone who already has an account gets a pending membership and an
     accept link; their password stays theirs. That includes someone registered
@@ -935,7 +984,7 @@ async def resend_invitation(
     user_id: int,
     db: Db,
     session: CurrentSession,
-    _: Annotated[object, Depends(require(Permission.USERS_MANAGE))],
+    _: Annotated[object, Depends(require(Permission.USERS_INVITE))],
     limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
     backend: Annotated[SulikoBackend, Depends(get_suliko_backend)],
 ) -> InviteOut:
@@ -950,11 +999,16 @@ async def resend_invitation(
     For anyone whose invitation is still open, and for someone who accepted but
     has not yet registered on suliko.ge, which is the other way an invitation
     stalls. Not for someone who has joined: there is nothing to send them.
+
+    The rank guard applies (you send again to people below you), with one
+    exception: whoever sent an invitation may send it again even when the
+    invitee has their own rank, so a Manager can see their own invitation of
+    another Manager through (`_guard_resend`).
     """
     row = await db.get(User, user_id)
     if row is None:
         raise NotFoundError("User not found.")
-    _guard_target(session, row)
+    await _guard_resend(db, session, row)
     if not row.is_active:
         raise ValidationError("This account is switched off. Switch it on first.")
 
@@ -1021,10 +1075,12 @@ async def get_user(
     user_id: int,
     db: Db,
     session: CurrentSession,
-    _: Annotated[object, Depends(require(Permission.USERS_MANAGE))],
+    _: Annotated[object, Depends(require(Permission.USERS_INVITE))],
 ) -> UserOut:
     row = await db.get(User, user_id)
-    if row is None:
+    if row is None or (not _sees_everyone(session) and row.role not in _visible_roles(session)):
+        # Not "forbidden": someone who only invites does not learn that a
+        # member above their rank exists, any more than the list shows them.
         raise NotFoundError("User not found.")
     overrides = (await _overrides_for(db, [row.id])).get(row.id, {})
     suliko_account = (await _invite_status_for(db, [row.id])).get(row.id)
