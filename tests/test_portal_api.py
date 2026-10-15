@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
@@ -29,7 +30,12 @@ from sqlalchemy.pool import StaticPool
 
 from suliko.api.portal_deps import ASSERTION_HEADER, get_platform_db, get_tenant_sessions
 from suliko.config import get_settings
-from suliko.core.errors import ConflictError, NotFoundError, ValidationError
+from suliko.core.errors import (
+    ConflictError,
+    NotFoundError,
+    PermissionDeniedError,
+    ValidationError,
+)
 from suliko.core.ratelimit import RateLimiter
 from suliko.db.base import Base
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
@@ -2249,6 +2255,151 @@ async def test_a_resend_to_a_switched_off_account_is_refused(
 async def test_a_resend_for_nobody_is_not_found(maker: async_sessionmaker[AsyncSession]) -> None:
     with pytest.raises(NotFoundError):
         await _resend(maker, 9999)
+
+
+# ── A Manager invites, up to Manager ────────────────────────────────────────
+#
+# `users.invite` (decided 2026-10-15): invite up to your own role, send an
+# invitation again, and see the members at or below your own rank, read-only.
+# The permission model itself is in `test_manager_invites.py`.
+
+
+async def _invite_as(
+    maker: async_sessionmaker[AsyncSession],
+    session: AuthenticatedSession,
+    role: Role,
+    email: str,
+) -> Any:
+    from suliko.api.v1 import users as users_api
+
+    payload = users_api.UserInvite(full_name="Someone New", email=email, role=role)
+    with tenant_scope(ACME):
+        async with maker() as db:
+            result = await users_api.invite_user(
+                payload, db, session, session, RateLimiter(None), UnconfiguredSulikoBackend()
+            )
+            await db.commit()
+    return result
+
+
+async def _resend_as(
+    maker: async_sessionmaker[AsyncSession], session: AuthenticatedSession, user_id: int
+) -> Any:
+    from suliko.api.v1 import users as users_api
+
+    with tenant_scope(ACME):
+        async with maker() as db:
+            result = await users_api.resend_invitation(
+                user_id, db, session, session, RateLimiter(None), UnconfiguredSulikoBackend()
+            )
+            await db.commit()
+    return result
+
+
+async def _add_member(maker: async_sessionmaker[AsyncSession], role: Role, name: str) -> int:
+    async with maker() as db:
+        with tenant_scope(ACME):
+            row = User(
+                tenant_id=ACME,
+                username=f"{name}@example.com",
+                email=f"{name}@example.com",
+                full_name=name.title(),
+                password_hash="x",
+                role=role,
+                is_active=True,
+            )
+            db.add(row)
+            await db.commit()
+            return int(row.id)
+
+
+async def test_a_manager_invites_staff_and_managers_but_never_above(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
+) -> None:
+    manager = _manager_session(ACME)
+
+    staff = await _invite_as(maker, manager, Role.STAFF, "staff@example.com")
+    colleague = await _invite_as(maker, manager, Role.MANAGER, "colleague@example.com")
+
+    assert staff.user.role is Role.STAFF and colleague.user.role is Role.MANAGER
+    assert [mail["to"] for mail in sent_mail] == ["staff@example.com", "colleague@example.com"]
+    for role in (Role.ADMIN, Role.OWNER):
+        with pytest.raises(ValidationError, match="above your own"):
+            await _invite_as(maker, manager, role, f"{role.value}@example.com")
+
+
+async def test_a_manager_sees_only_the_people_up_to_manager(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    from suliko.api.v1 import users as users_api
+
+    for role in (Role.OWNER, Role.ADMIN, Role.MANAGER, Role.STAFF):
+        await _add_member(maker, role, role.value)
+
+    with tenant_scope(ACME):
+        async with maker() as db:
+            manager, admin = _manager_session(ACME), _admin_session(ACME)
+            as_manager = await users_api.list_users(db, manager, manager)
+            as_admin = await users_api.list_users(db, admin, admin)
+
+    assert {user.role for user in as_manager.items} == {Role.MANAGER, Role.STAFF}
+    assert as_manager.meta.total == 2
+    assert {user.role for user in as_admin.items} == {
+        Role.OWNER,
+        Role.ADMIN,
+        Role.MANAGER,
+        Role.STAFF,
+    }
+
+
+async def test_a_manager_cannot_open_a_member_above_them(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Not forbidden but not found: who runs the organisation is not something
+    a read-only view reveals, by the list or by a guessed id."""
+    from suliko.api.v1 import users as users_api
+
+    admin_id = await _add_member(maker, Role.ADMIN, "boss")
+    staff_id = await _add_member(maker, Role.STAFF, "clerk")
+
+    with tenant_scope(ACME):
+        async with maker() as db:
+            manager, admin = _manager_session(ACME), _admin_session(ACME)
+            assert (await users_api.get_user(staff_id, db, manager, manager)).id == staff_id
+            with pytest.raises(NotFoundError):
+                await users_api.get_user(admin_id, db, manager, manager)
+            assert (await users_api.get_user(admin_id, db, admin, admin)).id == admin_id
+
+
+async def test_whoever_sent_an_invitation_may_send_it_again_to_their_own_rank(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
+) -> None:
+    me = _manager_session(ACME)
+    other_manager = replace(me, user_id=9, full_name="Other Manager")
+    admin = _admin_session(ACME)
+
+    below = await _invite_as(maker, admin, Role.STAFF, "below@example.com")
+    mine = await _invite_as(maker, me, Role.MANAGER, "mine@example.com")
+    theirs = await _invite_as(maker, other_manager, Role.MANAGER, "theirs@example.com")
+    above = await _invite_as(maker, admin, Role.ADMIN, "above@example.com")
+    sent_mail.clear()
+
+    # Below me: fine. The Manager I invited myself: fine.
+    await _resend_as(maker, me, below.user.id)
+    await _resend_as(maker, me, mine.user.id)
+    assert [mail["to"] for mail in sent_mail] == ["below@example.com", "mine@example.com"]
+
+    # A Manager someone else invited, and an Admin: not mine to send again.
+    for not_mine in (theirs, above):
+        with pytest.raises(PermissionDeniedError):
+            await _resend_as(maker, me, not_mine.user.id)
+    assert len(sent_mail) == 2
+
+    # The same rule a rank up: an Admin may send their own Admin invitation
+    # again (equal rank, but theirs) and the other Manager's (below them).
+    await _resend_as(maker, admin, above.user.id)
+    await _resend_as(maker, admin, theirs.user.id)
+    assert [mail["to"] for mail in sent_mail][-2:] == ["above@example.com", "theirs@example.com"]
 
 
 # ── Inviting by phone number ────────────────────────────────────────────────

@@ -42,7 +42,12 @@ class Permission(enum.StrEnum):
     REPORTS_READ = "reports.read"
     REPORTS_PROFIT = "reports.profit"
 
-    # Administration
+    # Administration. `users.invite` is the smaller half of `users.manage`:
+    # invite people up to your own role, send an invitation again, and see the
+    # members at or below your rank, read-only. Everything that changes a
+    # person (edit, switch off, delete, access, second factor) stays behind
+    # `users.manage`, which implies this one (see `effective_permissions`).
+    USERS_INVITE = "users.invite"
     USERS_MANAGE = "users.manage"
     SETTINGS_MANAGE = "settings.manage"
     APIKEYS_MANAGE = "apikeys.manage"
@@ -81,6 +86,7 @@ _MANAGER: frozenset[Permission] = _STAFF | {
     P.FINANCE_RECORD_PAYMENT,
     P.FINANCE_EXPENSES,
     P.REPORTS_PROFIT,
+    P.USERS_INVITE,
 }
 
 _ADMIN: frozenset[Permission] = _MANAGER | {
@@ -120,6 +126,10 @@ STEP_UP_PERMISSIONS: frozenset[Permission] = frozenset(
         P.APIKEYS_MANAGE,
         P.SETTINGS_MANAGE,
         P.USERS_MANAGE,
+        # Inviting was behind `users.manage`, and so behind a fresh code for
+        # anyone with a second factor. Moving it must not lower that bar for
+        # an admin. Someone with no factor enrolled is skipped, as before.
+        P.USERS_INVITE,
         P.TENANT_MANAGE,
         P.PLATFORM_IMPERSONATE,
     }
