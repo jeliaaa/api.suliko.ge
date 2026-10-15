@@ -1,6 +1,6 @@
-"""Outbound auth email.
+"""Outbound platform email: password resets, email confirmation, invitations.
 
-Password resets today; invites and welcome mail next. Business mail — client
+The look of these messages is `core/mail_layout.py`. Business mail — client
 confirmations, document delivery — does NOT come through here: that goes out
 through the tenant's own SMTP integration, because it has to carry the
 bureau's address. See `Settings.smtp_host` for why auth mail is the exception.
@@ -25,6 +25,7 @@ shaped to avoid.
 from __future__ import annotations
 
 import asyncio
+import re
 import smtplib
 from dataclasses import dataclass
 from email.headerregistry import Address
@@ -36,6 +37,10 @@ from suliko.config import get_settings
 
 log = structlog.get_logger()
 
+# A subject is one line. A name or organisation carrying a line break would
+# otherwise be a header injection (or, under the stdlib policy, an error).
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]+")
+
 
 @dataclass(frozen=True, slots=True)
 class MailResult:
@@ -46,20 +51,22 @@ class MailResult:
     reason: str
 
 
-def _build(to: str, subject: str, body: str) -> EmailMessage:
+def _build(to: str, subject: str, body: str, html: str | None = None) -> EmailMessage:
     settings = get_settings()
     message = EmailMessage()
-    message["Subject"] = subject
+    message["Subject"] = _CONTROL_CHARACTERS.sub(" ", subject).strip()
     message["To"] = to
     # The From address is configuration, never user input — a display name
     # taken from a user would let someone forge a plausible-looking sender.
     from_email = settings.smtp_from_email or "noreply@localhost"
     local, _, domain = from_email.partition("@")
     message["From"] = str(Address(settings.smtp_from_name, local, domain))
-    # Plain text only, deliberately. An auth mail is three sentences and a
-    # link; HTML buys nothing and costs a second body to keep in sync, plus a
-    # well-known phishing-lookalike surface.
     message.set_content(body)
+    if html:
+        # The plain text stays as the first alternative and says the same
+        # thing: `mail_layout.compose` makes both from one description, so
+        # there is no second body to keep in sync.
+        message.add_alternative(html, subtype="html")
     return message
 
 
@@ -84,7 +91,7 @@ def _send_blocking(message: EmailMessage) -> None:
         client.send_message(message)
 
 
-async def send(to: str, subject: str, body: str) -> MailResult:
+async def send(to: str, subject: str, body: str, html: str | None = None) -> MailResult:
     """Deliver one message. Never raises.
 
     With no SMTP configured the message is logged instead of sent, so local
@@ -105,7 +112,7 @@ async def send(to: str, subject: str, body: str) -> MailResult:
         )
         return MailResult(delivered=False, reason="not_configured")
 
-    message = _build(to, subject, body)
+    message = _build(to, subject, body, html)
     try:
         await asyncio.to_thread(_send_blocking, message)
     except (smtplib.SMTPException, OSError):

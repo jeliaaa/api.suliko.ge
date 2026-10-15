@@ -1121,8 +1121,10 @@ async def approve_deletion_request(
         after={"request_id": request.id, "purge_after": request.purge_after},
     )
     if item.account.email:
-        subject, body = approved_email(item.account, request)
-        background.add_task(mail.send, item.account.email, subject, body)
+        message = approved_email(item.account, request)
+        background.add_task(
+            mail.send, item.account.email, message.subject, message.text, message.html
+        )
     await db.refresh(request)
     return await _deletion_out(db, item, weigh=False)
 
@@ -1155,8 +1157,10 @@ async def reject_deletion_request(
         after={"request_id": request.id},
     )
     if item.account.email:
-        subject, body = rejected_email(item.account)
-        background.add_task(mail.send, item.account.email, subject, body)
+        message = rejected_email(item.account)
+        background.add_task(
+            mail.send, item.account.email, message.subject, message.text, message.html
+        )
     await db.refresh(request)
     return await _deletion_out(db, item, weigh=False)
 

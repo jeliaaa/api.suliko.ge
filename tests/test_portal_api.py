@@ -1480,8 +1480,8 @@ def sent_mail(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, str]]:
 
     sent: list[dict[str, str]] = []
 
-    async def fake_send(to: str, subject: str, body: str) -> MailResult:
-        sent.append({"to": to, "subject": subject, "body": body})
+    async def fake_send(to: str, subject: str, body: str, html: str | None = None) -> MailResult:
+        sent.append({"to": to, "subject": subject, "body": body, "html": html or ""})
         return MailResult(delivered=True, reason="sent")
 
     monkeypatch.setattr(mail_module, "send", fake_send)

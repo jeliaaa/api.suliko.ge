@@ -700,7 +700,7 @@ async def test_the_team_and_the_person_are_each_sent_a_note(world: Any) -> None:
     assert [task.func for task in background.tasks] == [mail.send, mail.send]
     (team_to, team_subject, team_body), (person_to, _, person_body) = [
         (str(to), str(subject), str(body))
-        for to, subject, body in (t.args for t in background.tasks)
+        for to, subject, body, _html in (t.args for t in background.tasks)
     ]
 
     assert team_to == get_settings().support_email == "info@suliko.ge"
@@ -738,7 +738,8 @@ def test_the_note_to_the_team_says_what_to_check_and_how_to_cancel() -> None:
         status=DeletionStatus.REQUESTED,
         created_at=datetime(2026, 10, 15, 9, 30, tzinfo=UTC),
     )
-    subject, body = team_email(account, request, organisation="Acme", organisation_slug="acme")
+    message = team_email(account, request, organisation="Acme", organisation_slug="acme")
+    subject, body = message.subject, message.text
 
     assert subject == "Account deletion request: Nino Beridze"
     for expected in (
@@ -755,7 +756,8 @@ def test_the_note_to_the_team_says_what_to_check_and_how_to_cancel() -> None:
 
 
 def test_the_note_to_the_person_promises_only_what_the_flow_does() -> None:
-    subject, body = person_email(Account(id=7, email="n@x.ge", full_name="Nino", password_hash="!"))
+    message = person_email(Account(id=7, email="n@x.ge", full_name="Nino", password_hash="!"))
+    subject, body = message.subject, message.text
     assert "delete" in subject
     assert "Hello Nino," in body
     assert f"{DELETION_GRACE_DAYS} days" in body

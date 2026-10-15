@@ -44,6 +44,21 @@ from suliko.core.errors import (
     RateLimitedError,
     ValidationError,
 )
+from suliko.core.mail_layout import (
+    Block,
+    Bold,
+    Button,
+    Callout,
+    Email,
+    Facts,
+    Link,
+    Step,
+    Steps,
+    callout,
+    compose,
+    fine,
+    p,
+)
 from suliko.core.ratelimit import RateLimiter, get_rate_limiter
 from suliko.domain.accounts import (
     UNUSABLE_PASSWORD_HASH,
@@ -531,21 +546,22 @@ async def lookup_account(
     )
 
 
-def _suliko_account_paragraph(*, linked: bool, matched_display_name: str | None) -> str:
-    """The one paragraph the invitation email gains for suliko.ge.
+def _suliko_account_note(*, linked: bool, matched_display_name: str | None) -> Callout:
+    """The note the invitation email gains for suliko.ge.
 
     What suliko.ge account this address is also expected to have, after the
     part about getting into THIS organisation.
     """
     if linked:
         matched = f" ({matched_display_name})" if matched_display_name else ""
-        return (
+        return callout(
             f"This address is already registered on suliko.ge{matched}, "
-            "so nothing more to do there.\n"
+            "so there is nothing more to do there."
         )
-    return (
+    return callout(
         "This invitation also expects a suliko.ge account under this exact "
-        f"email address. If you don't have one yet, register here: {registration_url()}\n"
+        "email address. If you don't have one yet, register here: ",
+        Link(registration_url(), registration_url()),
     )
 
 
@@ -559,49 +575,92 @@ def _invite_email(
     existing_account: bool,
     suliko_account: SulikoAccountOut,
     needs_registration: bool = False,
-) -> tuple[str, str]:
-    """Subject and plain-text body. Everything they need in one message."""
-    account_paragraph = _suliko_account_paragraph(
-        linked=suliko_account.status == "linked",
-        matched_display_name=suliko_account.matched_display_name,
+) -> Email:
+    """The invitation: who asked, what to click, how to sign in afterwards."""
+    address = user.email or ""
+    facts = Facts(
+        [
+            ("Organisation", tenant_name),
+            ("Invited by", inviter),
+            ("Invitation sent to", address),
+        ]
     )
+    blocks: list[Block] = [
+        p(f"Hello {user.full_name},"),
+        p(Bold(inviter), " has invited you to ", Bold(tenant_name), " on Suliko Office."),
+        facts,
+    ]
     if needs_registration:
         # No account anywhere. Passwords live on suliko.ge, so they register
-        # there first, with exactly this address, and only then accept — which
-        # is what lets the address they sign in with be the one invited.
-        how = (
-            "To join, do two things:\n\n"
-            f"1. Register on suliko.ge with exactly this email address "
-            f"({user.email}):\n   {registration_url()}\n\n"
-            f"2. Then accept the invitation here:\n   {invite_link}\n\n"
-            f"The link works once and expires in {valid_days} days. After that, "
-            f"sign in to Suliko Office with {user.email} and your suliko.ge "
-            f"password, and choose {tenant_name}.\n\n"
-        )
+        # there first, and only then accept. What links them to this invitation
+        # is the sign-in name suliko.ge proved at registration
+        # (`upsert_from_suliko`), and the registration page offers a phone
+        # number or Google: only Google proves an address. A phone sign-up
+        # would be a different person to this invitation, so the email says so
+        # rather than asking for something the page cannot do.
+        blocks += [
+            p("To join, do two things in this order."),
+            Steps(
+                [
+                    Step(
+                        [
+                            "Register on suliko.ge with Google, using exactly this email address: ",
+                            Bold(address),
+                        ],
+                        Button("Register on suliko.ge", registration_url(), kind="secondary"),
+                    ),
+                    Step(
+                        [f"Then come back and accept the invitation to {tenant_name}."],
+                        Button("Accept invitation", invite_link),
+                    ),
+                ]
+            ),
+            p(f"After that, open Suliko Office, continue with suliko.ge and choose {tenant_name}."),
+            callout(
+                "Registering with a phone number instead will not connect to this invitation. "
+                f"If you prefer a phone number, register with it first, then ask {inviter} to "
+                "invite that number.",
+                tone="warning",
+            ),
+        ]
         # The registration step above is the whole of what suliko.ge needs.
-        account_paragraph = ""
-    elif existing_account:
-        how = (
-            f"Accept the invitation here:\n\n{invite_link}\n\n"
-            f"The link works once and expires in {valid_days} days. Then sign in "
-            f"as usual with {user.email} and your own password, and choose "
-            f"{tenant_name}.\n\n"
-        )
+        note = None
     else:
-        how = (
-            f"Choose your password here:\n\n{invite_link}\n\n"
-            f"The link works once and expires in {valid_days} days. After that, "
-            f"sign in with {user.email} and that password, and choose {tenant_name}.\n\n"
+        if existing_account:
+            blocks += [
+                p(f"Accept the invitation to join {tenant_name}."),
+                Button("Accept invitation", invite_link),
+                p(f"Then sign in to Suliko Office as usual and choose {tenant_name}."),
+            ]
+        else:
+            blocks += [
+                p("Choose a password to join."),
+                Button("Choose your password", invite_link),
+                p(
+                    f"After that, sign in with {address} and that password, "
+                    f"and choose {tenant_name}."
+                ),
+            ]
+        note = _suliko_account_note(
+            linked=suliko_account.status == "linked",
+            matched_display_name=suliko_account.matched_display_name,
         )
-    body = (
-        f"Hello {user.full_name},\n\n"
-        f"{inviter} has invited you to {tenant_name} on Suliko.\n\n"
-        f"{how}"
-        f"{account_paragraph}\n"
-        f"If you were not expecting this, tell {tenant_name} and ignore the "
-        "message; nothing happens without the link above.\n"
+    if note is not None:
+        blocks.append(note)
+    blocks += [
+        fine(f"The link works once and expires in {valid_days} days."),
+        fine(
+            f"If you were not expecting this, tell {tenant_name} and ignore the "
+            "message. Nothing happens without the link."
+        ),
+    ]
+    return compose(
+        subject=f"You have been invited to {tenant_name} on Suliko",
+        heading=f"Join {tenant_name}",
+        preheader=f"{inviter} invited you to {tenant_name} on Suliko Office.",
+        blocks=blocks,
+        reason=f"You received this because {tenant_name} invited this address.",
     )
-    return f"You have been invited to {tenant_name} on Suliko", body
 
 
 @router.post("/invite", response_model=InviteOut, status_code=http_status.HTTP_201_CREATED)
@@ -810,7 +869,7 @@ async def invite_user(
     await limiter.record_invite(tenant_key)
     email_sent = False
     if member_email is not None:
-        subject, body = _invite_email(
+        message = _invite_email(
             row,
             session.tenant_name,
             invite_link,
@@ -820,7 +879,9 @@ async def invite_user(
             suliko_account=suliko_account,
             needs_registration=needs_registration,
         )
-        email_sent = (await mail.send(member_email, subject, body)).delivered
+        email_sent = (
+            await mail.send(member_email, message.subject, message.text, message.html)
+        ).delivered
 
     overrides = (await _overrides_for(db, [row.id])).get(row.id, {})
     return InviteOut(

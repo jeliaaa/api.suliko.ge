@@ -100,14 +100,50 @@ def test_the_from_address_comes_from_settings(monkeypatch: pytest.MonkeyPatch) -
     assert message["From"] == "Suliko Office <noreply@suliko.ge>"
 
 
-def test_the_body_is_plain_text(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No HTML alternative: an auth mail is three sentences and a link, and a
-    second body is a second thing to keep in sync."""
+def test_a_message_without_html_is_plain_text(monkeypatch: pytest.MonkeyPatch) -> None:
     _configure(monkeypatch)
 
     message = mail._build("nino@acme.ge", "Subject", "Body")
     assert message.get_content_type() == "text/plain"
     assert not message.is_multipart()
+
+
+def test_a_message_with_html_carries_both_versions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The plain text comes first and stays: a reader that cannot show HTML, and
+    a spam filter comparing the two, both get the same words."""
+    _configure(monkeypatch)
+
+    message = mail._build("nino@acme.ge", "Subject", "Plain body", "<p>Html body</p>")
+
+    assert message.get_content_type() == "multipart/alternative"
+    plain, html = message.iter_parts()
+    assert plain.get_content_type() == "text/plain"
+    assert "Plain body" in plain.get_content()
+    assert html.get_content_type() == "text/html"
+    assert "Html body" in html.get_content()
+
+
+def test_a_line_break_in_the_subject_cannot_inject_a_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The organisation's name is in the subject, and an organisation's name is
+    typed by a person."""
+    _configure(monkeypatch)
+
+    message = mail._build("nino@acme.ge", "Acme\r\nBcc: someone@else.test", "Body")
+
+    assert message["Bcc"] is None
+    assert "\n" not in message["Subject"]
+
+
+async def test_the_html_reaches_the_relay(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure(monkeypatch)
+    sent: list[Any] = []
+    monkeypatch.setattr(mail, "_send_blocking", sent.append)
+
+    await mail.send("nino@acme.ge", "Subject", "Plain", "<p>Html</p>")
+
+    assert sent[0].get_body(("html",)).get_content().strip() == "<p>Html</p>"
 
 
 # ── What the reset mail says ────────────────────────────────────────────────
@@ -139,7 +175,8 @@ def test_the_reset_mail_carries_the_link_and_its_lifetime() -> None:
     account = _account()
     link = "https://app.suliko.ge/ka/reset-password?token=rst_abc"
 
-    subject, body = _reset_email(account, link, 60)
+    message = _reset_email(account, link, 60)
+    subject, body = message.subject, message.text
 
     assert "password" in subject.lower()
     assert link in body
@@ -153,10 +190,11 @@ def test_the_reset_mail_carries_the_link_and_its_lifetime() -> None:
 
 
 def test_the_reset_mail_never_carries_a_password() -> None:
-    _, body = _reset_email(_account(), "https://example.test/x", 60)
+    message = _reset_email(_account(), "https://example.test/x", 60)
 
-    assert "SECRETHASH" not in body
-    assert "argon2" not in body
+    for version in (message.text, message.html):
+        assert "SECRETHASH" not in version
+        assert "argon2" not in version
 
 
 # ── What the verification mail says ─────────────────────────────────────────
@@ -166,7 +204,8 @@ def test_the_verification_mail_carries_the_link_and_its_lifetime() -> None:
     user, tenant = _people()
     link = "https://app.suliko.ge/ka/verify-email?token=rst_abc"
 
-    subject, body = _verification_email(user, tenant, link, 72)
+    message = _verification_email(user, tenant, link, 72)
+    subject, body = message.subject, message.text
 
     assert "confirm" in subject.lower()
     assert link in body
@@ -179,7 +218,7 @@ def test_the_verification_mail_says_nothing_is_blocked_on_it() -> None:
     works. The mail should not read like a warning."""
     user, tenant = _people()
 
-    _, body = _verification_email(user, tenant, "https://example.test/x", 72)
+    body = _verification_email(user, tenant, "https://example.test/x", 72).text
 
     assert "on hold" in body.lower() or "not on hold" in body.lower()
 
@@ -188,13 +227,14 @@ def test_the_verification_mail_never_carries_a_password() -> None:
     user, tenant = _people()
     user.password_hash = "$argon2id$v=19$m=65536,t=3,p=4$SECRETHASH"
 
-    _, body = _verification_email(user, tenant, "https://example.test/x", 72)
+    message = _verification_email(user, tenant, "https://example.test/x", 72)
 
-    assert "SECRETHASH" not in body
-    assert "argon2" not in body
+    for version in (message.text, message.html):
+        assert "SECRETHASH" not in version
+        assert "argon2" not in version
 
 
 def test_verification_ttl_under_a_day_is_shown_in_hours() -> None:
     user, tenant = _people()
-    _, body = _verification_email(user, tenant, "https://example.test/x", 6)
+    body = _verification_email(user, tenant, "https://example.test/x", 6).text
     assert "6 hours" in body

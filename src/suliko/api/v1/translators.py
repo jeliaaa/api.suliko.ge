@@ -31,8 +31,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from suliko.api.deps import CurrentSession, Db, require
 from suliko.api.v1._shared import PageMeta, mask_tail
+from suliko.config import get_settings
 from suliko.core import mail
 from suliko.core.errors import ConflictError, NotFoundError, RateLimitedError, ValidationError
+from suliko.core.mail_layout import Bold, Button, Email, Facts, callout, compose, p
 from suliko.core.ratelimit import RateLimiter, get_rate_limiter
 from suliko.domain.cities import CITIES, pack, unpack
 from suliko.domain.portal import (
@@ -460,8 +462,8 @@ class TranslatorInviteSummary(BaseModel):
 
 def _translator_invite_email(
     full_name: str, tenant_name: str, email: str, *, linked: bool, matched_display_name: str | None
-) -> tuple[str, str]:
-    """Subject and plain-text body — the two outcomes read very differently.
+) -> Email:
+    """The invitation to translate — the two outcomes read very differently.
 
     Order matters in the pending body, and is the one the plan settled on:
     which bureau invited them, that they need a suliko.ge account, the EXACT
@@ -469,31 +471,50 @@ def _translator_invite_email(
     hatch — so someone who already has an account under a different-looking
     address still finds their way in.
     """
+    subject = f"{tenant_name} has invited you on Suliko"
+    reason = f"You received this because {tenant_name} invited this address."
     if linked:
         matched = f" ({matched_display_name})" if matched_display_name else ""
-        body = (
-            f"Hello {full_name},\n\n"
-            f"{tenant_name} has invited you to translate for them on Suliko, and "
-            f"it looks like you already have a suliko.ge account under this "
-            f"address{matched}.\n\n"
-            "Sign in to suliko.ge and open the Orders tab. The bureau is "
-            "already waiting for you there.\n"
+        return compose(
+            subject=subject,
+            heading=f"{tenant_name} is waiting for you",
+            preheader="Open the Orders tab on suliko.ge. The bureau is already there.",
+            blocks=[
+                p(f"Hello {full_name},"),
+                p(
+                    Bold(tenant_name),
+                    " has invited you to translate for them on Suliko, and it looks "
+                    f"like you already have a suliko.ge account under this address{matched}.",
+                ),
+                p(
+                    "Sign in to suliko.ge and open the Orders tab. "
+                    "The bureau is already waiting for you there."
+                ),
+                Button("Open suliko.ge", get_settings().suliko_site_url),
+            ],
+            reason=reason,
         )
-        return f"{tenant_name} has invited you on Suliko", body
 
-    url = registration_url()
-    body = (
-        f"Hello {full_name},\n\n"
-        f"{tenant_name} has invited you to translate for them on Suliko.\n\n"
-        "To accept, you need a suliko.ge account using THIS email address:\n\n"
-        f"  {email}\n\n"
-        f"If you don't have one yet, register here: {url}\n\n"
-        "If you already have a suliko.ge account, make sure it uses this exact "
-        "email address, or the matching phone number. The moment it does, "
-        f"{tenant_name} will appear in your Orders tab automatically, with "
-        "nothing further for you to do.\n"
+    return compose(
+        subject=subject,
+        heading=f"Translate for {tenant_name}",
+        preheader="You need a suliko.ge account with this exact email address.",
+        blocks=[
+            p(f"Hello {full_name},"),
+            p(Bold(tenant_name), " has invited you to translate for them on Suliko."),
+            p("To accept, you need a suliko.ge account using this email address:"),
+            Facts([("Email address", email)]),
+            p("If you don't have one yet, register with it here."),
+            Button("Register on suliko.ge", registration_url()),
+            callout(
+                "If you already have a suliko.ge account, make sure it uses this exact "
+                "email address, or the matching phone number. The moment it does, "
+                f"{tenant_name} will appear in your Orders tab automatically, with "
+                "nothing further for you to do."
+            ),
+        ],
+        reason=reason,
     )
-    return f"{tenant_name} has invited you on Suliko", body
 
 
 async def _refuse_if_linked_elsewhere(
@@ -689,7 +710,7 @@ async def invite_translator(
             no_email=True,
         )
 
-    subject, body = _translator_invite_email(
+    message = _translator_invite_email(
         directory_row.name,
         session.tenant_name,
         email,
@@ -705,7 +726,7 @@ async def invite_translator(
             retry_after=retry,
         )
     await limiter.record_invite(tenant_key)
-    mail_result = await mail.send(email, subject, body)
+    mail_result = await mail.send(email, message.subject, message.text, message.html)
 
     return TranslatorInviteOut(
         translator=await _detail_of(db, directory_row),

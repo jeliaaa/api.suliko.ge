@@ -396,14 +396,16 @@ def test_forgot_password_for_a_suliko_person_issues_no_token() -> None:
 def test_the_suliko_reset_email_says_where_to_go_and_offers_no_local_link() -> None:
     account = Account(email="nino@suliko.ge", full_name="Nino", password_hash="!")
 
-    subject, body = auth._suliko_password_email(account, "https://suliko.ge/login")
+    message = auth._suliko_password_email(account, "https://suliko.ge/login")
 
-    assert "https://suliko.ge/login" in body
-    assert "kept on suliko.ge" in body
-    # Someone who has not registered there yet is pointed at registration.
-    assert "https://suliko.ge/sign-in?mode=register" in body
-    assert "reset-password" not in body
-    assert "Nino" in body and subject
+    for version in (message.text, message.html):
+        assert "https://suliko.ge/login" in version
+        assert "kept on suliko.ge" in version
+        # Someone who has not registered there yet is pointed at registration.
+        assert "https://suliko.ge/sign-in?mode=register" in version
+        assert "reset-password" not in version
+        assert "Nino" in version
+    assert message.subject
 
 
 def test_an_invitee_with_no_password_is_never_given_a_local_reset_link() -> None:
@@ -496,7 +498,7 @@ def _no_suliko_account() -> Any:
 
 
 def test_the_invitation_to_a_stranger_says_to_register_first() -> None:
-    subject, body = users._invite_email(
+    message = users._invite_email(
         _invitee(),
         "Acme",
         "https://app.example/ka/accept-invite?token=T",
@@ -507,27 +509,32 @@ def test_the_invitation_to_a_stranger_says_to_register_first() -> None:
         needs_registration=True,
     )
 
-    assert "Acme" in subject
-    assert "Register on suliko.ge with exactly this email address (new@suliko.ge)" in body
-    assert "https://suliko.ge/sign-in?mode=register" in body
-    assert "accept-invite?token=T" in body
-    assert body.index("Register on suliko.ge") < body.index("accept-invite")
-    # The one-time-password flow is gone for them.
-    assert "Choose your password" not in body
-    assert "reset-password" not in body
+    assert "Acme" in message.subject
+    for version in (message.text, message.html):
+        assert "https://suliko.ge/sign-in?mode=register" in version
+        assert "accept-invite?token=T" in version
+        assert "new@suliko.ge" in version
+        assert version.index("Register on suliko.ge") < version.index("accept-invite")
+        # The one-time-password flow is gone for them.
+        assert "Choose your password" not in version
+        assert "reset-password" not in version
+    assert "exactly this email address: new@suliko.ge" in message.text
 
 
 def test_the_other_invitations_are_as_they_were() -> None:
     kwargs: dict[str, Any] = {"suliko_account": _no_suliko_account()}
-    _, existing = users._invite_email(
+    existing = users._invite_email(
         _invitee(), "Acme", "L", "Boss", 7, existing_account=True, **kwargs
     )
-    _, fresh = users._invite_email(
+    fresh = users._invite_email(
         _invitee(), "Acme", "L", "Boss", 7, existing_account=False, **kwargs
     )
 
-    assert "Accept the invitation here" in existing
-    assert "Choose your password here" in fresh
+    assert "Accept the invitation to join Acme" in existing.text
+    assert "Accept invitation" in existing.html
+    assert "Choose your password" in fresh.text
+    assert "Choose your password" in fresh.html
+    assert "expires in 7 days" in existing.text
 
 
 def test_invite_resolves_people_through_suliko_before_creating_a_placeholder() -> None:
