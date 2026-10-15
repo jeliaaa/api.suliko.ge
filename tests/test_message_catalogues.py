@@ -59,11 +59,19 @@ def _placeholders(message: str) -> set[str]:
     return names
 
 
+# Georgian-only on purpose: the API sends each integration provider's texts in
+# English, and a message here overrides them (`text()` in integrations-tab.tsx
+# falls back to the API's text). Repeating the English in en.json would give it
+# two sources.
+GEORGIAN_ONLY_PREFIXES = ("settings.integrations.providers.",)
+
+
 @requires_messages
 def test_both_languages_have_the_same_keys() -> None:
     en, ka = _load("en"), _load("ka")
     assert sorted(set(en) - set(ka)) == [], "missing from ka.json"
-    assert sorted(set(ka) - set(en)) == [], "missing from en.json"
+    only_ka = [key for key in set(ka) - set(en) if not key.startswith(GEORGIAN_ONLY_PREFIXES)]
+    assert sorted(only_ka) == [], "missing from en.json"
 
 
 @requires_messages
