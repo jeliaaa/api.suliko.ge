@@ -87,7 +87,7 @@ from suliko.domain.portal import (
 )
 from suliko.integrations.suliko_backend import SulikoBackend, get_suliko_backend
 from suliko.models.portal import InviteKind, InviteStatus, PortalAccountInvite, PortalTranslator
-from suliko.models.user import Account, Role, User, UserPermissionOverride
+from suliko.models.user import Account, PasswordResetToken, Role, User, UserPermissionOverride
 from suliko.security import reset_tokens
 from suliko.security.passwords import (
     generate_token,
@@ -223,6 +223,11 @@ class UserOut(BaseModel):
     #: Null for anyone added before invitations asked suliko.ge about them.
     #: Everyone invited through `POST /users/invite` has one.
     suliko_account: SulikoAccountOut | None
+    #: How many invitation links this person has been sent (the first one
+    #: included) and when the last went out. Only filled in on the member's own
+    #: page (`GET /users/{id}`), where it is read from the stamped link rows.
+    invitation_count: int = 0
+    invitation_last_sent_at: datetime | None = None
 
 
 class UserPage(BaseModel):
@@ -970,6 +975,30 @@ async def _send_within(to: str, message: Email) -> tuple[bool, bool]:
     return result.delivered, False
 
 
+#: One resend per person per this many seconds. Each press is a real email to a
+#: real person, and a double click or a nervous second press used to send two.
+RESEND_COOLDOWN_SECONDS = 60
+
+
+async def _invitation_history(db: Db, user_id: int) -> tuple[int, datetime | None]:
+    """How many invitation links were issued for this person, and the last time.
+
+    Read from `PasswordResetToken`: issuing a link spends the one before it by
+    stamping `used_at`, never by deleting it, so the rows are the history.
+    """
+    count, last = (
+        await db.execute(
+            select(func.count(), func.max(PasswordResetToken.created_at)).where(
+                PasswordResetToken.user_id == user_id,
+                PasswordResetToken.purpose == reset_tokens.INVITATION,
+            )
+        )
+    ).one()
+    if last is not None and last.tzinfo is None:
+        last = last.replace(tzinfo=UTC)
+    return int(count or 0), last
+
+
 async def _deliver_invitation(
     db: Db,
     session: CurrentSession,
@@ -1082,6 +1111,15 @@ async def resend_invitation(
         or account.last_login_at is not None
         or account.email_verified_at is not None
     )
+
+    _count, last_sent = await _invitation_history(db, row.id)
+    if last_sent is not None:
+        wait = RESEND_COOLDOWN_SECONDS - int((datetime.now(UTC) - last_sent).total_seconds())
+        if wait > 0:
+            raise RateLimitedError(
+                f"An invitation was sent to this person a moment ago. Try again in {wait} seconds.",
+                retry_after=wait,
+            )
 
     tenant_key = f"invite:tenant:{session.tenant_id}"
     if retry := await limiter.check_invite(tenant_key):
@@ -1245,7 +1283,9 @@ async def get_user(
         raise NotFoundError("User not found.")
     overrides = (await _overrides_for(db, [row.id])).get(row.id, {})
     suliko_account = (await _invite_status_for(db, [row.id])).get(row.id)
-    return _out(row, session.plan, overrides, suliko_account)
+    out = _out(row, session.plan, overrides, suliko_account)
+    out.invitation_count, out.invitation_last_sent_at = await _invitation_history(db, row.id)
+    return out
 
 
 @router.patch("/{user_id}", response_model=UserOut)

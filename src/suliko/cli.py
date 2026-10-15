@@ -891,6 +891,12 @@ def main() -> None:
     p.add_argument("--email", required=True, help="the existing Office account's email")
     p.add_argument("--suliko-login", required=True, help="their suliko.ge email or phone number")
 
+    p = sub.add_parser(
+        "preview-emails",
+        help="write every platform email as HTML and text files to look at (sends nothing)",
+    )
+    p.add_argument("--out", required=True, help="the folder to write them to")
+
     sub.add_parser("deletion-requests", help="list the accounts closed by a deletion request")
     sub.add_parser(
         "purge-accounts",
@@ -930,6 +936,16 @@ def main() -> None:
                     await import_suliko_users(args.dry_run)
                 case "link-suliko-account":
                     await link_suliko_account(args.email, args.suliko_login)
+                case "preview-emails":
+                    from pathlib import Path
+
+                    from suliko.core.email_samples import write_previews
+
+                    # The subjects are Georgian; a Windows console is not UTF-8 by default.
+                    sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+                    for line in write_previews(Path(args.out)):
+                        say(line)
+                    say(f"Open {Path(args.out) / 'index.html'} in a browser.")
                 case "deletion-requests":
                     await deletion_requests()
                 case "cancel-deletion-request":

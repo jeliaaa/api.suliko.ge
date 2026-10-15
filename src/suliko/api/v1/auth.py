@@ -1716,6 +1716,16 @@ async def request_account_deletion(
 # using it both creates their password and accepts (see `reset_password`).
 
 
+class InvitationLinkInvalidError(ValidationError):
+    """The link is spent, replaced by a newer one, or past its expiry.
+
+    A code of its own so the app can say so in the person's language instead of
+    showing this English sentence on a Georgian page.
+    """
+
+    error_code = "invitation_link_invalid"
+
+
 class AcceptInvitationRequest(BaseModel):
     token: str = Field(min_length=1, max_length=200)
 
@@ -1732,7 +1742,7 @@ async def accept_invitation(payload: AcceptInvitationRequest) -> AcceptInvitatio
     async with get_sessionmaker()() as db:
         user = await reset_tokens.consume(db, payload.token, purpose=reset_tokens.INVITATION)
         if user is None:
-            raise ValidationError(
+            raise InvitationLinkInvalidError(
                 "This invitation link is no longer valid. Ask the organisation to invite you again."
             )
         with bypass_tenant_scope():
