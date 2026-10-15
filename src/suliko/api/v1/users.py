@@ -22,6 +22,7 @@ own password.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime, timedelta
@@ -32,6 +33,7 @@ from fastapi import APIRouter, Depends, Query
 from fastapi import status as http_status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 
 from suliko.api.deps import CurrentSession, Db, require
 from suliko.api.v1._shared import PageMeta
@@ -191,6 +193,10 @@ class InviteOut(BaseModel):
     #: Whether the email actually left. False is not an error: the account
     #: exists either way, and the link above is the fallback.
     email_sent: bool
+    #: The mail server had not answered when this response was made
+    #: (`EMAIL_WAIT_SECONDS`). The message is still being sent and may well
+    #: arrive; `email_sent` is False only because nobody knows yet.
+    email_pending: bool = False
     suliko_account: SulikoAccountOut
 
 
@@ -487,6 +493,15 @@ async def list_users(
     search: Annotated[str | None, Query(max_length=255)] = None,
     role: Role | None = None,
     is_active: bool | None = None,
+    state: Annotated[
+        Literal["invited", "not_signed_in", "signed_in"] | None,
+        Query(
+            description=(
+                "Where the person is: `invited` has not accepted yet, `not_signed_in` has "
+                "accepted (or was added) and never signed in, `signed_in` has."
+            )
+        ),
+    ] = None,
     sort: Literal["username", "-username", "id", "-id"] = "username",
     limit: Annotated[int, Query(ge=1, le=200)] = 20,
     offset: Annotated[int, Query(ge=0)] = 0,
@@ -494,6 +509,12 @@ async def list_users(
     stmt = select(User)
     if not _sees_everyone(session):
         stmt = stmt.where(User.role.in_(_visible_roles(session)))
+    if state == "invited":
+        stmt = stmt.where(User.invitation_pending.is_(True))
+    elif state == "not_signed_in":
+        stmt = stmt.where(User.invitation_pending.is_(False), User.last_login_at.is_(None))
+    elif state == "signed_in":
+        stmt = stmt.where(User.invitation_pending.is_(False), User.last_login_at.is_not(None))
 
     if search:
         pattern = f"%{search}%"
@@ -920,6 +941,35 @@ async def invite_user(
     )
 
 
+#: How long an invitation request waits for the mail server before answering
+#: without it. SMTP may take up to `smtp_timeout_seconds` (20 s), longer than
+#: the frontend's own timeout and than its host allows a request to run, so a
+#: slow server turned a delivered invitation into an error page for the
+#: inviter (seen on the first resends after the 15 October deploy). The link is
+#: on screen either way, and the send itself carries on after the answer.
+EMAIL_WAIT_SECONDS = 10.0
+
+#: Sends that outlived their request. Held so they are not collected while
+#: still running; each removes itself when done.
+_still_sending: set[asyncio.Task[mail.MailResult]] = set()
+
+
+async def _send_within(to: str, message: Email) -> tuple[bool, bool]:
+    """Send `message`, waiting at most `EMAIL_WAIT_SECONDS` for the answer.
+
+    Returns `(delivered, still_sending)`. After the wait the answer is
+    `(False, True)`: not known to have left, not given up on.
+    """
+    task = asyncio.ensure_future(mail.send(to, message.subject, message.text, message.html))
+    _still_sending.add(task)
+    task.add_done_callback(_still_sending.discard)
+    try:
+        result = await asyncio.wait_for(asyncio.shield(task), timeout=EMAIL_WAIT_SECONDS)
+    except TimeoutError:
+        return False, True
+    return result.delivered, False
+
+
 async def _deliver_invitation(
     db: Db,
     session: CurrentSession,
@@ -951,6 +1001,7 @@ async def _deliver_invitation(
     await limiter.record_invite(tenant_key)
     member_email = row.email
     email_sent = False
+    email_pending = False
     if member_email is not None:
         message = _invite_email(
             row,
@@ -962,9 +1013,7 @@ async def _deliver_invitation(
             suliko_account=suliko_account,
             needs_registration=needs_registration,
         )
-        email_sent = (
-            await mail.send(member_email, message.subject, message.text, message.html)
-        ).delivered
+        email_sent, email_pending = await _send_within(member_email, message)
 
     overrides = (await _overrides_for(db, [row.id])).get(row.id, {})
     return InviteOut(
@@ -975,6 +1024,7 @@ async def _deliver_invitation(
         invited_by_phone=member_email is None,
         invite_expires_at=datetime.now(UTC) + timedelta(seconds=ttl_seconds),
         email_sent=email_sent,
+        email_pending=email_pending,
         suliko_account=suliko_account,
     )
 
@@ -1068,6 +1118,117 @@ async def resend_invitation(
         needs_registration=needs_registration,
         suliko_account=suliko_account,
     )
+
+
+class AttachAccount(BaseModel):
+    """The suliko.ge sign-in the member really uses."""
+
+    #: What they sign in to suliko.ge with: the phone number they registered
+    #: with, or an address if it is a different one from the one invited.
+    login: str = Field(min_length=1, max_length=255)
+
+
+@router.post("/{user_id}/suliko-account", response_model=UserOut)
+async def attach_suliko_account(
+    user_id: int,
+    payload: AttachAccount,
+    db: Db,
+    session: CurrentSession,
+    _: Annotated[object, Depends(require(Permission.USERS_INVITE))],
+    backend: Annotated[SulikoBackend, Depends(get_suliko_backend)],
+) -> UserOut:
+    """Move a stalled invitation to the suliko.ge account its person really uses.
+
+    The way an invitation stalls: it was made for an address, and the person
+    registered on suliko.ge with a phone number, which is a different sign-in
+    and so a different person to Office (`upsert_from_suliko`). Until now the
+    only way out was to delete them and invite the number.
+
+    The member keeps their role, access and history; what changes is whose
+    sign-in they belong to. The manager confirmed who the number belongs to
+    (the form shows the name suliko.ge holds for it) before this is called.
+
+    Only for a placeholder: an account the invitation made, that nobody has
+    signed in to and that has no password of its own. Anyone who already has
+    a working sign-in is not moved, whatever is typed here.
+
+    The reach is a resend's (`_guard_resend`): people below your rank, or an
+    invitation you sent yourself.
+    """
+    row = await db.get(User, user_id)
+    if row is None:
+        raise NotFoundError("User not found.")
+    await _guard_resend(db, session, row)
+    if not row.is_active:
+        raise ValidationError("This account is switched off. Switch it on first.")
+    if not backend.enabled:
+        raise ValidationError("suliko.ge is not connected, so there is no account to attach.")
+
+    placeholder = await db.get(Account, row.account_id) if row.account_id else None
+    if placeholder is None:
+        raise ValidationError("This person has no account to move.")
+    if (
+        placeholder.suliko_user_id is not None
+        or placeholder.password_hash != UNUSABLE_PASSWORD_HASH
+    ):
+        raise ConflictError(
+            "This person already has a working sign-in, so there is nothing to attach."
+        )
+
+    login = checked_login(payload.login)
+    person = await find_suliko_person(backend, login)
+    if person is None:
+        raise ValidationError(
+            "suliko.ge has nobody who signs in with this. Check the number with them."
+        )
+    # The one rule: their account here, found by suliko.ge id, or the one
+    # that answers to this sign-in, or a new one made for them.
+    target = (await upsert_from_suliko(db, person)).account
+
+    if target.id != placeholder.id:
+        username = username_for_account(target)
+        clash = await db.scalar(
+            select(User.id)
+            .where(
+                User.id != row.id,
+                or_(User.account_id == target.id, func.lower(User.username) == username.lower()),
+            )
+            .limit(1)
+        )
+        if clash is not None:
+            raise ConflictError("That person is already in this organisation.")
+
+        row.account_id = target.id
+        row.username = username
+        row.email = target.email
+        row.phone = target.phone or row.phone
+        await db.flush()
+
+        # What the invitation made is now nobody's: remove it so its address is
+        # free again. Another organisation may have invited the same address, and
+        # this session cannot see its rows, so the database decides: its foreign
+        # key refuses while anything still points at the account, and then the
+        # placeholder simply stays.
+        try:
+            async with db.begin_nested():
+                await db.delete(placeholder)
+        except IntegrityError:
+            pass
+
+    from suliko.core.audit import record
+
+    await record(
+        db,
+        session,
+        action="user.account_attached",
+        entity_type="user",
+        entity_id=row.id,
+        after={"suliko_user_id": person.id, "moved": target.id != placeholder.id},
+    )
+
+    overrides = (await _overrides_for(db, [row.id])).get(row.id, {})
+    suliko_account = (await _invite_status_for(db, [row.id])).get(row.id)
+    return _out(row, session.plan, overrides, suliko_account)
 
 
 @router.get("/{user_id}", response_model=UserOut)
