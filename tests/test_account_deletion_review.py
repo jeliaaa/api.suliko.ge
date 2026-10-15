@@ -674,7 +674,7 @@ async def test_the_command_deletes_what_is_due_and_tells_the_person(
     monkeypatch.setattr(cli, "get_sessionmaker", lambda: maker)
     told: list[tuple[str, str, str]] = []
 
-    async def send(to: str, subject: str, body: str) -> None:
+    async def send(to: str, subject: str, body: str, html: str | None = None) -> None:
         told.append((to, subject, body))
 
     monkeypatch.setattr(mail, "send", send)
@@ -763,24 +763,26 @@ def test_the_person_is_told_when_it_will_happen_and_how_to_stop_it() -> None:
         status=DeletionStatus.APPROVED,
         purge_after=datetime(2026, 11, 14, 12, 0, tzinfo=UTC),
     )
-    subject, body = approved_email(account, request)
+    message = approved_email(account, request)
+    subject, body = message.subject, message.text
     assert "deleted" in subject
     assert "2026-11-14" in body
     assert "info@suliko.ge" in body
     assert "—" not in body
+    assert "2026-11-14" in message.html
 
 
 def test_the_person_is_told_the_request_ended_and_they_can_sign_in() -> None:
-    subject, body = rejected_email(
-        Account(id=7, email="n@x.ge", full_name="Nino", password_hash="!")
-    )
+    message = rejected_email(Account(id=7, email="n@x.ge", full_name="Nino", password_hash="!"))
+    subject, body = message.subject, message.text
     assert "open again" in subject
     assert "sign in again" in body
     assert "—" not in body
 
 
 def test_the_person_is_told_it_is_done() -> None:
-    subject, body = done_email("Nino")
+    message = done_email("Nino")
+    subject, body = message.subject, message.text
     assert "has been deleted" in subject
     assert "Hello Nino," in body
     assert "—" not in body

@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from suliko.config import get_settings
 from suliko.core.errors import AppError, ConflictError, ValidationError
+from suliko.core.mail_layout import Bold, Button, Email, Facts, Link, callout, compose, fine, p
 from suliko.db.tenancy import bypass_tenant_scope
 from suliko.domain.accounts import (
     UNUSABLE_PASSWORD_HASH,
@@ -668,9 +669,9 @@ async def purge_account(
     return address, name
 
 
-# ── The two emails ─────────────────────────────────────────────────────────
+# ── The emails ─────────────────────────────────────────────────────────────
 #
-# Plain text, like every platform mail (see core/mail.py).
+# Laid out like every platform mail (see core/mail_layout.py).
 
 
 def _when(moment: datetime | None) -> str:
@@ -683,87 +684,138 @@ def team_email(
     *,
     organisation: str,
     organisation_slug: str,
-) -> tuple[str, str]:
-    """Subject and body of the note to the team that a request has arrived."""
+) -> Email:
+    """The note to the team that a request has arrived."""
     name = account.full_name or login_name(account)
-    body = (
-        f"{name} has asked for their Suliko Office account to be deleted. "
-        "Their access is closed.\n\n"
-        f"  Name:           {name}\n"
-        f"  Email:          {account.email or '(none)'}\n"
-        f"  Phone:          {account.phone or '(none)'}\n"
-        f"  suliko.ge id:   {account.suliko_user_id or '(an Office-only account)'}\n"
-        f"  Asked from:     {organisation} ({organisation_slug})\n"
-        f"  Request:        {request.id}, filed {_when(request.created_at)}\n\n"
-        "Confirm it only if they have no obligations: unpaid invoices or orders "
-        "in progress, payouts owed to a translator, an organisation they are the "
-        "only owner of, or a suliko.ge balance owed. Once confirmed, the account "
-        f"is deleted within {DELETION_GRACE_DAYS} days.\n\n"
-        f"Review it in the admin console: {get_settings().app_url.rstrip('/')}/admin\n\n"
-        "If they write to cancel, reject it there, or run on the API server:\n\n"
-        f"  python -m suliko.cli cancel-deletion-request --id {request.id}\n"
+    return compose(
+        subject=f"Account deletion request: {name}",
+        heading="Account deletion request",
+        preheader=f"{name} asked for their account to be deleted. Access is closed.",
+        blocks=[
+            p(
+                Bold(name),
+                " has asked for their Suliko Office account to be deleted. Their access is closed.",
+            ),
+            Facts(
+                [
+                    ("Name", name),
+                    ("Email", account.email or "(none)"),
+                    ("Phone", account.phone or "(none)"),
+                    ("suliko.ge id", str(account.suliko_user_id or "(an Office-only account)")),
+                    ("Asked from", f"{organisation} ({organisation_slug})"),
+                    ("Request", f"{request.id}, filed {_when(request.created_at)}"),
+                ]
+            ),
+            p(
+                "Confirm it only if they have no obligations: unpaid invoices or orders "
+                "in progress, payouts owed to a translator, an organisation they are the "
+                "only owner of, or a suliko.ge balance owed. Once confirmed, the account "
+                f"is deleted within {DELETION_GRACE_DAYS} days."
+            ),
+            Button("Review in the admin console", f"{get_settings().app_url.rstrip('/')}/admin"),
+            callout(
+                "If they write to cancel, reject it in the console, or run on the API server: ",
+                Bold(f"python -m suliko.cli cancel-deletion-request --id {request.id}"),
+            ),
+        ],
+        reason="You received this because you are on the Suliko team.",
     )
-    return f"Account deletion request: {name}", body
 
 
-def person_email(account: Account) -> tuple[str, str]:
-    """Subject and body of the confirmation to the person who asked."""
+def person_email(account: Account) -> Email:
+    """The confirmation to the person who asked."""
     support = get_settings().support_email
-    body = (
-        f"Hello {account.full_name or login_name(account)},\n\n"
-        "We have your request to delete your Suliko Office account, and your "
-        "access is closed from now on.\n\n"
-        "We look at every request. We confirm it only if you have no obligations, "
-        "for example unpaid invoices, orders in progress, payouts still owed to a "
-        "translator, or an organisation you are the only owner of. Once it is "
-        f"confirmed, your account is deleted within {DELETION_GRACE_DAYS} days. "
-        "Orders, clients and invoices stay with the organisation they belong to.\n\n"
-        f"Changed your mind? Write to {support} and we will cancel the request and "
-        "open your account again.\n\n"
-        "If you did not ask for this, write to us straight away.\n"
+    return compose(
+        subject="We have your request to delete your Suliko account",
+        heading="We have your request",
+        preheader="Your access is closed while we review it.",
+        blocks=[
+            p(f"Hello {account.full_name or login_name(account)},"),
+            p(
+                "We have your request to delete your Suliko Office account, and your "
+                "access is closed from now on."
+            ),
+            p(
+                "We look at every request. We confirm it only if you have no obligations, "
+                "for example unpaid invoices, orders in progress, payouts still owed to a "
+                "translator, or an organisation you are the only owner of. Once it is "
+                f"confirmed, your account is deleted within {DELETION_GRACE_DAYS} days. "
+                "Orders, clients and invoices stay with the organisation they belong to."
+            ),
+            callout(
+                "Changed your mind? Write to ",
+                Link(support, f"mailto:{support}"),
+                " and we will cancel the request and open your account again.",
+            ),
+            fine("If you did not ask for this, write to us straight away."),
+        ],
+        reason="You received this because an account deletion was requested for this address.",
     )
-    return "We have your request to delete your Suliko account", body
 
 
-def _greeting(account_name: str) -> str:
-    return f"Hello {account_name},\n\n"
-
-
-def approved_email(account: Account, request: AccountDeletionRequest) -> tuple[str, str]:
-    """Subject and body telling the person their request was confirmed."""
+def approved_email(account: Account, request: AccountDeletionRequest) -> Email:
+    """Telling the person their request was confirmed."""
     support = get_settings().support_email
     name = account.full_name or login_name(account)
-    body = (
-        _greeting(name) + "We have confirmed your request to delete your Suliko Office account. "
-        f"Your account and personal details will be deleted on {_when(request.purge_after)}. "
-        "Orders, clients and invoices stay with the organisation they belong to.\n\n"
-        f"Until then your account stays closed. If you change your mind, write to {support} "
-        "before that date and we will cancel the deletion.\n"
+    return compose(
+        subject="Your Suliko account will be deleted",
+        heading="Your deletion is confirmed",
+        preheader=f"Your account will be deleted on {_when(request.purge_after)}.",
+        blocks=[
+            p(f"Hello {name},"),
+            p(
+                "We have confirmed your request to delete your Suliko Office account. "
+                "Your account and personal details will be deleted on ",
+                Bold(_when(request.purge_after)),
+                ". Orders, clients and invoices stay with the organisation they belong to.",
+            ),
+            callout(
+                "Until then your account stays closed. If you change your mind, write to ",
+                Link(support, f"mailto:{support}"),
+                " before that date and we will cancel the deletion.",
+            ),
+        ],
+        reason="You received this because you asked for your account to be deleted.",
     )
-    return "Your Suliko account will be deleted", body
 
 
-def rejected_email(account: Account) -> tuple[str, str]:
-    """Subject and body telling the person their request ended and the account is open."""
+def rejected_email(account: Account) -> Email:
+    """Telling the person their request ended and the account is open."""
     support = get_settings().support_email
     name = account.full_name or login_name(account)
-    body = (
-        _greeting(name) + "Your request to delete your Suliko Office account has been cancelled. "
-        "Nothing was deleted, and you can sign in again as before.\n\n"
-        f"If you have questions, write to {support}.\n"
+    return compose(
+        subject="Your Suliko account is open again",
+        heading="Your account is open again",
+        preheader="Nothing was deleted. You can sign in as before.",
+        blocks=[
+            p(f"Hello {name},"),
+            p(
+                "Your request to delete your Suliko Office account has been cancelled. "
+                "Nothing was deleted, and you can sign in again as before."
+            ),
+            fine("If you have questions, write to ", Link(support, f"mailto:{support}"), "."),
+        ],
+        reason="You received this because you asked for your account to be deleted.",
     )
-    return "Your Suliko account is open again", body
 
 
-def done_email(name: str) -> tuple[str, str]:
-    """Subject and body telling the person the deletion has happened."""
-    body = (
-        _greeting(name) + "Your Suliko Office account has been deleted, as you asked. Your name, "
-        "contact details and sign-in are gone. Orders, clients and invoices stay "
-        "with the organisation they belong to.\n\n"
-        "Thank you for using Suliko Office.\n"
+def done_email(name: str) -> Email:
+    """Telling the person the deletion has happened."""
+    return compose(
+        subject="Your Suliko account has been deleted",
+        heading="Your account has been deleted",
+        preheader="Your name, contact details and sign-in are gone.",
+        blocks=[
+            p(f"Hello {name},"),
+            p(
+                "Your Suliko Office account has been deleted, as you asked. Your name, "
+                "contact details and sign-in are gone. Orders, clients and invoices stay "
+                "with the organisation they belong to."
+            ),
+            p("Thank you for using Suliko Office."),
+        ],
+        reason="You received this because you asked for your account to be deleted.",
     )
-    return "Your Suliko account has been deleted", body
 
 
 __all__ = [

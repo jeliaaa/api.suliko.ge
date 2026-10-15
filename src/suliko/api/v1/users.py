@@ -44,6 +44,21 @@ from suliko.core.errors import (
     RateLimitedError,
     ValidationError,
 )
+from suliko.core.mail_layout import (
+    Block,
+    Bold,
+    Button,
+    Callout,
+    Email,
+    Facts,
+    Link,
+    Step,
+    Steps,
+    callout,
+    compose,
+    fine,
+    p,
+)
 from suliko.core.ratelimit import RateLimiter, get_rate_limiter
 from suliko.domain.accounts import (
     UNUSABLE_PASSWORD_HASH,
@@ -531,21 +546,22 @@ async def lookup_account(
     )
 
 
-def _suliko_account_paragraph(*, linked: bool, matched_display_name: str | None) -> str:
-    """The one paragraph the invitation email gains for suliko.ge.
+def _suliko_account_note(*, linked: bool, matched_display_name: str | None) -> Callout:
+    """The note the invitation email gains for suliko.ge.
 
     What suliko.ge account this address is also expected to have, after the
     part about getting into THIS organisation.
     """
     if linked:
         matched = f" ({matched_display_name})" if matched_display_name else ""
-        return (
+        return callout(
             f"This address is already registered on suliko.ge{matched}, "
-            "so nothing more to do there.\n"
+            "so there is nothing more to do there."
         )
-    return (
+    return callout(
         "This invitation also expects a suliko.ge account under this exact "
-        f"email address. If you don't have one yet, register here: {registration_url()}\n"
+        "email address. If you don't have one yet, register here: ",
+        Link(registration_url(), registration_url()),
     )
 
 
@@ -559,49 +575,92 @@ def _invite_email(
     existing_account: bool,
     suliko_account: SulikoAccountOut,
     needs_registration: bool = False,
-) -> tuple[str, str]:
-    """Subject and plain-text body. Everything they need in one message."""
-    account_paragraph = _suliko_account_paragraph(
-        linked=suliko_account.status == "linked",
-        matched_display_name=suliko_account.matched_display_name,
+) -> Email:
+    """The invitation: who asked, what to click, how to sign in afterwards."""
+    address = user.email or ""
+    facts = Facts(
+        [
+            ("Organisation", tenant_name),
+            ("Invited by", inviter),
+            ("Invitation sent to", address),
+        ]
     )
+    blocks: list[Block] = [
+        p(f"Hello {user.full_name},"),
+        p(Bold(inviter), " has invited you to ", Bold(tenant_name), " on Suliko Office."),
+        facts,
+    ]
     if needs_registration:
         # No account anywhere. Passwords live on suliko.ge, so they register
-        # there first, with exactly this address, and only then accept — which
-        # is what lets the address they sign in with be the one invited.
-        how = (
-            "To join, do two things:\n\n"
-            f"1. Register on suliko.ge with exactly this email address "
-            f"({user.email}):\n   {registration_url()}\n\n"
-            f"2. Then accept the invitation here:\n   {invite_link}\n\n"
-            f"The link works once and expires in {valid_days} days. After that, "
-            f"sign in to Suliko Office with {user.email} and your suliko.ge "
-            f"password, and choose {tenant_name}.\n\n"
-        )
+        # there first, and only then accept. What links them to this invitation
+        # is the sign-in name suliko.ge proved at registration
+        # (`upsert_from_suliko`), and the registration page offers a phone
+        # number or Google: only Google proves an address. A phone sign-up
+        # would be a different person to this invitation, so the email says so
+        # rather than asking for something the page cannot do.
+        blocks += [
+            p("To join, do two things in this order."),
+            Steps(
+                [
+                    Step(
+                        [
+                            "Register on suliko.ge with Google, using exactly this email address: ",
+                            Bold(address),
+                        ],
+                        Button("Register on suliko.ge", registration_url(), kind="secondary"),
+                    ),
+                    Step(
+                        [f"Then come back and accept the invitation to {tenant_name}."],
+                        Button("Accept invitation", invite_link),
+                    ),
+                ]
+            ),
+            p(f"After that, open Suliko Office, continue with suliko.ge and choose {tenant_name}."),
+            callout(
+                "Registering with a phone number instead will not connect to this invitation. "
+                f"If you prefer a phone number, register with it first, then ask {inviter} to "
+                "invite that number.",
+                tone="warning",
+            ),
+        ]
         # The registration step above is the whole of what suliko.ge needs.
-        account_paragraph = ""
-    elif existing_account:
-        how = (
-            f"Accept the invitation here:\n\n{invite_link}\n\n"
-            f"The link works once and expires in {valid_days} days. Then sign in "
-            f"as usual with {user.email} and your own password, and choose "
-            f"{tenant_name}.\n\n"
-        )
+        note = None
     else:
-        how = (
-            f"Choose your password here:\n\n{invite_link}\n\n"
-            f"The link works once and expires in {valid_days} days. After that, "
-            f"sign in with {user.email} and that password, and choose {tenant_name}.\n\n"
+        if existing_account:
+            blocks += [
+                p(f"Accept the invitation to join {tenant_name}."),
+                Button("Accept invitation", invite_link),
+                p(f"Then sign in to Suliko Office as usual and choose {tenant_name}."),
+            ]
+        else:
+            blocks += [
+                p("Choose a password to join."),
+                Button("Choose your password", invite_link),
+                p(
+                    f"After that, sign in with {address} and that password, "
+                    f"and choose {tenant_name}."
+                ),
+            ]
+        note = _suliko_account_note(
+            linked=suliko_account.status == "linked",
+            matched_display_name=suliko_account.matched_display_name,
         )
-    body = (
-        f"Hello {user.full_name},\n\n"
-        f"{inviter} has invited you to {tenant_name} on Suliko.\n\n"
-        f"{how}"
-        f"{account_paragraph}\n"
-        f"If you were not expecting this, tell {tenant_name} and ignore the "
-        "message; nothing happens without the link above.\n"
+    if note is not None:
+        blocks.append(note)
+    blocks += [
+        fine(f"The link works once and expires in {valid_days} days."),
+        fine(
+            f"If you were not expecting this, tell {tenant_name} and ignore the "
+            "message. Nothing happens without the link."
+        ),
+    ]
+    return compose(
+        subject=f"You have been invited to {tenant_name} on Suliko",
+        heading=f"Join {tenant_name}",
+        preheader=f"{inviter} invited you to {tenant_name} on Suliko Office.",
+        blocks=blocks,
+        reason=f"You received this because {tenant_name} invited this address.",
     )
-    return f"You have been invited to {tenant_name} on Suliko", body
 
 
 @router.post("/invite", response_model=InviteOut, status_code=http_status.HTTP_201_CREATED)
@@ -796,6 +855,35 @@ async def invite_user(
         },
     )
 
+    return await _deliver_invitation(
+        db,
+        session,
+        limiter,
+        row,
+        tenant_key=tenant_key,
+        existing_account=existing_account,
+        needs_registration=needs_registration,
+        suliko_account=suliko_account,
+    )
+
+
+async def _deliver_invitation(
+    db: Db,
+    session: CurrentSession,
+    limiter: RateLimiter,
+    row: User,
+    *,
+    tenant_key: str,
+    existing_account: bool,
+    needs_registration: bool,
+    suliko_account: SulikoAccountOut,
+) -> InviteOut:
+    """Mint the link, mail it, and say what happened.
+
+    The part an invitation and a resend have in common. Issuing a link spends
+    the one before it (`reset_tokens.issue`), so a resend is also how a link
+    that was lost, or leaked, is taken out of use.
+    """
     settings = get_settings()
     ttl_seconds = settings.invite_link_ttl_hours * 3600
     base = f"{settings.app_url.rstrip('/')}/{session.tenant_locale}"
@@ -808,9 +896,10 @@ async def invite_user(
         token = await reset_tokens.issue(db, row, ttl_seconds=ttl_seconds)
         invite_link = f"{base}/reset-password?token={quote(token, safe='')}&invite=1"
     await limiter.record_invite(tenant_key)
+    member_email = row.email
     email_sent = False
     if member_email is not None:
-        subject, body = _invite_email(
+        message = _invite_email(
             row,
             session.tenant_name,
             invite_link,
@@ -820,7 +909,9 @@ async def invite_user(
             suliko_account=suliko_account,
             needs_registration=needs_registration,
         )
-        email_sent = (await mail.send(member_email, subject, body)).delivered
+        email_sent = (
+            await mail.send(member_email, message.subject, message.text, message.html)
+        ).delivered
 
     overrides = (await _overrides_for(db, [row.id])).get(row.id, {})
     return InviteOut(
@@ -831,6 +922,92 @@ async def invite_user(
         invited_by_phone=member_email is None,
         invite_expires_at=datetime.now(UTC) + timedelta(seconds=ttl_seconds),
         email_sent=email_sent,
+        suliko_account=suliko_account,
+    )
+
+
+@router.post("/{user_id}/invitation", response_model=InviteOut)
+async def resend_invitation(
+    user_id: int,
+    db: Db,
+    session: CurrentSession,
+    _: Annotated[object, Depends(require(Permission.USERS_MANAGE))],
+    limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
+    backend: Annotated[SulikoBackend, Depends(get_suliko_backend)],
+) -> InviteOut:
+    """A fresh invitation link for someone who has not got in yet.
+
+    The link an invitation carries is shown to the inviter once and lasts seven
+    days, and the invite route refuses a second invitation for the same person.
+    So a lost email, a missed week or a link that went to the wrong place used
+    to end with deleting the person and starting again. This issues a new link
+    instead, spends the old one, and mails it again.
+
+    For anyone whose invitation is still open, and for someone who accepted but
+    has not yet registered on suliko.ge, which is the other way an invitation
+    stalls. Not for someone who has joined: there is nothing to send them.
+    """
+    row = await db.get(User, user_id)
+    if row is None:
+        raise NotFoundError("User not found.")
+    _guard_target(session, row)
+    if not row.is_active:
+        raise ValidationError("This account is switched off. Switch it on first.")
+
+    account = await db.get(Account, row.account_id) if row.account_id else None
+    if account is None:
+        raise ValidationError("This person has no account to invite.")
+
+    # Accepted, and nobody has registered under this address on suliko.ge yet.
+    needs_registration = (
+        backend.enabled
+        and account.suliko_user_id is None
+        and account.password_hash == UNUSABLE_PASSWORD_HASH
+    )
+    if not (row.invitation_pending or needs_registration):
+        raise ConflictError("This person has already joined. They can sign in as usual.")
+    # With suliko.ge connected, everyone else is an existing account (linked
+    # there, or an Office-only login) and gets the accept link. Without it the
+    # invitation made a placeholder nobody has used: it gets the set-password link.
+    existing_account = not needs_registration and (
+        account.suliko_user_id is not None
+        or account.last_login_at is not None
+        or account.email_verified_at is not None
+    )
+
+    tenant_key = f"invite:tenant:{session.tenant_id}"
+    if retry := await limiter.check_invite(tenant_key):
+        raise RateLimitedError(
+            "This organisation has sent too many invitations today. Try again tomorrow.",
+            retry_after=retry,
+        )
+
+    suliko_account = (await _invite_status_for(db, [row.id])).get(row.id)
+    if suliko_account is None:
+        # Invited by phone there is no match record: suliko.ge found them by the number.
+        suliko_account = SulikoAccountOut(
+            status="linked" if row.email is None else "pending",
+            matched_display_name=(account.full_name or None) if row.email is None else None,
+        )
+
+    from suliko.core.audit import record
+
+    await record(
+        db,
+        session,
+        action="user.invitation_resent",
+        entity_type="user",
+        entity_id=row.id,
+        after={"existing_account": existing_account, "needs_registration": needs_registration},
+    )
+    return await _deliver_invitation(
+        db,
+        session,
+        limiter,
+        row,
+        tenant_key=tenant_key,
+        existing_account=existing_account,
+        needs_registration=needs_registration,
         suliko_account=suliko_account,
     )
 

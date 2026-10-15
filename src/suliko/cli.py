@@ -503,8 +503,8 @@ async def purge_accounts() -> int:
             continue
         ok(f"request {request_id}: deleted")
         if address:
-            subject, body = done_email(name)
-            await mail.send(address, subject, body)
+            message = done_email(name)
+            await mail.send(address, message.subject, message.text, message.html)
     return 1 if failed else 0
 
 

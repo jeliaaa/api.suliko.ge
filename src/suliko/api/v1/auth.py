@@ -44,6 +44,7 @@ from suliko.core.errors import (
     RateLimitedError,
     ValidationError,
 )
+from suliko.core.mail_layout import Bold, Button, Email, Link, callout, compose, fine, p
 from suliko.core.ratelimit import RateLimiter, get_rate_limiter
 from suliko.db.session import bind_tenant_guc, get_sessionmaker, session_scope
 from suliko.db.tenancy import bypass_tenant_scope, tenant_scope
@@ -274,9 +275,7 @@ def _choice(membership: Membership) -> OrgChoice:
     )
 
 
-async def _choices(
-    db: AsyncSession, account_id: int
-) -> tuple[list[OrgChoice], OrgChoice | None]:
+async def _choices(db: AsyncSession, account_id: int) -> tuple[list[OrgChoice], OrgChoice | None]:
     """Organisations first, the personal workspace apart — the chooser shows
     it separately, and offers to create it when it does not exist."""
     options = await memberships(db, account_id)
@@ -507,17 +506,25 @@ async def login_options(payload: TicketRequest) -> LoginOptions:
         return await _login_options(db, account, payload.ticket)
 
 
-def _personal_enabled_email(account: Account, link: str) -> tuple[str, str]:
-    """Subject and plain-text body. No HTML — see core/mail.py."""
-    body = (
-        f"Hello {account.full_name or login_name(account)},\n\n"
-        "Your personal Suliko account is now enabled, on the Freelancer plan. "
-        "It is yours alone: your own clients, orders and prices, separate from "
-        "any bureau you work with.\n\n"
-        f"Open it any time from the organisation switcher, or sign in here:\n\n{link}\n\n"
-        "If you did not do this, sign in and change your password.\n"
+def _personal_enabled_email(account: Account, link: str) -> Email:
+    """The notice that a personal workspace now exists for this account."""
+    return compose(
+        subject="Your personal Suliko account is enabled",
+        heading="Your personal account is ready",
+        preheader="It is yours alone: your own clients, orders and prices.",
+        blocks=[
+            p(f"Hello {account.full_name or login_name(account)},"),
+            p(
+                "Your personal Suliko account is now enabled, on the Freelancer plan. "
+                "It is yours alone: your own clients, orders and prices, separate from "
+                "any bureau you work with."
+            ),
+            p("Open it any time from the organisation switcher, or sign in here."),
+            Button("Open Suliko Office", link),
+            fine("If you did not do this, sign in and change your password."),
+        ],
+        reason="You received this because a personal account was enabled for this address.",
     )
-    return "Your personal Suliko account is enabled", body
 
 
 async def _resolve_choice(
@@ -551,12 +558,14 @@ async def _resolve_choice(
         )
         settings = get_settings()
         link = f"{settings.app_url.rstrip('/')}/{own.tenant.locale}/login"
-        subject, body = _personal_enabled_email(account, link)
+        message = _personal_enabled_email(account, link)
         # After the response, which is after the commit: the email must not
         # announce a workspace a rolled-back transaction never created. Someone
         # who signs in with a phone number has no address to tell.
         if account.email:
-            background.add_task(mail.send, account.email, subject, body)
+            background.add_task(
+                mail.send, account.email, message.subject, message.text, message.html
+            )
         log.info("personal_workspace_created", account_id=account.id, tenant_id=own.tenant.id)
         return own
 
@@ -949,20 +958,31 @@ def _existing_account(plan: str | None, display_name: str) -> dict[str, str]:
     return {"kind": "freelancer"}
 
 
-def _verification_email(user: User, tenant: Tenant, link: str, ttl_hours: int) -> tuple[str, str]:
-    """Subject and plain-text body. No HTML — see core/mail.py."""
+def _verification_email(user: User, tenant: Tenant, link: str, ttl_hours: int) -> Email:
+    """The signup's "is this address really yours" link."""
     days = ttl_hours // 24
     validity = f"{days} day{'s' if days != 1 else ''}" if days else f"{ttl_hours} hours"
-    body = (
-        f"Hello {user.full_name or user.username},\n\n"
-        f"Welcome to Suliko. Confirm this address to finish setting up "
-        f"{tenant.display_name}:\n\n{link}\n\n"
-        f"The link works once and expires in {validity}. Nothing about your "
-        f"account is on hold while you do this. It is only so we know this "
-        f"address is really yours.\n\n"
-        f"If you did not sign up for Suliko, you can ignore this email.\n"
+    return compose(
+        subject="Confirm your email for Suliko",
+        heading="Confirm your email address",
+        preheader=f"One step to finish setting up {tenant.display_name}.",
+        blocks=[
+            p(f"Hello {user.full_name or user.username},"),
+            p(
+                "Welcome to Suliko. Confirm this address to finish setting up ",
+                Bold(tenant.display_name),
+                ".",
+            ),
+            Button("Confirm email address", link),
+            fine(
+                f"The link works once and expires in {validity}. Nothing about your "
+                "account is on hold while you do this. It is only so we know this "
+                "address is really yours."
+            ),
+            fine("If you did not sign up for Suliko, you can ignore this email."),
+        ],
+        reason="You received this because this address was used to sign up for Suliko.",
     )
-    return "Confirm your email for Suliko", body
 
 
 @router.post("/signup", response_model=SignupResponse, status_code=status.HTTP_201_CREATED)
@@ -1099,8 +1119,8 @@ async def signup(
         f"{settings.app_url.rstrip('/')}/{tenant.locale}/verify-email"
         f"?token={quote(verification_token, safe='')}"
     )
-    subject, body = _verification_email(user, tenant, link, settings.email_verification_ttl_hours)
-    background.add_task(mail.send, email, subject, body)
+    message = _verification_email(user, tenant, link, settings.email_verification_ttl_hours)
+    background.add_task(mail.send, email, message.subject, message.text, message.html)
 
     return SignupResponse(
         session_token=issued.token,
@@ -1221,10 +1241,10 @@ async def resend_verification_email(
     link = (
         f"{settings.app_url.rstrip('/')}/{tenant.locale}/verify-email?token={quote(token, safe='')}"
     )
-    subject, body = _verification_email(user, tenant, link, settings.email_verification_ttl_hours)
+    message = _verification_email(user, tenant, link, settings.email_verification_ttl_hours)
     # Inline, not backgrounded: this endpoint IS the "send it" action — there
     # is no larger response the person is waiting on behind it, unlike signup.
-    await mail.send(user.email, subject, body)
+    await mail.send(user.email, message.subject, message.text, message.html)
 
 
 # ── Passwords ───────────────────────────────────────────────────────────────
@@ -1256,39 +1276,61 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(min_length=1, max_length=1024)
 
 
-def _reset_email(account: Account, link: str, ttl_minutes: int) -> tuple[str, str]:
-    """Subject and plain-text body. No HTML — see core/mail.py."""
+def _reset_email(account: Account, link: str, ttl_minutes: int) -> Email:
+    """The link that lets someone choose a new password of their own."""
     hours = ttl_minutes // 60
     validity = f"{hours} hour{'s' if hours != 1 else ''}" if hours else f"{ttl_minutes} minutes"
-    body = (
-        f"Hello {account.full_name or account.email},\n\n"
-        f"Someone asked to reset the password for your Suliko account "
-        f"({account.email}).\n\n"
-        f"Open this link to choose a new one:\n\n{link}\n\n"
-        f"The link works once and expires in {validity}. The new password "
-        f"is the one you sign in with everywhere, in every organisation you "
-        f"belong to.\n\n"
-        f"If this wasn't you, you can ignore this email. Your password has "
-        f"not changed. Nobody can use this link without opening it.\n"
+    return compose(
+        subject="Reset your Suliko password",
+        heading="Reset your password",
+        preheader="Choose a new password. The link works once.",
+        blocks=[
+            p(f"Hello {account.full_name or account.email},"),
+            p(
+                "Someone asked to reset the password for your Suliko account (",
+                Bold(account.email or ""),
+                "). Open the link below to choose a new one.",
+            ),
+            Button("Choose a new password", link),
+            fine(
+                f"The link works once and expires in {validity}. The new password "
+                "is the one you sign in with everywhere, in every organisation you "
+                "belong to."
+            ),
+            callout(
+                "If this wasn't you, you can ignore this email. Your password has "
+                "not changed. Nobody can use this link without opening it."
+            ),
+        ],
+        reason="You received this because a password reset was requested for this address.",
     )
-    return "Reset your Suliko password", body
 
 
-def _suliko_password_email(account: Account, reset_url: str) -> tuple[str, str]:
+def _suliko_password_email(account: Account, reset_url: str) -> Email:
     """For someone whose password lives on suliko.ge: where to reset it."""
-    body = (
-        f"Hello {account.full_name or login_name(account)},\n\n"
-        "Someone asked to reset the password for your Suliko Office account "
-        f"({login_name(account)}).\n\n"
-        "Your password is kept on suliko.ge, and Suliko Office signs you in with it, "
-        "so it is changed there. Reset it here:\n\n"
-        f"{reset_url}\n\n"
-        "Then sign in to Suliko Office with the new password.\n\n"
-        "No suliko.ge account yet? Register with exactly this email address, "
-        f"then sign in here:\n\n{registration_url()}\n\n"
-        "If this wasn't you, you can ignore this email. Nothing has changed.\n"
+    return compose(
+        subject="Reset your Suliko password",
+        heading="Reset your password on suliko.ge",
+        preheader="Your password is kept on suliko.ge. Reset it there.",
+        blocks=[
+            p(f"Hello {account.full_name or login_name(account)},"),
+            p(
+                "Someone asked to reset the password for your Suliko Office account (",
+                Bold(login_name(account)),
+                "). Your password is kept on suliko.ge, and Suliko Office signs you in "
+                "with it, so it is changed there.",
+            ),
+            Button("Reset password on suliko.ge", reset_url),
+            p("Then sign in to Suliko Office with the new password."),
+            callout(
+                "No suliko.ge account yet? Register with exactly this email address, "
+                "then sign in here: ",
+                Link(registration_url(), registration_url()),
+            ),
+            fine("If this wasn't you, you can ignore this email. Nothing has changed."),
+        ],
+        reason="You received this because a password reset was requested for this address.",
     )
-    return "Reset your Suliko password", body
 
 
 @router.post("/password/forgot", status_code=status.HTTP_204_NO_CONTENT)
@@ -1330,8 +1372,8 @@ async def forgot_password(
             # a link of ours would hand them a password that exists only here.
             # They are told where to go instead — after the response, like the
             # mail below, so this costs the same as the path that issues a token.
-            subject, body = _suliko_password_email(account, settings.suliko_password_reset_url)
-            background.add_task(mail.send, email, subject, body)
+            message = _suliko_password_email(account, settings.suliko_password_reset_url)
+            background.add_task(mail.send, email, message.subject, message.text, message.html)
             return
         # The token is the reset-token machinery's, which is per membership
         # row; the one used most recently carries it. Which row it is changes
@@ -1381,11 +1423,11 @@ async def forgot_password(
         f"{settings.app_url.rstrip('/')}/{tenant.locale}/reset-password"
         f"?token={quote(token, safe='')}"
     )
-    subject, body = _reset_email(account, link, settings.password_reset_ttl_minutes)
+    message = _reset_email(account, link, settings.password_reset_ttl_minutes)
     # After the response, not before it. Sending inline made a known account
     # take seconds (SMTP handshake, TLS, login) and an unknown one return at
     # once — the response time alone told anyone which addresses exist.
-    background.add_task(mail.send, email, subject, body)
+    background.add_task(mail.send, email, message.subject, message.text, message.html)
 
 
 @router.post("/password/reset", status_code=status.HTTP_204_NO_CONTENT)
@@ -1647,16 +1689,22 @@ async def request_account_deletion(
 
     # After the response, which is after the commit: nobody is told about a
     # request a rolled-back transaction never filed. `mail.send` never raises.
-    subject, body = team_email(
+    team = team_email(
         account,
         deletion,
         organisation=session.tenant_name,
         organisation_slug=session.tenant_slug,
     )
-    background.add_task(mail.send, get_settings().support_email, subject, body)
+    background.add_task(mail.send, get_settings().support_email, team.subject, team.text, team.html)
     if account.email:
-        subject, body = person_email(account)
-        background.add_task(mail.send, account.email, subject, body)
+        confirmation = person_email(account)
+        background.add_task(
+            mail.send,
+            account.email,
+            confirmation.subject,
+            confirmation.text,
+            confirmation.html,
+        )
 
     log.info("account_deletion_requested", account_id=account.id, request_id=deletion.id)
     return DeletionRequestResponse(status=deletion.status.value, requested_at=deletion.created_at)
