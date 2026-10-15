@@ -140,6 +140,8 @@ class TenantSummary(BaseModel):
     #: `onboarding_required` reports separately.
     plan: TenantPlan
     onboarding_required: bool
+    #: Which order package the bureau's fee is: 1, 2 or 3 (`models.billing`).
+    package_tier: int
     locale: str
     users: int
     active_users: int
@@ -314,6 +316,7 @@ def _summary(tenant: Tenant, *, users: int, active_users: int, orders: int) -> T
         status=tenant.status,
         plan=effective_plan(tenant.plan),
         onboarding_required=parse(tenant.plan) is None,
+        package_tier=tenant.package_tier,
         locale=tenant.locale,
         users=users,
         active_users=active_users,

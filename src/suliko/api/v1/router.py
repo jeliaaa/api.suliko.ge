@@ -4,6 +4,7 @@ from fastapi import APIRouter
 
 from suliko.api.v1 import (
     auth,
+    billing,
     calculator,
     clients,
     companies,
@@ -21,6 +22,7 @@ from suliko.api.v1 import (
     order_word_editor,
     orders,
     platform,
+    platform_billing,
     portal,
     portal_admin,
     reference,
@@ -65,6 +67,8 @@ api_router.include_router(service_pages.strings_router)
 # router that is deliberately outside the tenancy model rather than
 # inside it — see its module docstring for how that is kept safe.
 api_router.include_router(platform.router)
+api_router.include_router(platform_billing.router)
+api_router.include_router(billing.router)
 
 # The suliko.ge translator portal and its admin. These do NOT use the staff
 # session chain in api/deps.py; see api/portal_deps.py.
