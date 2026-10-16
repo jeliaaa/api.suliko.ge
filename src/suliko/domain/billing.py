@@ -27,7 +27,7 @@ from __future__ import annotations
 import enum
 import re
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
@@ -39,7 +39,7 @@ from suliko.core.errors import AppError, ValidationError
 from suliko.domain.clock import today_in, zone
 from suliko.domain.plans import TenantPlan, effective_plan
 from suliko.domain.statuses import EXCLUDED_FROM_AGGREGATES
-from suliko.models.billing import BillingPackage
+from suliko.models.billing import BillingFreeMonth, BillingPackage
 from suliko.models.order import Order, OrderStatusEvent
 from suliko.models.tenant import Tenant
 
@@ -199,6 +199,30 @@ def month_window(period: str, tz: str | None) -> tuple[datetime, datetime]:
 
 def period_of(day: date) -> str:
     return f"{day.year:04d}-{day.month:02d}"
+
+
+def period_days(period: str) -> tuple[date, date]:
+    """The first and the last day of a calendar month."""
+    year, month = parse_period(period)
+    first = date(year, month, 1)
+    return first, date(year + (month == 12), month % 12 + 1, 1) - timedelta(days=1)
+
+
+def previous_period(period: str) -> str:
+    return period_of(period_days(period)[0] - timedelta(days=1))
+
+
+def started_on(tenant: Tenant) -> date:
+    """The day the account began, in its own time zone: where its billing starts."""
+    return tenant.created_at.astimezone(zone(tenant.timezone)).date()
+
+
+async def free_periods(db: Any, tenant_id: int) -> set[str]:
+    """The months a superuser made free for this account."""
+    rows = await db.execute(
+        select(BillingFreeMonth.period).where(BillingFreeMonth.tenant_id == tenant_id)
+    )
+    return set(rows.scalars().all())
 
 
 # ── What is counted ─────────────────────────────────────────────────────────

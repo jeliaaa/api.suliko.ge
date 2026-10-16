@@ -27,6 +27,8 @@ from suliko.domain.billing import (
     Package,
     Quote,
     audience_of,
+    current_period,
+    free_periods,
     from_cents,
     load_packages,
     month_of,
@@ -69,6 +71,8 @@ class UsageOut(BaseModel):
     level: str
     blocked: bool
     monthly_price: Decimal | None
+    #: A superuser made this month free: no fee. The package's order limit still applies.
+    free_month: bool = False
 
 
 class InvoiceOut(BaseModel):
@@ -93,6 +97,8 @@ class BillingOverview(BaseModel):
     #: The version of the terms the confirmation is made against; send it back.
     terms_version: str
     invoices: list[InvoiceOut]
+    #: Months ("2026-09") made free for this account, listed beside the invoices.
+    free_months: list[str]
 
 
 class UpgradeRequest(BaseModel):
@@ -117,7 +123,9 @@ def package_out(package: Package) -> PackageOut:
     )
 
 
-def usage_out(*, period: str, package: Package, figures: Quote) -> UsageOut:
+def usage_out(
+    *, period: str, package: Package, figures: Quote, free_month: bool = False
+) -> UsageOut:
     return UsageOut(
         period=period,
         tier=package.tier,
@@ -129,6 +137,7 @@ def usage_out(*, period: str, package: Package, figures: Quote) -> UsageOut:
         monthly_price=None
         if figures.plan_fee_cents is None
         else from_cents(figures.plan_fee_cents),
+        free_month=free_month,
     )
 
 
@@ -151,10 +160,12 @@ def invoice_out(row: BillingInvoice) -> InvoiceOut:
 async def tenant_usage(db: Db, tenant: Tenant, period: str | None = None) -> UsageOut:
     """This month (or ``period``) for one account."""
     package, figures = await month_of(db, tenant, period)
-    from suliko.domain.billing import current_period
-
+    chosen = period or current_period(tenant.timezone)
     return usage_out(
-        period=period or current_period(tenant.timezone), package=package, figures=figures
+        period=chosen,
+        package=package,
+        figures=figures,
+        free_month=chosen in await free_periods(db, tenant.id),
     )
 
 
@@ -214,6 +225,7 @@ async def get_overview(db: Db, session: Billing) -> BillingOverview:
         upgrade_to=upgrade_targets(tenant.package_tier, packages),
         terms_version=TERMS_VERSION,
         invoices=[invoice_out(row) for row in rows],
+        free_months=sorted(await free_periods(db, tenant.id), reverse=True),
     )
 
 

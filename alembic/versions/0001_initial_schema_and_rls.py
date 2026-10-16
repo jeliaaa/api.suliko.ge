@@ -113,6 +113,8 @@ LATER_REVISION_TABLES = frozenset(
         "billing_invoices",
         # 0032
         "invoice_templates",
+        # 0034
+        "billing_free_months",
     }
 )
 

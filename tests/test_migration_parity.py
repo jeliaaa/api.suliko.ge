@@ -82,6 +82,8 @@ LATER_REVISIONS = (
     "0032_invoice_templates.py",
     # Packages per audience and no per-order fee — see test_migration_0033.py.
     "0033_package_audiences.py",
+    # billing_free_months — see test_migration_0034.py.
+    "0034_free_months.py",
 )
 
 

@@ -8,7 +8,7 @@ installed.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -28,7 +28,12 @@ from suliko.db.base import Base
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
 from suliko.domain import billing
 from suliko.domain.plans import TenantPlan
-from suliko.models.billing import BillingInvoice, BillingInvoiceStatus, BillingPackage
+from suliko.models.billing import (
+    BillingFreeMonth,
+    BillingInvoice,
+    BillingInvoiceStatus,
+    BillingPackage,
+)
 from suliko.models.order import Order, OrderStatusEvent
 from suliko.models.tenant import Tenant, TenantStatus
 from suliko.models.user import Role
@@ -117,7 +122,7 @@ def test_a_month_must_be_written_year_dash_month(bad: str) -> None:
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
 
-MODELS = (Tenant, Order, OrderStatusEvent, BillingPackage, BillingInvoice)
+MODELS = (Tenant, Order, OrderStatusEvent, BillingPackage, BillingInvoice, BillingFreeMonth)
 
 
 @pytest.fixture(autouse=True)
@@ -721,3 +726,262 @@ async def test_an_invoice_is_followed_by_hand_open_sent_paid_or_waived(
 )
 def test_a_new_order_cannot_claim_to_be_an_import(claimed: str | None, stored: str) -> None:
     assert orders_api.order_source(claimed) == stored
+
+
+# ── Dates, months and free months ───────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("period", "first", "last"),
+    [
+        ("2026-10", date(2026, 10, 1), date(2026, 10, 31)),
+        ("2026-12", date(2026, 12, 1), date(2026, 12, 31)),
+        ("2028-02", date(2028, 2, 1), date(2028, 2, 29)),
+        ("2026-02", date(2026, 2, 1), date(2026, 2, 28)),
+    ],
+)
+def test_a_period_runs_from_the_first_to_the_last_day_of_its_month(
+    period: str, first: date, last: date
+) -> None:
+    assert billing.period_days(period) == (first, last)
+
+
+@pytest.mark.parametrize(
+    ("period", "before"), [("2026-10", "2026-09"), ("2026-01", "2025-12"), ("2026-03", "2026-02")]
+)
+def test_the_month_before_crosses_the_year(period: str, before: str) -> None:
+    assert billing.previous_period(period) == before
+
+
+async def test_billing_starts_on_the_day_the_account_began_in_its_own_time_zone(
+    db: AsyncSession,
+) -> None:
+    tenant = await tenant_of(db, ACME)
+    tenant.created_at = datetime(2026, 8, 31, 21, 0, tzinfo=UTC)  # 01:00 on 1 Sep in Tbilisi
+    tenant.timezone = "Asia/Tbilisi"
+    assert billing.started_on(tenant) == date(2026, 9, 1)
+
+
+async def _free(db: AsyncSession, period: str, tenant_id: int = ACME, free: bool = True) -> Any:
+    return await platform_api.set_free_month(
+        tenant_id, period, platform_api.FreeMonthChange(free=free), db, superuser()
+    )
+
+
+async def test_a_superuser_makes_a_month_free_and_takes_it_back(
+    db: AsyncSession, audit: list[dict[str, Any]]
+) -> None:
+    out = await _free(db, "2026-09")
+    assert (out.tenant_id, out.period, out.free) == (ACME, "2026-09", True)
+    assert audit[-1]["action"] == "platform.billing_free_month_set"
+    with bypass_tenant_scope():
+        assert await billing.free_periods(db, ACME) == {"2026-09"}
+        assert await billing.free_periods(db, GLOBEX) == set()
+
+    # Saying it again changes nothing and is not audited a second time.
+    count = len(audit)
+    await _free(db, "2026-09")
+    assert len(audit) == count
+    with bypass_tenant_scope():
+        rows = (await db.execute(select(BillingFreeMonth))).scalars().all()
+    assert len(rows) == 1
+
+    back = await _free(db, "2026-09", free=False)
+    assert back.free is False
+    assert audit[-1]["action"] == "platform.billing_free_month_removed"
+    with bypass_tenant_scope():
+        assert await billing.free_periods(db, ACME) == set()
+    # Taking back what was never set is quiet too.
+    count = len(audit)
+    await _free(db, "2026-09", free=False)
+    assert len(audit) == count
+
+
+async def test_a_free_month_needs_a_real_month_and_a_real_account(db: AsyncSession) -> None:
+    with pytest.raises(ValidationError):
+        await _free(db, "10/2026")
+    with pytest.raises(NotFoundError):
+        await _free(db, "2026-09", tenant_id=9999)
+
+
+async def test_a_month_that_already_has_an_invoice_is_set_to_waived_instead(
+    db: AsyncSession,
+) -> None:
+    await make_order(db, ACME, when(5, month=7))
+    await platform_api.prepare_invoices(
+        platform_api.PrepareRequest(period="2026-07"), db, superuser()
+    )
+    with pytest.raises(ConflictError):
+        await _free(db, "2026-07")
+    with bypass_tenant_scope():
+        assert await billing.free_periods(db, ACME) == set()
+    # Taking a free mark back is never refused.
+    await _free(db, "2026-07", free=False)
+
+
+async def test_a_free_month_is_free_for_that_account_only_and_gets_no_invoice(
+    db: AsyncSession,
+) -> None:
+    await make_order(db, ACME, when(5, month=7))
+    await make_order(db, GLOBEX, when(5, month=7))
+    await _free(db, "2026-07", ACME)
+    out = await platform_api.prepare_invoices(
+        platform_api.PrepareRequest(period="2026-07"), db, superuser()
+    )
+    # ACME is free; GLOBEX still owes; the freelancer and personal workspace owe nothing anyway.
+    assert (out.created, out.nothing_due) == (1, 3)
+    with bypass_tenant_scope():
+        owed = (await db.execute(select(BillingInvoice.tenant_id))).scalars().all()
+    assert list(owed) == [GLOBEX]
+    # The next month is not free.
+    await make_order(db, ACME, when(5, month=8))
+    later = await platform_api.prepare_invoices(
+        platform_api.PrepareRequest(period="2026-08"), db, superuser()
+    )
+    assert later.created == 2
+
+
+async def test_a_free_month_waives_only_the_fee_the_limit_still_applies(
+    db: AsyncSession,
+) -> None:
+    current = billing.current_period("Asia/Tbilisi")
+    await _free(db, current)
+    await fill(db, ACME, 50, month=int(current[5:]))
+    tenant = await tenant_of(db, ACME)
+    with pytest.raises(billing.PackageLimitError), bypass_tenant_scope():
+        await billing.ensure_room_for_order(db, tenant)
+
+
+async def test_the_owners_usage_and_overview_say_the_month_is_free(db: AsyncSession) -> None:
+    current = billing.current_period("Asia/Tbilisi")
+    with tenant_scope(ACME):
+        plain = await tenant_api.tenant_usage(db, await tenant_of(db, ACME))
+    assert plain.free_month is False
+    await _free(db, current)
+    await _free(db, "2026-01")
+    with tenant_scope(ACME):
+        tenant = await tenant_of(db, ACME)
+        usage = await tenant_api.tenant_usage(db, tenant)
+        other = await tenant_api.tenant_usage(db, tenant, "2026-01")
+        untouched = await tenant_api.tenant_usage(db, tenant, "2026-02")
+        overview = await tenant_api.get_overview(db, session_of(ACME))
+    assert usage.free_month is True
+    assert other.free_month is True
+    assert untouched.free_month is False
+    with tenant_scope(GLOBEX):
+        elsewhere = await tenant_api.tenant_usage(db, await tenant_of(db, GLOBEX))
+    assert elsewhere.free_month is False
+    assert overview.free_months == sorted([current, "2026-01"], reverse=True)
+
+
+async def test_an_accounts_page_has_its_dates_and_a_free_flag_for_this_month(
+    db: AsyncSession,
+) -> None:
+    tenant = await tenant_of(db, ACME)
+    tenant.created_at = datetime(2026, 8, 12, 10, 0, tzinfo=UTC)
+    current = billing.current_period("Asia/Tbilisi")
+    first, last = billing.period_days(current)
+
+    page = await platform_api.get_tenant_billing(ACME, db, superuser())
+    assert (page.tenant_id, page.audience, page.tier) == (ACME, "bureau", 1)
+    assert page.billing_started == date(2026, 8, 12)
+    assert (page.period, page.period_start, page.period_end) == (current, first, last)
+    assert page.free_this_month is False
+
+    await _free(db, current)
+    assert (await platform_api.get_tenant_billing(ACME, db, superuser())).free_this_month is True
+    with pytest.raises(NotFoundError):
+        await platform_api.get_tenant_billing(9999, db, superuser())
+
+
+async def test_an_accounts_months_run_back_from_now_to_the_month_it_began(
+    db: AsyncSession,
+) -> None:
+    tenant = await tenant_of(db, ACME)
+    current = billing.current_period("Asia/Tbilisi")
+    # The account began three months before this one.
+    start = current
+    for _ in range(3):
+        start = billing.previous_period(start)
+    year, month = billing.parse_period(start)
+    tenant.created_at = datetime(year, month, 10, 9, 0, tzinfo=UTC)
+
+    page = await platform_api.get_tenant_billing(ACME, db, superuser())
+    periods = [row.period for row in page.months]
+    assert periods[0] == current
+    assert periods[-1] == start
+    assert len(periods) == 4
+    assert periods == sorted(periods, reverse=True)
+
+
+async def test_an_old_account_lists_two_years_and_no_more(db: AsyncSession) -> None:
+    tenant = await tenant_of(db, ACME)
+    tenant.created_at = datetime(2015, 1, 1, tzinfo=UTC)
+    page = await platform_api.get_tenant_billing(ACME, db, superuser())
+    assert len(page.months) == platform_api.MONTHS_SHOWN == 24
+
+
+async def test_each_month_shows_its_orders_its_fee_and_where_it_stands(
+    db: AsyncSession,
+) -> None:
+    tenant = await tenant_of(db, ACME)
+    current = billing.current_period("Asia/Tbilisi")
+    tenant.created_at = datetime(2020, 1, 1, tzinfo=UTC)
+    # One invoiced month, one free month, one plain one, and this month.
+    invoiced, free, plain = "2026-07", "2026-06", "2026-05"
+    for period, count in ((invoiced, 3), (free, 2), (plain, 1)):
+        await fill(db, ACME, count, month=int(period[5:]))
+    await platform_api.prepare_invoices(
+        platform_api.PrepareRequest(period=invoiced), db, superuser()
+    )
+    await _free(db, free)
+    page = await platform_api.get_tenant_billing(ACME, db, superuser())
+    rows = {row.period: row for row in page.months}
+
+    now = rows[current]
+    assert (now.state, now.free, now.invoice) == ("current", False, None)
+    assert now.fee == Decimal("50.00")
+    assert now.included == 50
+
+    done = rows[invoiced]
+    assert (done.state, done.orders, done.fee) == ("open", 3, Decimal("50.00"))
+    assert done.invoice is not None
+
+    gift = rows[free]
+    assert (gift.state, gift.free, gift.orders, gift.fee) == ("free", True, 2, Decimal("0.00"))
+    assert gift.invoice is None
+
+    bare = rows[plain]
+    assert (bare.state, bare.orders, bare.invoice) == ("not_invoiced", 1, None)
+
+
+async def test_a_month_with_no_price_shows_no_fee(db: AsyncSession) -> None:
+    await platform_api.edit_package(
+        "bureau",
+        1,
+        platform_api.PackageUpdate(orders_included=50, monthly_price=None),
+        db,
+        superuser(),
+    )
+    page = await platform_api.get_tenant_billing(ACME, db, superuser())
+    assert page.months[0].fee is None
+
+
+async def test_the_billing_view_flags_the_accounts_whose_month_is_free(db: AsyncSession) -> None:
+    await _free(db, "2026-10", GLOBEX)
+    out = await platform_api.get_billing(db, superuser(), "2026-10")
+    flags = {a.tenant_id: (a.free_month, a.usage.free_month) for a in out.accounts}
+    assert flags[GLOBEX] == (True, True)
+    assert flags[ACME] == (False, False)
+    # Another month is not affected.
+    november = await platform_api.get_billing(db, superuser(), "2026-11")
+    assert not any(a.free_month for a in november.accounts)
+
+
+def test_the_free_month_switch_is_a_single_put_in_the_platform_area() -> None:
+    app = FastAPI()
+    app.include_router(api_router, prefix="/api/v1")
+    paths = app.openapi()["paths"]
+    free = [p for p in paths if "free-months" in p]
+    assert free == ["/api/v1/platform/tenants/{tenant_id}/free-months/{period}"]
+    assert list(paths[free[0]]) == ["put"]

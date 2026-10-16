@@ -85,3 +85,20 @@ class BillingInvoice(Base, IdMixin, TenantScoped, TimestampMixin):
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     note: Mapped[str | None] = mapped_column(String(500), default=None)
+
+
+class BillingFreeMonth(Base, IdMixin, TenantScoped, TimestampMixin):
+    """A calendar month a superuser made free for one account: no fee for the whole month.
+
+    Only the fee is waived. The package's order limit still applies. A month that
+    already has an invoice cannot be made free: its invoice is set to waived instead.
+    """
+
+    __tablename__ = "billing_free_months"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "period", name="uq_billing_free_months_period"),
+    )
+
+    #: "2026-10": the calendar month, in the account's own time zone.
+    period: Mapped[str] = mapped_column(String(7), nullable=False)
+    note: Mapped[str | None] = mapped_column(String(255), default=None)
