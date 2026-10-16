@@ -160,7 +160,7 @@ def _every_email() -> dict[str, Email]:
     pending = users.SulikoAccountOut(status="pending", matched_display_name=None)
     return {
         "reset": auth._reset_email(account, LINK, 60),
-        "reset on suliko.ge": auth._suliko_password_email(account, "https://suliko.ge/login"),
+        "reset on suliko.ge": auth._suliko_password_email(account, "https://suliko.ge/sign-in"),
         "confirm": auth._verification_email(user, tenant, LINK, 72),
         "personal enabled": auth._personal_enabled_email(account, LINK),
         "invite, new to suliko": users._invite_email(

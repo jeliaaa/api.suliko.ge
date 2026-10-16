@@ -396,10 +396,10 @@ def test_forgot_password_for_a_suliko_person_issues_no_token() -> None:
 def test_the_suliko_reset_email_says_where_to_go_and_offers_no_local_link() -> None:
     account = Account(email="nino@suliko.ge", full_name="Nino", password_hash="!")
 
-    message = auth._suliko_password_email(account, "https://suliko.ge/login")
+    message = auth._suliko_password_email(account, "https://suliko.ge/sign-in")
 
     for version in (message.text, message.html):
-        assert "https://suliko.ge/login" in version
+        assert "https://suliko.ge/sign-in" in version
         assert "suliko.ge-ზე ინახება" in version
         # Someone who has not registered there yet is pointed at registration.
         assert "https://suliko.ge/sign-in?mode=register" in version
