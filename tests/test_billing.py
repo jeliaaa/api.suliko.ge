@@ -1,4 +1,4 @@
-"""Order packages: counting a bureau's month, the warnings, and the invoices.
+"""Order packages: counting a month, the block at the limit, the move up, the invoices.
 
 The arithmetic (`domain/billing.py`) is pure and tested directly. The counting
 and the endpoints run for real against in-memory SQLite, with the tenant filter
@@ -14,14 +14,16 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
+from fastapi import FastAPI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from suliko.api.v1 import billing as tenant_api
+from suliko.api.v1 import orders as orders_api
 from suliko.api.v1 import platform_billing as platform_api
 from suliko.api.v1.router import api_router
-from suliko.core.errors import NotFoundError, ValidationError
+from suliko.core.errors import ConflictError, NotFoundError, ValidationError
 from suliko.db.base import Base
 from suliko.db.tenancy import bypass_tenant_scope, install_tenant_filter, tenant_scope
 from suliko.domain import billing
@@ -36,7 +38,6 @@ from suliko.security.sessions import AuthenticatedSession
 install_tenant_filter()
 
 ACME, GLOBEX, SOLO, PERSONAL = 1, 2, 3, 4
-PACKAGE_1 = billing.default_package(1)
 
 
 # ── The arithmetic ──────────────────────────────────────────────────────────
@@ -44,16 +45,9 @@ PACKAGE_1 = billing.default_package(1)
 
 @pytest.mark.parametrize(
     ("orders", "level"),
-    [
-        (0, "ok"),
-        (39, "ok"),
-        (40, "near"),
-        (49, "near"),
-        (50, "limit"),
-        (51, "limit"),
-    ],
+    [(0, "ok"), (39, "ok"), (40, "near"), (49, "near"), (50, "limit"), (51, "limit")],
 )
-def test_the_warning_starts_at_eighty_percent_and_again_at_all_of_them(
+def test_the_warning_starts_at_eighty_percent_and_the_limit_at_all_of_them(
     orders: int, level: str
 ) -> None:
     assert billing.level_of(orders, 50) == level
@@ -67,22 +61,31 @@ def test_a_small_package_warns_at_the_right_order() -> None:
     assert billing.level_of(6, 7) == "near"
 
 
-def test_orders_past_the_included_ones_are_charged_one_lari_each_on_any_package() -> None:
-    for tier in billing.TIERS:
-        package = billing.default_package(tier)
-        under = billing.quote(package, package.orders_included)
-        assert (under.extra_orders, under.extra_fee_cents) == (0, 0)
-        over = billing.quote(package, package.orders_included + 3)
-        assert (over.extra_orders, over.extra_fee_cents) == (3, 300)
-        assert over.total_cents == (package.monthly_price_cents or 0) + 300
+def test_at_the_limit_the_account_is_blocked_and_nothing_is_charged_per_order() -> None:
+    package = billing.default_package("bureau", 1)
+    below = billing.quote(package, package.orders_included - 1)
+    assert (below.blocked, below.remaining, below.total_cents) == (False, 1, 5000)
+    at = billing.quote(package, package.orders_included)
+    assert (at.blocked, at.remaining) == (True, 0)
+    # Past it (an order made before the rule, say) the fee is still just the fee.
+    over = billing.quote(package, package.orders_included + 30)
+    assert (over.blocked, over.remaining, over.total_cents) == (True, 0, 5000)
 
 
-def test_a_package_with_no_price_bills_only_the_extras() -> None:
-    package = billing.default_package(3)
-    assert package.monthly_price_cents is None
-    figures = billing.quote(package, package.orders_included + 2)
-    assert (figures.plan_fee_cents, figures.total_cents) == (None, 200)
-    assert billing.quote(package, 10).total_cents == 0
+def test_a_package_can_be_free_or_have_no_price() -> None:
+    free = billing.default_package("freelancer", 1)
+    assert (free.monthly_price_cents, billing.quote(free, 3).total_cents) == (0, 0)
+    quoted = billing.default_package("bureau", 3)
+    assert quoted.monthly_price_cents is None
+    assert billing.quote(quoted, 10).total_cents == 0
+
+
+def test_bureaus_and_freelancers_have_their_own_packages() -> None:
+    assert {a: set(p) for a, p in billing.DEFAULT_PACKAGES.items()} == {
+        "bureau": {1, 2, 3},
+        "freelancer": {1, 2, 3},
+    }
+    assert billing.default_package("bureau", 2) != billing.default_package("freelancer", 2)
 
 
 def test_lari_and_tetri_round_trip_and_round_half_up() -> None:
@@ -93,7 +96,7 @@ def test_lari_and_tetri_round_trip_and_round_half_up() -> None:
     assert str(billing.from_cents(5)) == "0.05"
 
 
-def test_a_month_is_the_bureaus_own_calendar_month() -> None:
+def test_a_month_is_the_accounts_own_calendar_month() -> None:
     start, end = billing.month_window("2026-10", "Asia/Tbilisi")
     # Tbilisi is UTC+4: October starts at 20:00 UTC on the 30th of September.
     assert start == datetime(2026, 9, 30, 20, tzinfo=UTC)
@@ -101,7 +104,6 @@ def test_a_month_is_the_bureaus_own_calendar_month() -> None:
     assert billing.month_window("2026-12", "Asia/Tbilisi")[1] == datetime(
         2026, 12, 31, 20, tzinfo=UTC
     )
-    # Half past midnight on the 1st in Tbilisi is still the 31st in UTC.
     night = datetime(2026, 10, 31, 20, 30, tzinfo=UTC)
     assert billing.current_period("Asia/Tbilisi", now=night) == "2026-11"
     assert billing.current_period("UTC", now=night) == "2026-10"
@@ -113,7 +115,7 @@ def test_a_month_must_be_written_year_dash_month(bad: str) -> None:
         billing.parse_period(bad)
 
 
-# ── Counting ────────────────────────────────────────────────────────────────
+# ── Fixtures ────────────────────────────────────────────────────────────────
 
 MODELS = (Tenant, Order, OrderStatusEvent, BillingPackage, BillingInvoice)
 
@@ -203,12 +205,54 @@ async def make_order(
     return order
 
 
+async def fill(db: AsyncSession, tenant_id: int, count: int, *, month: int = 10) -> None:
+    for number in range(count):
+        await make_order(db, tenant_id, when(1 + number % 28, hour=number % 24, month=month))
+
+
 async def counted(db: AsyncSession, tenant_id: int = ACME, period: str = "2026-10") -> int:
     with bypass_tenant_scope():
         return await billing.count_orders(db, tenant_id, period, "Asia/Tbilisi")
 
 
-async def test_only_orders_made_in_the_bureaus_calendar_month_are_counted(db: AsyncSession) -> None:
+async def tenant_of(db: AsyncSession, tenant_id: int) -> Tenant:
+    with bypass_tenant_scope():
+        tenant = await db.get(Tenant, tenant_id)
+    assert tenant is not None
+    return tenant
+
+
+def session_of(tenant_id: int, plan: TenantPlan = TenantPlan.BUREAU) -> AuthenticatedSession:
+    return AuthenticatedSession(
+        session_id=1,
+        user_id=1,
+        username="owner",
+        full_name="Owner",
+        email="o@x.test",
+        role=Role.OWNER,
+        tenant_id=tenant_id,
+        tenant_slug=f"t{tenant_id}",
+        tenant_name="Acme",
+        plan=plan,
+        onboarding_required=False,
+        must_change_password=False,
+        has_mfa=False,
+        permissions=permissions_for_role(Role.OWNER),
+        mfa_satisfied_at=None,
+        impersonated_by_user_id=None,
+    )
+
+
+def superuser() -> AuthenticatedSession:
+    return session_of(ACME)
+
+
+# ── Counting ────────────────────────────────────────────────────────────────
+
+
+async def test_only_orders_made_in_the_accounts_calendar_month_are_counted(
+    db: AsyncSession,
+) -> None:
     await make_order(db, ACME, when(15))
     # Half past eleven on 30 September in Tbilisi is still September...
     await make_order(db, ACME, datetime(2026, 9, 30, 19, 30, tzinfo=UTC))
@@ -241,108 +285,114 @@ async def test_imported_orders_are_not_counted(db: AsyncSession) -> None:
     assert await counted(db) == 2
 
 
-async def test_each_bureau_counts_only_its_own_orders(db: AsyncSession) -> None:
+async def test_each_account_counts_only_its_own_orders(db: AsyncSession) -> None:
     await make_order(db, ACME, when(2))
     await make_order(db, GLOBEX, when(3))
     await make_order(db, GLOBEX, when(4))
     assert (await counted(db, ACME), await counted(db, GLOBEX)) == (1, 2)
 
 
-async def test_only_a_bureau_is_counted_not_a_freelancer_a_personal_account_or_a_new_signup(
+async def test_a_bureau_a_freelancer_and_a_personal_workspace_each_have_their_audience(
     db: AsyncSession,
 ) -> None:
+    assert billing.audience_of(await tenant_of(db, ACME)) == "bureau"
+    assert billing.audience_of(await tenant_of(db, SOLO)) == "freelancer"
+    assert billing.audience_of(await tenant_of(db, PERSONAL)) == "freelancer"
+    # Not finished onboarding counts as a freelancer too, as for access.
+    unfinished = await tenant_of(db, ACME)
+    unfinished.plan = None
+    assert billing.audience_of(unfinished) == "freelancer"
+
+
+# ── The block ───────────────────────────────────────────────────────────────
+
+
+async def test_an_order_is_allowed_up_to_the_last_one_and_refused_after(db: AsyncSession) -> None:
+    await fill(db, ACME, 49)
+    tenant = await tenant_of(db, ACME)
     with bypass_tenant_scope():
-        by_id = {t.id: t for t in (await db.execute(select(Tenant))).scalars()}
-    assert billing.is_counted(by_id[ACME]) is True
-    assert billing.is_counted(by_id[SOLO]) is False
-    assert billing.is_counted(by_id[PERSONAL]) is False
-    by_id[ACME].plan = None
-    assert billing.is_counted(by_id[ACME]) is False
+        await billing.ensure_room_for_order(db, tenant)
+    await make_order(db, ACME, when(20, hour=3))
+    with bypass_tenant_scope(), pytest.raises(billing.PackageLimitError) as refused:
+        await billing.ensure_room_for_order(db, tenant)
+    assert refused.value.status_code == 402
+    assert refused.value.error_code == "package_limit_reached"
+    assert refused.value.extra["included"] == 50
 
 
-# ── The bureau's own view ───────────────────────────────────────────────────
+async def test_cancelling_an_order_makes_room_again(db: AsyncSession) -> None:
+    await fill(db, ACME, 49)
+    last = await make_order(db, ACME, when(20, hour=3), statuses=("new",))
+    tenant = await tenant_of(db, ACME)
+    with bypass_tenant_scope(), pytest.raises(billing.PackageLimitError):
+        await billing.ensure_room_for_order(db, tenant)
+    with bypass_tenant_scope():
+        db.add(
+            OrderStatusEvent(
+                tenant_id=ACME, order_id=last.id, status="cancelled", changed_at=when(21)
+            )
+        )
+        await db.flush()
+        await billing.ensure_room_for_order(db, tenant)
 
 
-def session_of(tenant_id: int, plan: TenantPlan = TenantPlan.BUREAU) -> AuthenticatedSession:
-    return AuthenticatedSession(
-        session_id=1,
-        user_id=1,
-        username="owner",
-        full_name="Owner",
-        email="o@x.test",
-        role=Role.OWNER,
-        tenant_id=tenant_id,
-        tenant_slug=f"t{tenant_id}",
-        tenant_name="Acme",
-        plan=plan,
-        onboarding_required=False,
-        must_change_password=False,
-        has_mfa=False,
-        permissions=permissions_for_role(Role.OWNER),
-        mfa_satisfied_at=None,
-        impersonated_by_user_id=None,
+async def test_a_freelancer_is_limited_by_the_freelancer_package(db: AsyncSession) -> None:
+    await platform_api.edit_package(
+        "freelancer",
+        1,
+        platform_api.PackageUpdate(orders_included=3, monthly_price=Decimal("0")),
+        db,
+        superuser(),
     )
+    await fill(db, SOLO, 3)
+    await fill(db, ACME, 3)
+    with bypass_tenant_scope():
+        with pytest.raises(billing.PackageLimitError):
+            await billing.ensure_room_for_order(db, await tenant_of(db, SOLO))
+        # A bureau with three orders is nowhere near its own 50.
+        await billing.ensure_room_for_order(db, await tenant_of(db, ACME))
 
 
-def superuser() -> AuthenticatedSession:
-    return session_of(ACME)
+async def test_the_block_stands_at_the_first_line_of_create_order(db: AsyncSession) -> None:
+    await fill(db, ACME, 50)
+    payload = orders_api.OrderCreate.model_construct(client_id=1, documents=[])
+    with tenant_scope(ACME), pytest.raises(billing.PackageLimitError):
+        await orders_api.create_order(payload, db, session_of(ACME))
 
 
-async def test_usage_says_how_far_into_the_package_the_bureau_is(db: AsyncSession) -> None:
-    for day in range(1, 42):
-        await make_order(db, ACME, when(1 + day % 28, hour=day % 24))
-    # The orders above are in October 2026; ask for that month explicitly.
+# ── The account's own view and the move up ──────────────────────────────────
+
+
+async def test_usage_says_how_far_into_the_package_the_account_is(db: AsyncSession) -> None:
+    await fill(db, ACME, 41)
     with tenant_scope(ACME):
-        tenant = await db.get(Tenant, ACME)
-        usage = await tenant_api.tenant_usage(
-            db, tenant, await billing.load_packages(db), "2026-10"
-        )  # type: ignore[arg-type]
-    assert (usage.counted, usage.orders, usage.included, usage.level) == (True, 41, 50, "near")
-    assert (usage.extra_orders, usage.extra_fee, usage.total) == (
-        0,
-        Decimal("0.00"),
-        Decimal("50.00"),
-    )
-    assert usage.plan_fee == Decimal("50.00")
+        usage = await tenant_api.tenant_usage(db, await tenant_of(db, ACME), "2026-10")
+    assert (usage.orders, usage.included, usage.remaining) == (41, 50, 9)
+    assert (usage.level, usage.blocked, usage.tier) == ("near", False, 1)
+    assert usage.monthly_price == Decimal("50.00")
 
 
-async def test_past_the_package_each_extra_order_adds_a_lari(db: AsyncSession) -> None:
-    for number in range(53):
-        await make_order(db, ACME, when(1 + number % 28, hour=number % 24))
-    with tenant_scope(ACME):
-        tenant = await db.get(Tenant, ACME)
-        usage = await tenant_api.tenant_usage(
-            db, tenant, await billing.load_packages(db), "2026-10"
-        )  # type: ignore[arg-type]
-    assert (usage.level, usage.extra_orders, usage.extra_fee) == ("limit", 3, Decimal("3.00"))
-    assert usage.total == Decimal("53.00")
-
-
-async def test_a_freelancer_is_not_counted_or_limited(db: AsyncSession) -> None:
-    for number in range(60):
-        await make_order(db, SOLO, when(1 + number % 28, hour=number % 24))
+async def test_a_freelancer_is_counted_against_its_own_package_too(db: AsyncSession) -> None:
+    await fill(db, SOLO, 60)
     with tenant_scope(SOLO):
-        tenant = await db.get(Tenant, SOLO)
-        usage = await tenant_api.tenant_usage(
-            db, tenant, await billing.load_packages(db), "2026-10"
-        )  # type: ignore[arg-type]
-    assert (usage.counted, usage.orders, usage.level, usage.extra_fee) == (
-        False,
-        0,
-        "ok",
-        Decimal("0.00"),
-    )
+        usage = await tenant_api.tenant_usage(db, await tenant_of(db, SOLO), "2026-10")
+    assert (usage.orders, usage.included, usage.blocked) == (60, 50, True)
+    assert usage.monthly_price == Decimal("0.00")
 
 
 async def test_the_packages_fall_back_to_the_defaults_when_none_are_stored(
     db: AsyncSession,
 ) -> None:
-    packages = await billing.load_packages(db)
-    assert {tier: p.orders_included for tier, p in packages.items()} == {1: 50, 2: 150, 3: 500}
-    assert packages[3].monthly_price_cents is None
+    for audience, expected in (
+        ("bureau", {1: 50, 2: 150, 3: 500}),
+        ("freelancer", {1: 50, 2: 150, 3: 500}),
+    ):
+        packages = await billing.load_packages(db, audience)
+        assert {tier: p.orders_included for tier, p in packages.items()} == expected
+    assert (await billing.load_packages(db, "bureau"))[3].monthly_price_cents is None
 
 
-async def test_the_overview_lists_packages_and_only_invoices_already_asked_for(
+async def test_the_overview_lists_the_accounts_own_packages_the_way_up_and_asked_invoices(
     db: AsyncSession,
 ) -> None:
     with bypass_tenant_scope():
@@ -358,27 +408,11 @@ async def test_the_overview_lists_packages_and_only_invoices_already_asked_for(
                     package_tier=1,
                     orders_included=50,
                     orders_counted=52,
-                    extra_orders=2,
                     plan_fee_cents=5000,
-                    extra_fee_cents=200,
-                    total_cents=5200,
+                    total_cents=5000,
                     status=status,
                 )
             )
-        db.add(
-            BillingInvoice(
-                tenant_id=GLOBEX,
-                period="2026-09",
-                package_tier=2,
-                orders_included=150,
-                orders_counted=10,
-                extra_orders=0,
-                plan_fee_cents=10000,
-                extra_fee_cents=0,
-                total_cents=10000,
-                status=BillingInvoiceStatus.SENT,
-            )
-        )
         await db.flush()
     with tenant_scope(ACME):
         overview = await tenant_api.get_overview(db, session_of(ACME))
@@ -386,86 +420,139 @@ async def test_the_overview_lists_packages_and_only_invoices_already_asked_for(
         ("2026-09", "paid"),
         ("2026-08", "sent"),
     ]
-    assert overview.invoices[0].total == Decimal("52.00")
     assert [p.tier for p in overview.packages] == [1, 2, 3]
-    assert overview.packages[0].monthly_price == Decimal("50.00")
-    assert overview.packages[2].monthly_price is None
+    assert {p.audience for p in overview.packages} == {"bureau"}
+    # Tier 3 has no price, so it is not one an account can take by itself.
+    assert overview.upgrade_to == [2]
+    assert overview.terms_version == billing.TERMS_VERSION
+
+
+async def test_a_freelancer_sees_the_freelancer_packages(db: AsyncSession) -> None:
+    with tenant_scope(SOLO):
+        overview = await tenant_api.get_overview(db, session_of(SOLO, TenantPlan.FREELANCER))
+    assert {p.audience for p in overview.packages} == {"freelancer"}
+    assert overview.packages[1].monthly_price == Decimal("20.00")
+
+
+def upgrade_request(tier: int = 2, **changes: Any) -> tenant_api.UpgradeRequest:
+    fields: dict[str, Any] = {
+        "tier": tier,
+        "accepted_terms": True,
+        "terms_version": billing.TERMS_VERSION,
+    }
+    fields.update(changes)
+    return tenant_api.UpgradeRequest(**fields)
+
+
+async def test_one_click_moves_the_account_up_at_once_and_makes_room(
+    db: AsyncSession, audit: list[dict[str, Any]]
+) -> None:
+    await fill(db, ACME, 50)
+    tenant = await tenant_of(db, ACME)
+    with bypass_tenant_scope(), pytest.raises(billing.PackageLimitError):
+        await billing.ensure_room_for_order(db, tenant)
+    with tenant_scope(ACME):
+        usage = await tenant_api.upgrade(upgrade_request(), db, session_of(ACME))
+    assert (usage.tier, usage.included, usage.blocked, usage.remaining) == (2, 150, False, 100)
+    assert audit[-1]["action"] == "billing.package_upgraded"
+    assert audit[-1]["after"]["terms_version"] == billing.TERMS_VERSION
+    assert (audit[-1]["before"], audit[-1]["after"]["package_tier"]) == ({"package_tier": 1}, 2)
+    with bypass_tenant_scope():
+        await billing.ensure_room_for_order(db, await tenant_of(db, ACME))
+
+
+@pytest.mark.parametrize(
+    ("changes", "error"),
+    [
+        ({"accepted_terms": False}, ValidationError),
+        ({"terms_version": "1999-01-01"}, ConflictError),
+        ({"tier": 1}, ConflictError),
+        ({"tier": 3}, ConflictError),
+        ({"tier": 9}, NotFoundError),
+    ],
+)
+async def test_the_move_up_is_refused_without_the_terms_or_to_a_package_it_cannot_take(
+    db: AsyncSession, changes: dict[str, Any], error: type[Exception]
+) -> None:
+    with tenant_scope(ACME), pytest.raises(error):
+        await tenant_api.upgrade(upgrade_request(**changes), db, session_of(ACME))
+    assert (await tenant_of(db, ACME)).package_tier == 1
+
+
+async def test_nobody_goes_down_by_clicking(db: AsyncSession) -> None:
+    with tenant_scope(GLOBEX), pytest.raises(ConflictError, match="bigger"):
+        await tenant_api.upgrade(upgrade_request(tier=1), db, session_of(GLOBEX))
 
 
 # ── The superuser ───────────────────────────────────────────────────────────
 
 
-async def test_a_superuser_edits_a_package_and_the_change_is_audited(
+async def test_a_superuser_edits_one_audiences_package_and_the_change_is_audited(
     db: AsyncSession, audit: list[dict[str, Any]]
 ) -> None:
     out = await platform_api.edit_package(
+        "freelancer",
         2,
-        platform_api.PackageUpdate(
-            orders_included=200, monthly_price=Decimal("120.50"), extra_order_price=Decimal("1.50")
-        ),
+        platform_api.PackageUpdate(orders_included=200, monthly_price=Decimal("25.50")),
         db,
         superuser(),
     )
-    assert (out.tier, out.orders_included, out.monthly_price, out.extra_order_price) == (
+    assert (out.audience, out.tier, out.orders_included, out.monthly_price) == (
+        "freelancer",
         2,
         200,
-        Decimal("120.50"),
-        Decimal("1.50"),
+        Decimal("25.50"),
     )
-    stored = await db.get(BillingPackage, 2)
+    stored = await db.get(BillingPackage, ("freelancer", 2))
     assert stored is not None
-    assert (stored.orders_included, stored.monthly_price_cents, stored.extra_order_cents) == (
-        200,
-        12050,
-        150,
-    )
+    assert (stored.orders_included, stored.monthly_price_cents) == (200, 2550)
     (entry,) = audit
     assert entry["action"] == "platform.billing_package_edited"
     assert entry["before"]["orders_included"] == 150
-    assert entry["after"]["orders_included"] == 200
-    # And it is what the bureaus see, and what the next month is billed by.
-    packages = await billing.load_packages(db)
-    assert billing.quote(packages[2], 203).extra_fee_cents == 450
+    assert entry["after"]["audience"] == "freelancer"
+    # The bureau set is untouched.
+    assert (await billing.load_packages(db, "bureau"))[2].orders_included == 150
 
 
-async def test_the_packages_can_be_listed_without_counting_anyone(db: AsyncSession) -> None:
-    packages = await platform_api.list_packages(db, superuser())
-    assert [(p.tier, p.orders_included) for p in packages] == [(1, 50), (2, 150), (3, 500)]
-
-
-async def test_a_package_can_have_no_price_and_a_package_that_does_not_exist_is_refused(
+async def test_a_package_can_be_given_no_price_and_a_missing_one_is_refused(
     db: AsyncSession,
 ) -> None:
     out = await platform_api.edit_package(
+        "bureau",
         1,
-        platform_api.PackageUpdate(
-            orders_included=50, monthly_price=None, extra_order_price=Decimal("1")
-        ),
+        platform_api.PackageUpdate(orders_included=50, monthly_price=None),
         db,
         superuser(),
     )
     assert out.monthly_price is None
-    with pytest.raises(NotFoundError):
-        await platform_api.edit_package(
-            4,
-            platform_api.PackageUpdate(orders_included=1, extra_order_price=Decimal("1")),
-            db,
-            superuser(),
-        )
+    for audience, tier in (("bureau", 4), ("tourist", 1)):
+        with pytest.raises(NotFoundError):
+            await platform_api.edit_package(
+                audience, tier, platform_api.PackageUpdate(orders_included=1), db, superuser()
+            )
 
 
-async def test_a_superuser_moves_a_bureau_to_another_package(
+async def test_all_six_packages_can_be_listed_without_counting_anyone(db: AsyncSession) -> None:
+    packages = await platform_api.list_packages(db, superuser())
+    assert [(p.audience, p.tier, p.orders_included) for p in packages] == [
+        ("bureau", 1, 50),
+        ("bureau", 2, 150),
+        ("bureau", 3, 500),
+        ("freelancer", 1, 50),
+        ("freelancer", 2, 150),
+        ("freelancer", 3, 500),
+    ]
+
+
+async def test_a_superuser_moves_an_account_to_any_package(
     db: AsyncSession, audit: list[dict[str, Any]]
 ) -> None:
     out = await platform_api.set_tenant_package(
         ACME, platform_api.TenantPackageChange(tier=3), db, superuser()
     )
     assert (out.tier, out.previous) == (3, 1)
-    with bypass_tenant_scope():
-        assert (await db.get(Tenant, ACME)).package_tier == 3  # type: ignore[union-attr]
+    assert (await tenant_of(db, ACME)).package_tier == 3
     assert audit[-1]["action"] == "platform.tenant_package_changed"
-    assert audit[-1]["before"] == {"package_tier": 1}
-    # Choosing the package it is already on writes nothing.
     audit.clear()
     await platform_api.set_tenant_package(
         ACME, platform_api.TenantPackageChange(tier=3), db, superuser()
@@ -477,27 +564,50 @@ async def test_a_superuser_moves_a_bureau_to_another_package(
         )
 
 
-def test_no_package_can_be_chosen_anywhere_but_the_platform_area() -> None:
-    """The bureau's own routes never take a package: only a superuser changes one."""
-    offenders = []
-    for route in api_router.routes:
-        body = getattr(route, "body_field", None)
-        model = getattr(getattr(body, "type_", None), "model_fields", None)
-        if model and {"tier", "package_tier"} & set(model) and "/platform/" not in route.path:  # type: ignore[attr-defined]
-            offenders.append(route.path)  # type: ignore[attr-defined]
-    assert offenders == []
+def test_the_only_ways_to_change_a_package_are_the_platform_area_and_the_owners_upgrade() -> None:
+    """No other route takes a package: the owner's one is the upgrade, and it only goes up.
+
+    Read from the OpenAPI schema of a real app: the router's own route list holds
+    included routers, not routes, and would show nothing.
+    """
+    app = FastAPI()
+    app.include_router(api_router, prefix="/api/v1")
+    spec = app.openapi()
+    found = []
+    for path, operations in spec["paths"].items():
+        for method, operation in operations.items():
+            ref = (
+                operation.get("requestBody", {})
+                .get("content", {})
+                .get("application/json", {})
+                .get("schema", {})
+                .get("$ref")
+            )
+            properties = (
+                spec["components"]["schemas"][ref.split("/")[-1]]["properties"] if ref else {}
+            )
+            if {"tier", "package_tier"} & set(properties):
+                found.append((method, path))
+    assert sorted(found) == [
+        ("post", "/api/v1/billing/upgrade"),
+        ("put", "/api/v1/platform/tenants/{tenant_id}/package"),
+    ]
 
 
-async def test_the_billing_view_lists_every_bureau_and_leaves_out_freelancers(
-    db: AsyncSession,
-) -> None:
-    for number in range(12):
-        await make_order(db, GLOBEX, when(1 + number, hour=number))
+async def test_the_billing_view_lists_every_account_with_its_audience(db: AsyncSession) -> None:
+    await fill(db, GLOBEX, 12)
+    await fill(db, SOLO, 4)
     out = await platform_api.get_billing(db, superuser(), "2026-10")
-    assert [b.tenant_id for b in out.bureaus] == [ACME, GLOBEX]
-    globex = out.bureaus[1]
+    assert [(a.tenant_id, a.audience) for a in out.accounts] == [
+        (ACME, "bureau"),
+        (GLOBEX, "bureau"),
+        (SOLO, "freelancer"),
+        (PERSONAL, "freelancer"),
+    ]
+    globex = out.accounts[1]
     assert (globex.usage.tier, globex.usage.orders, globex.usage.included) == (2, 12, 150)
-    assert globex.invoice is None
+    assert out.accounts[2].usage.orders == 4
+    assert out.accounts[3].usage.orders == 0
     with pytest.raises(ValidationError):
         await platform_api.get_billing(db, superuser(), "10/2026")
 
@@ -505,25 +615,20 @@ async def test_the_billing_view_lists_every_bureau_and_leaves_out_freelancers(
 async def test_invoices_are_prepared_once_for_a_month_that_has_ended(
     db: AsyncSession, audit: list[dict[str, Any]]
 ) -> None:
-    for number in range(53):
-        await make_order(db, ACME, when(1 + number % 28, hour=number % 24, month=7))
+    await fill(db, ACME, 53, month=7)
     await make_order(db, GLOBEX, when(5, month=7))
+    await make_order(db, SOLO, when(5, month=7))
     request = platform_api.PrepareRequest(period="2026-07")
     out = await platform_api.prepare_invoices(request, db, superuser())
-    assert (out.created, out.existing, out.not_ended, out.nothing_due) == (2, 0, 0, 0)
+    # The freelancer and the personal workspace are on a free package: nothing to invoice.
+    assert (out.created, out.existing, out.not_ended, out.nothing_due) == (2, 0, 0, 2)
     with bypass_tenant_scope():
         rows = {r.tenant_id: r for r in (await db.execute(select(BillingInvoice))).scalars().all()}
     acme = rows[ACME]
-    assert (acme.orders_counted, acme.extra_orders, acme.extra_fee_cents) == (53, 3, 300)
-    assert (acme.plan_fee_cents, acme.total_cents, acme.status) == (
-        5000,
-        5300,
-        BillingInvoiceStatus.OPEN,
-    )
-    # A bureau with one order still owes its monthly fee.
+    assert (acme.orders_counted, acme.plan_fee_cents, acme.total_cents) == (53, 5000, 5000)
+    assert acme.status is BillingInvoiceStatus.OPEN
     assert rows[GLOBEX].total_cents == 10000
     assert audit[-1]["action"] == "platform.billing_invoices_prepared"
-
     again = await platform_api.prepare_invoices(request, db, superuser())
     assert (again.created, again.existing) == (0, 2)
 
@@ -533,7 +638,7 @@ async def test_a_month_that_has_not_ended_is_not_invoiced(db: AsyncSession) -> N
     out = await platform_api.prepare_invoices(
         platform_api.PrepareRequest(period=current), db, superuser()
     )
-    assert (out.created, out.not_ended) == (0, 2)
+    assert (out.created, out.not_ended) == (0, 4)
 
 
 async def test_an_invoice_is_frozen_when_prepared_and_a_later_package_edit_leaves_it(
@@ -544,10 +649,9 @@ async def test_an_invoice_is_frozen_when_prepared_and_a_later_package_edit_leave
         platform_api.PrepareRequest(period="2026-07"), db, superuser()
     )
     await platform_api.edit_package(
+        "bureau",
         1,
-        platform_api.PackageUpdate(
-            orders_included=10, monthly_price=Decimal("999"), extra_order_price=Decimal("9")
-        ),
+        platform_api.PackageUpdate(orders_included=10, monthly_price=Decimal("999")),
         db,
         superuser(),
     )
@@ -558,12 +662,11 @@ async def test_an_invoice_is_frozen_when_prepared_and_a_later_package_edit_leave
     assert (invoice.plan_fee_cents, invoice.total_cents) == (5000, 5000)
 
 
-async def test_a_bureau_with_nothing_to_pay_gets_no_invoice(db: AsyncSession) -> None:
+async def test_an_account_with_nothing_to_pay_gets_no_invoice(db: AsyncSession) -> None:
     await platform_api.edit_package(
+        "bureau",
         1,
-        platform_api.PackageUpdate(
-            orders_included=50, monthly_price=None, extra_order_price=Decimal("1")
-        ),
+        platform_api.PackageUpdate(orders_included=50, monthly_price=None),
         db,
         superuser(),
     )
@@ -571,8 +674,8 @@ async def test_a_bureau_with_nothing_to_pay_gets_no_invoice(db: AsyncSession) ->
     out = await platform_api.prepare_invoices(
         platform_api.PrepareRequest(period="2026-07"), db, superuser()
     )
-    # ACME has no price and no extras; GLOBEX (package 2) still owes its fee.
-    assert (out.created, out.nothing_due) == (1, 1)
+    # ACME has no price; GLOBEX (package 2) still owes its fee; the two freelancers are free.
+    assert (out.created, out.nothing_due) == (1, 3)
 
 
 async def test_an_invoice_is_followed_by_hand_open_sent_paid_or_waived(
@@ -601,7 +704,6 @@ async def test_an_invoice_is_followed_by_hand_open_sent_paid_or_waived(
     # SQLite hands a time back without its zone; the moment is the same.
     assert paid.sent_at.replace(tzinfo=None) == sent.sent_at.replace(tzinfo=None)
     assert paid.note == "Emailed 3 Aug"
-    # Moving a paid invoice back takes the paid time away.
     back = await change(BillingInvoiceStatus.SENT)
     assert back.paid_at is None
     waived = await change(BillingInvoiceStatus.WAIVED, "")
@@ -611,3 +713,11 @@ async def test_an_invoice_is_followed_by_hand_open_sent_paid_or_waived(
         await platform_api.set_invoice_status(
             9999, platform_api.InvoiceChange(status=BillingInvoiceStatus.PAID), db, superuser()
         )
+
+
+@pytest.mark.parametrize(
+    ("claimed", "stored"),
+    [(None, "office"), ("", "office"), ("website", "website"), ("import", "office")],
+)
+def test_a_new_order_cannot_claim_to_be_an_import(claimed: str | None, stored: str) -> None:
+    assert orders_api.order_source(claimed) == stored

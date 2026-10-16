@@ -29,8 +29,16 @@ def test_columns_match_the_model(revision: tuple[Any, RecordedOps], table: str) 
     _, ops = revision
     migrated = ops.tables[table]
     declared = Base.metadata.tables[table]
-    assert set(migrated.columns.keys()) == set(declared.columns.keys())
+    # What 0033 changed afterwards: an audience on the packages, and no per-order fee.
+    later = {"billing_packages": {"audience"}, "billing_invoices": set()}[table]
+    gone = {
+        "billing_packages": {"extra_order_cents"},
+        "billing_invoices": {"extra_orders", "extra_fee_cents"},
+    }[table]
+    assert set(migrated.columns.keys()) == (set(declared.columns.keys()) - later) | gone
     for name, column in declared.columns.items():
+        if name in later:
+            continue
         other = migrated.columns[name]
         assert other.nullable == column.nullable, f"{table}.{name}: nullability differs"
         assert str(other.type) == str(column.type), f"{table}.{name}: type differs"
@@ -63,15 +71,15 @@ def test_a_bureau_has_one_invoice_a_month(revision: tuple[Any, RecordedOps]) -> 
     assert ("tenant_id", "period") in unique
 
 
-def test_the_packages_start_with_the_numbers_the_code_falls_back_to(
+def test_the_bureau_packages_start_with_the_numbers_the_code_falls_back_to(
     revision: tuple[Any, RecordedOps],
 ) -> None:
     """Placeholder numbers a superuser changes in the admin console."""
     _, ops = revision
     seeded = [s for s in ops.statements if s.startswith("INSERT INTO billing_packages")]
-    assert len(seeded) == len(DEFAULT_PACKAGES) == 3
-    for tier, (included, price, extra) in DEFAULT_PACKAGES.items():
-        values = f"VALUES ({tier}, {included}, {'NULL' if price is None else price}, {extra})"
+    assert len(seeded) == len(DEFAULT_PACKAGES["bureau"]) == 3
+    for tier, (included, price) in DEFAULT_PACKAGES["bureau"].items():
+        values = f"VALUES ({tier}, {included}, {'NULL' if price is None else price}, 100)"
         assert any(values in statement for statement in seeded), values
 
 

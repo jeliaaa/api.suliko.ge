@@ -34,6 +34,8 @@ class RecordedOps:
     #: (name, table, columns) for each unique constraint created on an existing table.
     unique_constraints: list[tuple[str, str, list[str]]] = field(default_factory=list)
     dropped_constraints: list[tuple[str, str]] = field(default_factory=list)
+    #: (name, table, columns) for each primary key created on an existing table.
+    primary_keys: list[tuple[str, str, list[str]]] = field(default_factory=list)
 
     def get_bind(self) -> None:
         """There is no database.
@@ -62,6 +64,9 @@ class RecordedOps:
 
     def drop_constraint(self, name: str, table: str, **_kwargs: Any) -> None:
         self.dropped_constraints.append((name, table))
+
+    def create_primary_key(self, name: str, table: str, columns: list[str]) -> None:
+        self.primary_keys.append((name, table, list(columns)))
 
     def create_table(self, name: str, *columns: Any, **kwargs: Any) -> sa.Table:
         # A private MetaData: the real one already holds these tables, and
