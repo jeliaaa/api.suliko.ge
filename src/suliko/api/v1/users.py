@@ -670,7 +670,7 @@ def _invite_email(
         # would be a different person to this invitation, so the email says so
         # rather than asking for something the page cannot do.
         blocks += [
-            p("შესაერთებლად ორი ნაბიჯია, ამ თანმიმდევრობით."),
+            p("ორგანიზაციაში გასაწევრიანებლად ორი ნაბიჯია, ამ თანმიმდევრობით."),
             Steps(
                 [
                     Step(
@@ -704,11 +704,11 @@ def _invite_email(
             blocks += [
                 p(f"დაადასტურეთ მოწვევა: {tenant_name}."),
                 Button("მოწვევის დადასტურება", invite_link),
-                p(f"შემდეგ ჩვეულებრივ შედით Suliko Office-ში და აირჩიეთ {tenant_name}."),
+                p(f"შემდეგ ჩვეულებრივად შედით Suliko Office-ში და აირჩიეთ {tenant_name}."),
             ]
         else:
             blocks += [
-                p("შესაერთებლად აირჩიეთ პაროლი."),
+                p("გასაწევრიანებლად აირჩიეთ პაროლი."),
                 Button("პაროლის არჩევა", invite_link),
                 p(
                     f"ამის შემდეგ შედით ამ მისამართით ({address}) და ახალი პაროლით, "

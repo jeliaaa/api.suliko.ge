@@ -795,7 +795,7 @@ def rejected_email(account: Account) -> Email:
     return compose(
         subject="თქვენი Suliko ანგარიში ისევ ღიაა",
         heading="ანგარიში ისევ ღიაა",
-        preheader="არაფერი წაშლილა. შეგიძლიათ ჩვეულებრივ შეხვიდეთ.",
+        preheader="არაფერი წაშლილა. შეგიძლიათ ჩვეულებრივად შეხვიდეთ.",
         blocks=[
             p(f"გამარჯობა, {name}!"),
             p(

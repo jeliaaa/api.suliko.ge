@@ -89,7 +89,7 @@ _COPY_NAMES: dict[tuple[str, Language], str] = {
     ("plain", "en"): "Plain copy",
     ("plain", "ka"): "უბრალო ასლი",
     ("notary_original", "en"): "Notary on original",
-    ("notary_original", "ka"): "ნოტარიული ორიგინალზე",
+    ("notary_original", "ka"): "ნოტარიული დამოწმება ორიგინალზე",
     ("notary_copy", "en"): "Plain copy",
     ("notary_copy", "ka"): "უბრალო ასლი",
     ("notary_certified", "en"): "Certified copy",
