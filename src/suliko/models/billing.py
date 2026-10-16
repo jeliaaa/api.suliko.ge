@@ -23,20 +23,24 @@ from suliko.db.base import Base, IdMixin, TenantScoped, TimestampMixin, enum_val
 class BillingPackage(Base, TimestampMixin):
     """One of the packages a bureau can be on, the same for every bureau.
 
-    A platform table with three rows (``tier`` 1, 2, 3), edited by a superuser:
-    how many orders a month the fee covers, the fee, and what each order beyond
-    that costs. Nothing here is per bureau.
+    A platform table with three rows for bureaus and three for freelancers
+    (``audience``), edited by a superuser: how many orders a month the fee covers
+    and the fee. When the month's orders reach the package, new orders are refused
+    until the account moves up one; nothing is charged per order. Nothing here is
+    per account.
     """
 
     __tablename__ = "billing_packages"
 
+    #: "bureau" or "freelancer" (which also covers a person's own workspace).
+    audience: Mapped[str] = mapped_column(
+        String(10), primary_key=True, default="bureau", server_default="bureau"
+    )
     tier: Mapped[int] = mapped_column(SmallInteger, primary_key=True, autoincrement=False)
     orders_included: Mapped[int] = mapped_column(Integer, nullable=False)
-    #: Null: the fee is agreed with each bureau, so there is no price to print.
+    #: 0 is free. Null: agreed with each account, so there is no price to print and
+    #: the account cannot move to it by itself.
     monthly_price_cents: Mapped[int | None] = mapped_column(Integer, default=None)
-    extra_order_cents: Mapped[int] = mapped_column(
-        Integer, default=100, server_default="100", nullable=False
-    )
 
 
 class BillingInvoiceStatus(enum.StrEnum):
@@ -64,10 +68,8 @@ class BillingInvoice(Base, IdMixin, TenantScoped, TimestampMixin):
     package_tier: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     orders_included: Mapped[int] = mapped_column(Integer, nullable=False)
     orders_counted: Mapped[int] = mapped_column(Integer, nullable=False)
-    extra_orders: Mapped[int] = mapped_column(Integer, nullable=False)
-    #: Null: the package has no price (agreed separately), so only extras are here.
+    #: Null: the package has no price (agreed separately).
     plan_fee_cents: Mapped[int | None] = mapped_column(Integer, default=None)
-    extra_fee_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     total_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[BillingInvoiceStatus] = mapped_column(
         Enum(

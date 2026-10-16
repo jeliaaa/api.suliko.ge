@@ -46,6 +46,7 @@ from suliko.api.v1._shared import (
     phone_digits,
 )
 from suliko.core.errors import ConflictError, NotFoundError, ValidationError
+from suliko.domain.billing import ensure_room_for_order
 from suliko.domain.clock import add_days, today_in
 from suliko.domain.notifications import notify, notify_everyone
 from suliko.domain.orders import base_order_query
@@ -78,6 +79,7 @@ from suliko.models.order import (
     Urgency,
 )
 from suliko.models.reference import CustomOption, OptionList
+from suliko.models.tenant import Tenant
 from suliko.models.user import User
 from suliko.security.permissions import Permission
 from suliko.security.sessions import AuthenticatedSession
@@ -843,8 +845,21 @@ async def _document_row(
     )
 
 
+def order_source(claimed: str | None) -> str:
+    """How an order arrived. "import" is what the spreadsheet import writes and what the
+    month's count leaves out, so a caller cannot claim it to stay under its package."""
+    return claimed if claimed and claimed != "import" else "office"
+
+
 @router.post("", response_model=OrderDetail, status_code=http_status.HTTP_201_CREATED)
 async def create_order(payload: OrderCreate, db: Db, session: OrdersWriter) -> OrderDetail:
+    # The package: once the month's orders have reached it, a new one is refused until
+    # the account moves up (`POST /billing/upgrade`). Checked before anything else so
+    # a refusal costs nothing and leaves nothing behind.
+    tenant = await db.get(Tenant, session.tenant_id)
+    if tenant is not None:
+        await ensure_room_for_order(db, tenant)
+
     client = await db.get(Client, payload.client_id)
     if client is None:
         raise ValidationError("That client does not exist.")
@@ -879,7 +894,7 @@ async def create_order(payload: OrderCreate, db: Db, session: OrdersWriter) -> O
             if payload.handover_method is HandoverMethod.DELIVERY
             else Decimal("0")
         ),
-        source=payload.source or "office",
+        source=order_source(payload.source),
         notes=payload.notes,
         created_by_user_id=session.user_id,
     )

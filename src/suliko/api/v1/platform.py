@@ -98,6 +98,7 @@ from suliko.domain.accounts import (
     upsert_from_suliko,
     username_for_account,
 )
+from suliko.domain.billing import audience_of
 from suliko.domain.plans import TenantPlan, effective_plan
 from suliko.domain.portal import checked_login
 from suliko.integrations.suliko_backend import SulikoBackend, get_suliko_backend
@@ -142,6 +143,8 @@ class TenantSummary(BaseModel):
     onboarding_required: bool
     #: Which order package the bureau's fee is: 1, 2 or 3 (`models.billing`).
     package_tier: int
+    #: Which set of packages it is on: "bureau" or "freelancer".
+    package_audience: str
     locale: str
     users: int
     active_users: int
@@ -317,6 +320,7 @@ def _summary(tenant: Tenant, *, users: int, active_users: int, orders: int) -> T
         plan=effective_plan(tenant.plan),
         onboarding_required=parse(tenant.plan) is None,
         package_tier=tenant.package_tier,
+        package_audience=audience_of(tenant),
         locale=tenant.locale,
         users=users,
         active_users=active_users,

@@ -80,6 +80,8 @@ LATER_REVISIONS = (
     "0031_order_packages.py",
     # invoice_templates, a bureau's own invoice file — see test_migration_0032.py.
     "0032_invoice_templates.py",
+    # Packages per audience and no per-order fee — see test_migration_0033.py.
+    "0033_package_audiences.py",
 )
 
 

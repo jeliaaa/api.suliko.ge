@@ -1,13 +1,13 @@
-"""A bureau's order package, this month's usage, and what it has been asked to pay.
+"""An account's order package, this month's usage, and the one-click move up.
 
-Read-only for the bureau. Which package a bureau is on, what each package covers
-and costs, and the invoices are all set by a superuser (`platform_billing.py`);
-the owner sees them here, on the Billing page, with the figure and the warning
-the rest of the app shows.
+Every account is on one of three packages, the same for everyone of its kind
+(bureaus have their own set, freelancers theirs; both are set by a superuser in
+`platform_billing.py`). When the month's orders reach the package, new orders are
+refused until the account moves up. The owner does that here: pick a bigger
+package, read a short summary of the terms, confirm, and the package changes at
+once. Moving DOWN, or onto a package that has no listed price, is done by Suliko.
 
-Nothing in this module, and nothing anywhere, stops an order being made: past the
-included orders the bureau is told and each extra one is added to the month's
-fee (`domain/billing.py`).
+Nothing is charged per order. The month's invoice is the package's monthly fee.
 """
 
 from __future__ import annotations
@@ -21,16 +21,15 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from suliko.api.deps import Db, require
-from suliko.core.errors import NotFoundError
+from suliko.core.errors import ConflictError, NotFoundError, ValidationError
 from suliko.domain.billing import (
+    TERMS_VERSION,
     Package,
     Quote,
-    count_orders,
-    current_period,
+    audience_of,
     from_cents,
-    is_counted,
     load_packages,
-    quote,
+    month_of,
 )
 from suliko.models.billing import BillingInvoice, BillingInvoiceStatus
 from suliko.models.tenant import Tenant
@@ -49,32 +48,27 @@ INVOICES_SHOWN = 24
 
 
 class PackageOut(BaseModel):
+    audience: str
     tier: int
     orders_included: int
-    #: Null: agreed with each bureau, so there is no price to print.
+    #: 0 is free. Null: agreed with Suliko, so there is no price to print.
     monthly_price: Decimal | None
-    #: What each order beyond the included ones costs.
-    extra_order_price: Decimal
 
 
 class UsageOut(BaseModel):
-    """One calendar month of one bureau, against its package."""
+    """One calendar month of one account, against its package."""
 
-    #: False for a freelancer or a personal account: nothing is counted or limited.
-    counted: bool
-    #: "2026-10", the bureau's own calendar month.
+    #: "2026-10", the account's own calendar month.
     period: str
     tier: int
     orders: int
     included: int
-    extra_orders: int
-    #: "ok", "near" (80 percent of the included orders used) or "limit" (all of them).
+    remaining: int
+    #: "ok", "near" (80 percent of the included orders used) or "limit" (all of them:
+    #: new orders are refused until the account moves up a package).
     level: str
-    plan_fee: Decimal | None
-    extra_order_price: Decimal
-    extra_fee: Decimal
-    #: The fee (when it has a price) plus the extras.
-    total: Decimal
+    blocked: bool
+    monthly_price: Decimal | None
 
 
 class InvoiceOut(BaseModel):
@@ -84,9 +78,7 @@ class InvoiceOut(BaseModel):
     status: str
     orders_included: int
     orders_counted: int
-    extra_orders: int
-    plan_fee: Decimal | None
-    extra_fee: Decimal
+    monthly_price: Decimal | None
     total: Decimal
     sent_at: datetime | None
     paid_at: datetime | None
@@ -96,7 +88,19 @@ class InvoiceOut(BaseModel):
 class BillingOverview(BaseModel):
     usage: UsageOut
     packages: list[PackageOut]
+    #: The tiers this account can move to by itself: bigger, and with a price.
+    upgrade_to: list[int]
+    #: The version of the terms the confirmation is made against; send it back.
+    terms_version: str
     invoices: list[InvoiceOut]
+
+
+class UpgradeRequest(BaseModel):
+    tier: int
+    #: The person ticked the box under the terms summary.
+    accepted_terms: bool
+    #: The version of the terms the screen showed.
+    terms_version: str
 
 
 # ── Builders, shared with the platform area ─────────────────────────────────
@@ -104,28 +108,27 @@ class BillingOverview(BaseModel):
 
 def package_out(package: Package) -> PackageOut:
     return PackageOut(
+        audience=package.audience,
         tier=package.tier,
         orders_included=package.orders_included,
         monthly_price=None
         if package.monthly_price_cents is None
         else from_cents(package.monthly_price_cents),
-        extra_order_price=from_cents(package.extra_order_cents),
     )
 
 
-def usage_out(*, counted: bool, period: str, package: Package, figures: Quote) -> UsageOut:
+def usage_out(*, period: str, package: Package, figures: Quote) -> UsageOut:
     return UsageOut(
-        counted=counted,
         period=period,
         tier=package.tier,
         orders=figures.orders,
         included=figures.included,
-        extra_orders=figures.extra_orders,
+        remaining=figures.remaining,
         level=figures.level.value,
-        plan_fee=None if figures.plan_fee_cents is None else from_cents(figures.plan_fee_cents),
-        extra_order_price=from_cents(package.extra_order_cents),
-        extra_fee=from_cents(figures.extra_fee_cents),
-        total=from_cents(figures.total_cents),
+        blocked=figures.blocked,
+        monthly_price=None
+        if figures.plan_fee_cents is None
+        else from_cents(figures.plan_fee_cents),
     )
 
 
@@ -137,9 +140,7 @@ def invoice_out(row: BillingInvoice) -> InvoiceOut:
         status=row.status.value,
         orders_included=row.orders_included,
         orders_counted=row.orders_counted,
-        extra_orders=row.extra_orders,
-        plan_fee=None if row.plan_fee_cents is None else from_cents(row.plan_fee_cents),
-        extra_fee=from_cents(row.extra_fee_cents),
+        monthly_price=None if row.plan_fee_cents is None else from_cents(row.plan_fee_cents),
         total=from_cents(row.total_cents),
         sent_at=row.sent_at,
         paid_at=row.paid_at,
@@ -147,17 +148,23 @@ def invoice_out(row: BillingInvoice) -> InvoiceOut:
     )
 
 
-async def tenant_usage(
-    db: Db, tenant: Tenant, packages: dict[int, Package], period: str | None = None
-) -> UsageOut:
-    """This month (or ``period``) for one bureau. A freelancer is not counted."""
-    period = period or current_period(tenant.timezone)
-    package = packages.get(tenant.package_tier) or packages[1]
-    counted = is_counted(tenant)
-    orders = await count_orders(db, tenant.id, period, tenant.timezone) if counted else 0
+async def tenant_usage(db: Db, tenant: Tenant, period: str | None = None) -> UsageOut:
+    """This month (or ``period``) for one account."""
+    package, figures = await month_of(db, tenant, period)
+    from suliko.domain.billing import current_period
+
     return usage_out(
-        counted=counted, period=period, package=package, figures=quote(package, orders)
+        period=period or current_period(tenant.timezone), package=package, figures=figures
     )
+
+
+def upgrade_targets(current: int, packages: dict[int, Package]) -> list[int]:
+    """Bigger packages that have a price: the ones an account can take by itself."""
+    return [
+        tier
+        for tier, package in sorted(packages.items())
+        if tier > current and package.monthly_price_cents is not None
+    ]
 
 
 # ── Routes ──────────────────────────────────────────────────────────────────
@@ -174,19 +181,18 @@ async def _own_tenant(db: Db, session: AuthenticatedSession) -> Tenant:
 async def get_usage(db: Db, session: Billing) -> UsageOut:
     """This month's orders against the package: the figure in the sidebar and the
     warning banner. Cheap enough to ask on every page."""
-    tenant = await _own_tenant(db, session)
-    return await tenant_usage(db, tenant, await load_packages(db))
+    return await tenant_usage(db, await _own_tenant(db, session))
 
 
 @router.get("", response_model=BillingOverview)
 async def get_overview(db: Db, session: Billing) -> BillingOverview:
-    """The Billing page: this month, the packages, and the invoices asked of the bureau.
+    """The Billing page: this month, the packages, and the invoices asked for.
 
     An invoice a superuser has worked out but not yet asked for (``open``) is not
     shown: it can still change.
     """
     tenant = await _own_tenant(db, session)
-    packages = await load_packages(db)
+    packages = await load_packages(db, audience_of(tenant))
     rows = (
         (
             await db.execute(
@@ -203,7 +209,55 @@ async def get_overview(db: Db, session: Billing) -> BillingOverview:
         .all()
     )
     return BillingOverview(
-        usage=await tenant_usage(db, tenant, packages),
+        usage=await tenant_usage(db, tenant),
         packages=[package_out(packages[tier]) for tier in sorted(packages)],
+        upgrade_to=upgrade_targets(tenant.package_tier, packages),
+        terms_version=TERMS_VERSION,
         invoices=[invoice_out(row) for row in rows],
     )
+
+
+@router.post("/upgrade", response_model=UsageOut)
+async def upgrade(payload: UpgradeRequest, db: Db, session: Billing) -> UsageOut:
+    """Move up to a bigger package, now.
+
+    The person has seen the terms summary and ticked the box; the version they saw
+    must still be the current one. The package changes at once, so the orders they
+    were stopped from adding can be added straight away, and the month is invoiced
+    at the new fee. Smaller packages and packages with no listed price are not
+    taken here: Suliko moves an account there.
+    """
+    if not payload.accepted_terms:
+        raise ValidationError("Confirm the terms to change your package.")
+    if payload.terms_version != TERMS_VERSION:
+        raise ConflictError("The terms have changed. Reload the page and read them again.")
+
+    tenant = await _own_tenant(db, session)
+    packages = await load_packages(db, audience_of(tenant))
+    if payload.tier not in packages:
+        raise NotFoundError("There is no such package.")
+    if payload.tier <= tenant.package_tier:
+        raise ConflictError("You can only move to a bigger package here. Write to us to go down.")
+    if packages[payload.tier].monthly_price_cents is None:
+        raise ConflictError("That package is agreed with us. Write to us and we will set it up.")
+
+    before = tenant.package_tier
+    tenant.package_tier = payload.tier
+    await db.flush()
+
+    from suliko.core.audit import record
+
+    await record(
+        db,
+        session,
+        action="billing.package_upgraded",
+        entity_type="tenant",
+        entity_id=tenant.id,
+        before={"package_tier": before},
+        after={
+            "package_tier": payload.tier,
+            "terms_version": payload.terms_version,
+            "audience": audience_of(tenant),
+        },
+    )
+    return await tenant_usage(db, tenant)
