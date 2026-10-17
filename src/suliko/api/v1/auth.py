@@ -1315,7 +1315,7 @@ def _suliko_password_email(account: Account, reset_url: str) -> Email:
             p(
                 "ვიღაცამ მოითხოვა თქვენი Suliko Office ანგარიშის (",
                 Bold(login_name(account)),
-                ") პაროლის აღდგენა. თქვენი პაროლი suliko.ge-ზე ინახება და Suliko Office "
+                ") პაროლის აღდგენა. თქვენი პაროლი suliko.ge-ზე ინახება და Suliko Office-ში "
                 "შესასვლელად სწორედ მას იყენებს, ამიტომ იგი იქვე იცვლება.",
             ),
             Button("პაროლის აღდგენა suliko.ge-ზე", reset_url),

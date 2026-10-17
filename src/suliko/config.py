@@ -302,7 +302,7 @@ class Settings(BaseSettings):
     word_editor_max_bytes: int = 25 * 1024 * 1024
     #: Where a person resets a suliko.ge password — sent to those who ask to
     #: reset it here, since Office does not hold it.
-    suliko_password_reset_url: str = "https://suliko.ge/login"  # noqa: S105 -- a URL
+    suliko_password_reset_url: str = "https://suliko.ge/sign-in"  # noqa: S105 -- a URL
 
     # ── CORS ────────────────────────────────────────────────────────────────
     # The Next.js BFF calls this API server-side. The one exception is portal
