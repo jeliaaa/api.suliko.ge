@@ -7,6 +7,7 @@ nothing secret is ever stored in the database in the clear — see
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Literal
 
@@ -128,6 +129,13 @@ class Settings(BaseSettings):
     #   python -c "import os, base64; print(
     #       base64.urlsafe_b64encode(os.urandom(32)).decode())"
     encryption_master_key: SecretStr = SecretStr("")
+
+    # ── First-run tips ──────────────────────────────────────────────────────
+    #: Accounts created on or after this moment get the first-run tips (hotspots
+    #: and the optional tour); older accounts never do. Set to the release date
+    #: so nobody who already knows the product is shown them. ISO 8601, UTC if
+    #: no offset is given. Override with TIPS_ACCOUNTS_SINCE.
+    tips_accounts_since: datetime = datetime(2026, 10, 20, tzinfo=UTC)
 
     # ── Two-factor authentication ───────────────────────────────────────────
     #: Master switch for the second factor.

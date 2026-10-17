@@ -6,6 +6,7 @@ import enum
 from datetime import datetime
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     DateTime,
     Enum,
@@ -78,6 +79,11 @@ class Account(Base, IdMixin, TimestampMixin):
         DateTime(timezone=True), default=None
     )
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    #: Ids of the first-run tips the person has dismissed (see `domain/tips.py`).
+    #: Per account: the tips explain the product, not one organisation.
+    tips_seen: Mapped[list[str]] = mapped_column(
+        JSON, default=list, server_default=text("'[]'"), nullable=False
+    )
 
 
 class DeletionStatus(enum.StrEnum):

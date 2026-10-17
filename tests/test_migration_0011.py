@@ -27,7 +27,7 @@ def test_accounts_matches_the_model(revision: tuple[Any, RecordedOps]) -> None:
     migrated = ops.tables["accounts"]
     declared = Account.__table__
     # What revision 0012 adds to, or relaxes on, this table afterwards.
-    added_later = {"phone", "suliko_user_id"}
+    added_later = {"phone", "suliko_user_id", "tips_seen"}
     relaxed_later = {"email"}
     assert set(migrated.columns.keys()) == set(declared.columns.keys()) - added_later
     for name, column in declared.columns.items():
