@@ -24,7 +24,6 @@ TIP_IDS: tuple[str, ...] = (
     "nav-finances",
     "translations-new",
     "order-translate-send",
-    "settings-email",
     "users-invite",
 )
 
