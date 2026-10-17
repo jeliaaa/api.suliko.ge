@@ -8,6 +8,7 @@
     python -m suliko.cli seed-reference --tenant acme
     python -m suliko.cli import-suliko-users --dry-run
     python -m suliko.cli link-suliko-account --email me@example.com --suliko-login 599123456
+    python -m suliko.cli import-tarjimnebi --tenant SLUG --dump FILE [--commit]
     python -m suliko.cli check
     python -m suliko.cli purge-files        # daily: reclaim removed order files
     python -m suliko.cli deletion-requests  # accounts closed by a request to delete them
@@ -539,6 +540,69 @@ async def seed_reference(tenant_slug: str, with_rates: bool = False) -> None:
             )
 
 
+async def import_tarjimnebi(
+    tenant_slug: str,
+    dump_path: str,
+    *,
+    commit: bool,
+    keep_numbers: bool,
+    package_tier: int | None = None,
+) -> int:
+    """Load a tarjimnebi dump into one organisation. Dry run unless ``commit``."""
+    import json
+    from pathlib import Path
+
+    from suliko.domain.tarjimnebi_import import RefusedError, import_dump, load_dump
+
+    path = Path(dump_path)
+    if not path.exists():
+        fail(f"{path} does not exist.")
+        return 1
+    dump = load_dump(path)
+    say(
+        f"dump: {len(dump.clients)} clients, {len(dump.translators)} translators, "
+        f"{len(dump.notaries)} notaries, {len(dump.orders)} orders"
+    )
+
+    async with get_sessionmaker()() as db:
+        with bypass_tenant_scope():
+            tenant = (
+                await db.execute(select(Tenant).where(Tenant.slug == tenant_slug))
+            ).scalar_one_or_none()
+        if tenant is None:
+            fail(f"No tenant with slug {tenant_slug!r}.")
+            return 1
+        with tenant_scope(int(tenant.id)):
+            try:
+                report = await import_dump(db, int(tenant.id), dump, keep_numbers=keep_numbers)
+            except RefusedError as exc:
+                await db.rollback()
+                fail(str(exc))
+                return 1
+            for key, n in sorted(report.counts.items()):
+                say(f"  {n:6d}  {key}")
+            for line in report.warnings[:60]:
+                warn(line)
+            if len(report.warnings) > 60:
+                warn(f"... and {len(report.warnings) - 60} more warnings")
+            if package_tier is not None and package_tier > tenant.package_tier:
+                say(f"  package: tier {tenant.package_tier} -> {package_tier}")
+                tenant.package_tier = package_tier
+            if not commit:
+                await db.rollback()
+                ok("Dry run: everything was inserted and rolled back. Nothing is saved.")
+                return 0
+            await db.commit()
+            out = (
+                path.with_suffix(".idmap.json")
+                if path.is_file()
+                else path / "tarjimnebi.idmap.json"
+            )
+            out.write_text(json.dumps(report.idmap, indent=1), encoding="utf-8")
+            ok(f"Committed. Old-to-new ids written to {out}")
+            return 0
+
+
 # ── Health check ────────────────────────────────────────────────────────────
 
 
@@ -897,6 +961,24 @@ def main() -> None:
     )
     p.add_argument("--out", required=True, help="the folder to write them to")
 
+    p = sub.add_parser(
+        "import-tarjimnebi",
+        help="load a dump of app.tarjimnebi.ge (scripts/tarjimnebi) into an organisation",
+    )
+    p.add_argument("--tenant", required=True)
+    p.add_argument("--dump", required=True, help="the JSON file, or the folder of parts")
+    p.add_argument("--commit", action="store_true", help="save; without it nothing is kept")
+    p.add_argument(
+        "--keep-numbers",
+        action="store_true",
+        help="keep the old order and client numbers (empty organisations only)",
+    )
+    p.add_argument(
+        "--package-tier",
+        type=int,
+        help="raise the organisation to this order package (never lowers it); 3 is the biggest",
+    )
+
     sub.add_parser("deletion-requests", help="list the accounts closed by a deletion request")
     sub.add_parser(
         "purge-accounts",
@@ -934,6 +1016,14 @@ def main() -> None:
                     await seed_reference(args.tenant, with_rates=args.with_rates)
                 case "import-suliko-users":
                     await import_suliko_users(args.dry_run)
+                case "import-tarjimnebi":
+                    return await import_tarjimnebi(
+                        args.tenant,
+                        args.dump,
+                        commit=args.commit,
+                        keep_numbers=args.keep_numbers,
+                        package_tier=args.package_tier,
+                    )
                 case "link-suliko-account":
                     await link_suliko_account(args.email, args.suliko_login)
                 case "preview-emails":
