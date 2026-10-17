@@ -2080,6 +2080,69 @@ async def test_inviting_an_existing_account_waits_for_acceptance(
         assert row.invitation_pending is True
 
 
+async def test_inviting_a_person_picked_from_the_suggestions_uses_their_sign_in_name(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
+) -> None:
+    from suliko.api.v1 import users as users_api
+    from suliko_fakes import FakeBackend, person
+
+    # The browser sends the id only. A hand-edited address beside it is ignored.
+    payload = users_api.UserInvite(
+        full_name="Nino Beridze",
+        email="someone.else@example.com",
+        role=Role.STAFF,
+        suliko_user_id="g1",
+    )
+    backend = FakeBackend([person("g1", "nino@suliko.ge")])
+    with tenant_scope(ACME):
+        async with maker() as db:
+            session = _admin_session(ACME)
+            result = await users_api.invite_user(
+                payload, db, session, session, RateLimiter(None), backend
+            )
+            await db.commit()
+
+    assert result.user.email == "nino@suliko.ge"
+    assert result.existing_account is True
+    assert "someone.else@example.com" not in sent_mail[-1]["body"]
+
+
+async def test_inviting_a_picked_person_who_signs_in_with_a_phone_needs_no_email(
+    maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
+) -> None:
+    from suliko.api.v1 import users as users_api
+    from suliko_fakes import FakeBackend, person
+
+    payload = users_api.UserInvite(full_name="Gela", role=Role.STAFF, suliko_user_id="g2")
+    backend = FakeBackend([person("g2", "599123456", "Gela", "")])
+    with tenant_scope(ACME):
+        async with maker() as db:
+            session = _admin_session(ACME)
+            result = await users_api.invite_user(
+                payload, db, session, session, RateLimiter(None), backend
+            )
+            await db.commit()
+
+    assert result.invited_by_phone is True
+    assert result.user.invitation_pending is True
+
+
+async def test_inviting_a_picked_person_who_has_left_suliko_is_refused(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    from suliko.api.v1 import users as users_api
+    from suliko_fakes import FakeBackend
+
+    payload = users_api.UserInvite(full_name="Gone", role=Role.STAFF, suliko_user_id="nobody")
+    with tenant_scope(ACME):
+        async with maker() as db:
+            session = _admin_session(ACME)
+            with pytest.raises(ValidationError):
+                await users_api.invite_user(
+                    payload, db, session, session, RateLimiter(None), FakeBackend([])
+                )
+
+
 async def test_the_same_person_cannot_be_invited_twice(
     maker: async_sessionmaker[AsyncSession], sent_mail: list[dict[str, str]]
 ) -> None:

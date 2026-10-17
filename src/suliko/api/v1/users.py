@@ -66,6 +66,7 @@ from suliko.core.ratelimit import RateLimiter, get_rate_limiter
 from suliko.domain.accounts import (
     UNUSABLE_PASSWORD_HASH,
     find_account_by_login,
+    find_account_by_suliko_id,
     find_suliko_person,
     upsert_from_suliko,
     username_for,
@@ -150,9 +151,15 @@ class UserInvite(BaseModel):
     #: Users screen and in the audit log.
     role: Role = Role.STAFF
     permissions: list[str] | None = None
+    #: Someone picked from the suggestion list (`GET /users/suggest`). Instead
+    #: of an address or number the browser never saw, the invitation is to
+    #: this suliko.ge person, by the sign-in name suliko.ge holds for them.
+    suliko_user_id: str | None = Field(default=None, max_length=64)
 
     @model_validator(mode="after")
     def _someone_to_invite(self) -> UserInvite:
+        if self.suliko_user_id:
+            return self
         if self.email is None and normalize_phone(self.phone) is None:
             raise ValueError("an email address or a phone number is required")
         return self
@@ -617,6 +624,86 @@ async def lookup_account(
     )
 
 
+class SulikoSuggestion(BaseModel):
+    """One person in the invite form's dropdown.
+
+    Carries a MASKED contact, enough to tell two Ninos apart and not enough to
+    collect addresses or numbers: the real sign-in name stays on the server and
+    is used when this `suliko_id` comes back on the invite.
+    """
+
+    suliko_id: str
+    full_name: str
+    #: The sign-in name with its middle hidden: "n***@gmail.com", "599 ** ** 56".
+    contact: str
+    kind: Literal["email", "phone"]
+    #: Already a member here, or invited and not yet accepted.
+    member: bool = False
+    pending: bool = False
+
+
+def mask_login(user_name: str) -> tuple[str, Literal["email", "phone"]]:
+    """A sign-in name as the dropdown shows it, and which kind it is."""
+    name = user_name.strip()
+    if "@" in name:
+        local, _, domain = name.rpartition("@")
+        return f"{local[:1]}***@{domain}", "email"
+    digits = "".join(ch for ch in name if ch.isdigit())
+    if len(digits) < 6:
+        return "***", "phone"
+    hidden = " ".join("**" for _ in range(min(3, (len(digits) - 5 + 1) // 2)))
+    return f"{digits[:3]} {hidden} {digits[-2:]}", "phone"
+
+
+@router.get("/suggest", response_model=list[SulikoSuggestion])
+async def suggest_people(
+    db: Db,
+    session: CurrentSession,
+    _: Annotated[object, Depends(require(Permission.USERS_INVITE))],
+    limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
+    backend: Annotated[SulikoBackend, Depends(get_suliko_backend)],
+    q: Annotated[str, Query(max_length=100)] = "",
+) -> list[SulikoSuggestion]:
+    """People registered on suliko.ge whose email or phone starts with `q`.
+
+    For the invite form's dropdown. Behind `users.invite`, like the invite it
+    leads to, and limited per person: it answers "who is this?", it is not a
+    directory. suliko.ge returns nobody until about four characters are typed
+    and never more than five people, and what comes back here is masked.
+
+    If suliko.ge cannot be asked this is a 503, not an empty list: an inviter
+    who is told nobody matches would stop looking.
+    """
+    typed = q.strip()
+    if not backend.enabled or len(typed) < 4:
+        return []
+    if retry := await limiter.check_write(f"suggest:{session.user_id}"):
+        raise RateLimitedError("Too many searches. Wait a moment.", retry_after=retry)
+
+    out: list[SulikoSuggestion] = []
+    for person in await backend.suggest_users(typed):
+        contact, kind = mask_login(person.user_name)
+        account = await find_account_by_suliko_id(db, person.id)
+        row = (
+            (await db.execute(select(User).where(User.account_id == account.id).limit(1)))
+            .scalars()
+            .first()
+            if account is not None
+            else None
+        )
+        out.append(
+            SulikoSuggestion(
+                suliko_id=person.id,
+                full_name=person.full_name or contact,
+                contact=contact,
+                kind=kind,
+                member=row is not None and not row.invitation_pending,
+                pending=row is not None and row.invitation_pending,
+            )
+        )
+    return out
+
+
 def _suliko_account_note(*, linked: bool, matched_display_name: str | None) -> Callout:
     """The note the invitation email gains for suliko.ge.
 
@@ -775,11 +862,22 @@ async def invite_user(
             retry_after=retry,
         )
 
+    invite_email = str(payload.email) if payload.email is not None else None
     phone = (payload.phone or "").strip() or None
+    if payload.suliko_user_id:
+        # Picked from the suggestions: the person is the suliko.ge account with
+        # this id, invited by the sign-in name suliko.ge holds for them. What
+        # the browser sent is only the id, so a hand-edited request cannot
+        # invite a different address under this person's name.
+        chosen = await backend.get_user(payload.suliko_user_id)
+        if chosen is None:
+            raise ValidationError("That person is no longer on suliko.ge. Search again.")
+        invite_email = chosen.email
+        phone = chosen.phone
     # Who is being invited: by address, or — with no address — by the phone
     # number they sign in to suliko.ge with.
-    by_phone = payload.email is None
-    login = checked_login(phone if by_phone else str(payload.email))
+    by_phone = invite_email is None
+    login = checked_login(phone if by_phone else invite_email)
     account = await find_account_by_login(db, login)
     if account is None and backend.enabled:
         # Registered on suliko.ge, never seen here: make their account now, so

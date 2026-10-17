@@ -46,7 +46,7 @@ from suliko.models.reference import DocumentType, Language, LanguagePairPrice, T
 from suliko.models.tenant import Tenant
 from suliko.models.user import Account, Role, User
 from suliko.security.passwords import hash_password, verify_password
-from suliko_fakes import FakeBackend, person
+from suliko_fakes import FakeBackend, contact, person
 
 TABLES = [
     Tenant.__table__,
@@ -884,3 +884,106 @@ async def test_a_phone_account_here_is_found_without_asking_suliko(db: AsyncSess
 async def test_a_search_that_is_neither_is_refused(db: AsyncSession, raw: str) -> None:
     with pytest.raises(ValidationError):
         await _lookup(db, raw, FakeBackend([person()]))
+
+
+# ── Suggesting people while the inviter types ───────────────────────────────
+
+
+async def _suggest(
+    db: AsyncSession, typed: str, backend: FakeBackend, *, limiter: Any = None
+) -> Any:
+    from suliko.core.ratelimit import RateLimiter
+
+    class _Session:
+        user_id = 7
+
+    return await users.suggest_people(
+        db=db,
+        session=_Session(),  # type: ignore[arg-type]
+        _=None,
+        limiter=limiter or RateLimiter(None),
+        backend=backend,
+        q=typed,
+    )
+
+
+def test_a_sign_in_name_is_masked_for_the_dropdown() -> None:
+    assert users.mask_login("nino.beridze@gmail.com") == ("n***@gmail.com", "email")
+    assert users.mask_login("599123456") == ("599 ** ** 56", "phone")
+    assert users.mask_login("+995 599 12 34 56") == ("995 ** ** ** 56", "phone")
+
+
+async def test_typing_the_start_of_an_email_suggests_the_person_masked(db: AsyncSession) -> None:
+    backend = FakeBackend(contacts=[contact("g1", "nino@suliko.ge"), contact("g2", "gela@x.ge")])
+
+    found = await _suggest(db, "nino", backend)
+
+    assert [(s.suliko_id, s.full_name, s.contact, s.kind) for s in found] == [
+        ("g1", "Nino Beridze", "n***@suliko.ge", "email")
+    ]
+    # Nothing the browser receives carries the whole address.
+    assert "nino@suliko.ge" not in found[0].model_dump_json()
+
+
+async def test_typing_the_start_of_a_phone_number_suggests_the_person(db: AsyncSession) -> None:
+    backend = FakeBackend(contacts=[contact("g2", "599123456", "Gela", "Kapanadze")])
+
+    found = await _suggest(db, "+995 599 12", backend)
+
+    assert [(s.suliko_id, s.contact, s.kind) for s in found] == [("g2", "599 ** ** 56", "phone")]
+
+
+async def test_too_little_typed_asks_suliko_nothing(db: AsyncSession) -> None:
+    backend = FakeBackend(contacts=[contact()])
+
+    assert await _suggest(db, "nin", backend) == []
+    assert await _suggest(db, "   ", backend) == []
+    assert backend.suggestions == []
+
+
+async def test_a_suggestion_says_who_is_already_here(db: AsyncSession) -> None:
+    tenant = Tenant(slug="acme", display_name="Acme")
+    db.add(tenant)
+    await db.flush()
+    link = await upsert_from_suliko(db, person("g1", "nino@suliko.ge"))
+    from suliko.db.tenancy import tenant_scope
+
+    with tenant_scope(int(tenant.id)):
+        db.add(
+            User(
+                account_id=link.account.id,
+                username="nino",
+                email="nino@suliko.ge",
+                full_name="Nino Beridze",
+                password_hash=UNUSABLE_PASSWORD_HASH,
+                role=Role.STAFF,
+                invitation_pending=True,
+            )
+        )
+        await db.flush()
+        found = await _suggest(db, "nino", FakeBackend(contacts=[contact()]))
+
+    assert (found[0].member, found[0].pending) == (False, True)
+
+
+async def test_suggestions_are_limited_per_person(db: AsyncSession) -> None:
+    from suliko.core.errors import RateLimitedError
+
+    class _Full:
+        async def check_write(self, key: str) -> int | None:
+            assert key == "suggest:7"
+            return 60
+
+    with pytest.raises(RateLimitedError):
+        await _suggest(db, "nino", FakeBackend(contacts=[contact()]), limiter=_Full())
+
+
+async def test_suggestions_for_a_suliko_that_is_down_are_an_error_not_nobody(
+    db: AsyncSession,
+) -> None:
+    with pytest.raises(SulikoUnavailableError):
+        await _suggest(db, "nino", FakeBackend(directory_down=True))
+
+
+async def test_without_suliko_there_is_nobody_to_suggest(db: AsyncSession) -> None:
+    assert await _suggest(db, "nino", FakeBackend(enabled=False)) == []
