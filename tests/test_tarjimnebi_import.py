@@ -254,6 +254,17 @@ async def test_everything_is_loaded_and_ledgers_balance(db: AsyncSession) -> Non
 
 
 @pytest.mark.asyncio
+async def test_language_codes_are_stored_lower_case(db: AsyncSession) -> None:
+    dump = _dump()
+    dump.orders[1]["documents"][0]["source_language"] = "Uz"
+    with tenant_scope(ACME):
+        await import_dump(db, ACME, dump, keep_numbers=False)
+        codes = set((await db.execute(select(OrderDocument.source_language))).scalars())
+        assert "Uz" not in codes
+        assert "uz" in codes
+
+
+@pytest.mark.asyncio
 async def test_a_second_run_is_refused(db: AsyncSession) -> None:
     with tenant_scope(ACME):
         await import_dump(db, ACME, _dump(), keep_numbers=False)

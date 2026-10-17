@@ -322,8 +322,8 @@ async def import_dump(
             db.add(
                 TranslatorLanguagePair(
                     translator_id=translator.id,
-                    source_language=pair["from"][:5],
-                    target_language=pair["to"][:5],
+                    source_language=pair["from"].lower()[:5],
+                    target_language=pair["to"].lower()[:5],
                     rate_per_page=_money(pair["price"]) if pair.get("price") else None,
                 )
             )
@@ -376,10 +376,9 @@ async def import_dump(
         rows: list[tuple[dict[str, Any], OrderDocument]] = []
         for d in raw.get("documents") or []:
             dtype = type_by_legacy.get(d["document_type_id"] or 0)
-            if (
-                d.get("source_language") not in languages
-                or d.get("target_language") not in languages
-            ):
+            if (d.get("source_language") or "").lower() not in languages or (
+                d.get("target_language") or ""
+            ).lower() not in languages:
                 report.warn(
                     f"Order {raw['id']}: language "
                     f"{d.get('source_language')}>{d.get('target_language')} unknown."
@@ -388,8 +387,8 @@ async def import_dump(
                 order_id=order.id,
                 document_type_id=dtype.id if dtype else None,
                 service_type=ServiceType.WRITTEN,
-                source_language=(d.get("source_language") or "ka")[:5],
-                target_language=(d.get("target_language") or "ka")[:5],
+                source_language=(d.get("source_language") or "ka").lower()[:5],
+                target_language=(d.get("target_language") or "ka").lower()[:5],
                 page_count=int(d.get("page_count") or 1),
                 copy_type=CopyType(d["copy_type"])
                 if d.get("copy_type") in {c.value for c in CopyType}
