@@ -11,7 +11,12 @@ from typing import Any
 
 import pytest
 
-from suliko.api.v1.notifications import MENTION_PATTERN
+from suliko.api.v1.notifications import (
+    MENTION_PATTERN,
+    mention_handles,
+    mention_names,
+    resolve_mentions,
+)
 from suliko.api.v1.service_pages import _group_of
 from suliko.domain.notifications import notify
 from suliko.models.collaboration import Notification, NotificationKind
@@ -167,3 +172,47 @@ def test_a_local_part_mention_resolves_only_when_unambiguous() -> None:
     assert resolve_mentions({"ana"}, [nino, ana]) == [ana]  # type: ignore[list-item]
     assert resolve_mentions({"nino"}, [nino, nino2]) == []  # type: ignore[list-item]
     assert resolve_mentions({"nino@acme.ge"}, [nino, nino2]) == [nino]  # type: ignore[list-item]
+
+
+def test_an_email_username_is_mentioned_by_the_part_before_the_at() -> None:
+    assert mention_handles(["niko@acme.ge", "tako@acme.ge"]) == {
+        "niko@acme.ge": "niko",
+        "tako@acme.ge": "tako",
+    }
+
+
+def test_two_people_with_one_local_part_are_mentioned_in_full() -> None:
+    handles = mention_handles(["niko@acme.ge", "niko@other.ge", "tako@acme.ge"])
+
+    assert handles["niko@acme.ge"] == "niko@acme.ge"
+    assert handles["niko@other.ge"] == "niko@other.ge"
+    assert handles["tako@acme.ge"] == "tako"
+
+
+def test_a_phone_username_is_mentioned_as_it_is() -> None:
+    assert mention_handles(["579737737"]) == {"579737737": "579737737"}
+
+
+def test_a_local_part_that_is_another_persons_username_stays_in_full() -> None:
+    """ "@niko" would mean the member called niko, not niko@acme.ge."""
+    handles = mention_handles(["niko", "niko@acme.ge"])
+
+    assert handles["niko"] == "niko"
+    assert handles["niko@acme.ge"] == "niko@acme.ge"
+
+
+def test_every_offered_handle_resolves_to_exactly_that_person() -> None:
+    """What the dropdown inserts must do what it promises once the note is posted."""
+    from types import SimpleNamespace
+
+    users = [
+        SimpleNamespace(id=i, username=name)
+        for i, name in enumerate(
+            ["niko@acme.ge", "tako@acme.ge", "579737737", "lasha@a.ge", "lasha@b.ge"], start=1
+        )
+    ]
+    handles = mention_handles([u.username for u in users])
+
+    for user in users:
+        found = resolve_mentions(mention_names(f"hi @{handles[user.username]} ok"), users)  # type: ignore[arg-type]
+        assert [u.id for u in found] == [user.id]
