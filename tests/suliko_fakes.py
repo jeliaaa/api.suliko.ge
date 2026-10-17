@@ -87,6 +87,7 @@ class FakeBackend:
         #: What a search can find (profile email/phone kept apart from the sign-in name).
         self.contacts = contacts or []
         self.searches: list[str] = []
+        self.suggestions: list[str] = []
         #: One-time sign-in codes: code -> suliko id. Spent on first use.
         self.codes = codes or {}
         self.passwords = passwords or {}
@@ -137,6 +138,33 @@ class FakeBackend:
             if by_email or by_phone:
                 found.append(c)
         return found
+
+    async def suggest_users(self, query: str) -> list[SulikoContact]:
+        """The start of the email, sign-in name or number, once four characters are typed."""
+        self._guard()
+        self.suggestions.append(query)
+        typed = query.strip().lower()
+        numeric = all(ch.isdigit() or ch in "+ -()" for ch in typed)
+
+        def local(raw: str | None) -> str:
+            digits = "".join(ch for ch in raw or "" if ch.isdigit())
+            if digits.startswith("995"):
+                return digits[3:]
+            return digits[1:] if digits.startswith("0") else digits
+
+        wanted = local(typed) if numeric else typed
+        if len(wanted) < 4:
+            return []
+        found = []
+        for c in self.contacts:
+            if numeric:
+                phones = [local(c.phone), local(c.user_name if "@" not in c.user_name else None)]
+                hit = any(p.startswith(wanted) for p in phones if p)
+            else:
+                hit = any(v.lower().startswith(typed) for v in (c.email or "", c.user_name) if v)
+            if hit:
+                found.append(c)
+        return found[:5]
 
     async def iter_users(self, page_size: int = 200) -> AsyncIterator[SulikoUser]:
         self._guard()

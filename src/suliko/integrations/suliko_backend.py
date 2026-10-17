@@ -152,6 +152,8 @@ class SulikoBackend(Protocol):
 
     async def search_users(self, query: str) -> list[SulikoContact]: ...
 
+    async def suggest_users(self, query: str) -> list[SulikoContact]: ...
+
     def iter_users(self, page_size: int = PAGE_SIZE) -> AsyncIterator[SulikoUser]: ...
 
     async def redeem_sso_code(
@@ -349,6 +351,15 @@ class HttpSulikoBackend:
             raise SulikoUnavailableError("suliko.ge sent something Office could not read.")
         return [parse_contact(item) for item in data]
 
+    async def suggest_users(self, query: str) -> list[SulikoContact]:
+        """Up to a handful of people whose email, sign-in name or phone number STARTS
+        with `query`, for a box that suggests while someone types. suliko.ge
+        answers with an empty list until enough has been typed."""
+        data = await self._get_json(f"{USERS_PATH}/suggest", params={"q": query})
+        if not isinstance(data, list):
+            raise SulikoUnavailableError("suliko.ge sent something Office could not read.")
+        return [parse_contact(item) for item in data]
+
     async def iter_users(self, page_size: int = PAGE_SIZE) -> AsyncIterator[SulikoUser]:
         page, seen = 1, 0
         while True:
@@ -419,6 +430,9 @@ class UnconfiguredSulikoBackend:
         raise SulikoUnavailableError("suliko.ge is not connected to this Office.")
 
     async def search_users(self, query: str) -> list[SulikoContact]:
+        raise SulikoUnavailableError("suliko.ge is not connected to this Office.")
+
+    async def suggest_users(self, query: str) -> list[SulikoContact]:
         raise SulikoUnavailableError("suliko.ge is not connected to this Office.")
 
     def iter_users(self, page_size: int = PAGE_SIZE) -> AsyncIterator[SulikoUser]:
