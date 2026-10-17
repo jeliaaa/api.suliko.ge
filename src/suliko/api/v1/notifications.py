@@ -326,6 +326,78 @@ async def list_comments(
     ]
 
 
+class MentionablePerson(BaseModel):
+    """A colleague a note box can offer after "@"."""
+
+    #: What goes after the "@" so the mention resolves (`resolve_mentions`).
+    handle: str
+    full_name: str
+    position: str | None = None
+
+
+def mention_handles(usernames: list[str]) -> dict[str, str]:
+    """The shortest text that mentions each username, and still means only them.
+
+    An email username is mentioned by its part before the "@" when no one else
+    shares it ("@niko" for niko@acme.ge); otherwise, and for a username that is
+    not an address, by the whole username.
+    """
+    locals_ = [name.lower().split("@", 1)[0] for name in usernames if "@" in name]
+    taken = {name.lower() for name in usernames}
+    out: dict[str, str] = {}
+    for name in usernames:
+        local = name.split("@", 1)[0]
+        short = (
+            local
+            if "@" in name
+            and locals_.count(local.lower()) == 1
+            and local.lower() not in taken
+            and len(local) >= 2
+            else name
+        )
+        out[name] = short
+    return out
+
+
+@comments_router.get("/{order_id}/comments/people", response_model=list[MentionablePerson])
+async def mentionable_people(
+    order_id: int,
+    db: Db,
+    session: CurrentSession,
+    _: Annotated[object, Depends(require(Permission.ORDERS_READ))],
+) -> list[MentionablePerson]:
+    """Colleagues who can be @mentioned in a note: active members who have
+    joined, other than you, for the note box's dropdown.
+
+    Behind `orders.read`, like writing the note. It lists only people of this
+    organisation, which a note's author can already name. Empty for an
+    organisation of one.
+    """
+    await _order_or_404(db, order_id)
+    members = (
+        (
+            await db.execute(
+                select(User)
+                .where(User.is_active.is_(True), User.invitation_pending.is_(False))
+                .order_by(User.full_name, User.id)
+                .limit(500)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    handles = mention_handles([m.username for m in members])
+    return [
+        MentionablePerson(
+            handle=handles[m.username],
+            full_name=m.full_name or m.username,
+            position=m.position,
+        )
+        for m in members
+        if m.id != session.user_id
+    ]
+
+
 @comments_router.post(
     "/{order_id}/comments", response_model=CommentOut, status_code=http_status.HTTP_201_CREATED
 )
