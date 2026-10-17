@@ -75,6 +75,7 @@ from suliko.domain.accounts import (
 )
 from suliko.domain.plans import TenantPlan, effective_permissions, effective_plan
 from suliko.domain.portal import registration_url
+from suliko.domain.tips import TIP_IDS, apply_update, seen_tips, tips_enabled
 from suliko.integrations.suliko_backend import (
     PasswordOutcome,
     SulikoBackend,
@@ -1765,6 +1766,32 @@ async def accept_invitation(payload: AcceptInvitationRequest) -> AcceptInvitatio
     return AcceptInvitationResponse(tenant_slug=tenant.slug, tenant_name=tenant.display_name)
 
 
+class TipsState(BaseModel):
+    #: Show hotspots at all: a new account that has chosen its plan.
+    enabled: bool
+    #: Ids of the tips already dismissed (see `domain/tips.py`).
+    seen: list[str]
+
+
+class TipsUpdate(BaseModel):
+    #: Ids to mark as seen. Unknown ids are refused.
+    seen: list[str] = Field(default_factory=list, max_length=50)
+    #: Forget everything seen ("replay tips"). Applied instead of `seen`.
+    reset: bool = False
+
+
+def _tips_state(account: Account | None, session: AuthenticatedSession) -> TipsState:
+    return TipsState(
+        enabled=tips_enabled(
+            account,
+            since=get_settings().tips_accounts_since,
+            onboarding_required=session.onboarding_required,
+            impersonated=session.is_impersonated,
+        ),
+        seen=seen_tips(account),
+    )
+
+
 class SessionInfo(BaseModel):
     user_id: int
     username: str
@@ -1806,6 +1833,8 @@ class SessionInfo(BaseModel):
     #: create it). The current organisation is among them.
     organizations: list[OrgChoice] = Field(default_factory=list)
     personal: OrgChoice | None = None
+    #: First-run tips, so the shell needs no extra request.
+    tips: TipsState = Field(default_factory=lambda: TipsState(enabled=False, seen=[]))
 
 
 @router.get("/session", response_model=SessionInfo)
@@ -1817,6 +1846,7 @@ async def current_session(
     own: OrgChoice | None = None
     login = session.email or session.username
     managed_externally = False
+    account: Account | None = None
     if session.account_id is not None:
         async with get_sessionmaker()() as db:
             organizations, own = await _choices(db, session.account_id)
@@ -1853,7 +1883,34 @@ async def current_session(
         has_mfa=session.has_mfa,
         mfa_enforced=get_settings().mfa_enforced,
         email_verified=session.email_verified,
+        tips=_tips_state(account, session),
     )
+
+
+@router.get("/tips", response_model=TipsState)
+async def get_tips(session: CurrentSession, db: Db) -> TipsState:
+    account = await db.get(Account, session.account_id) if session.account_id else None
+    return _tips_state(account, session)
+
+
+@router.patch("/tips", response_model=TipsState)
+async def update_tips(payload: TipsUpdate, session: CurrentSession, db: Db) -> TipsState:
+    """Mark tips as seen, or forget them all (`reset`: "replay tips").
+
+    Not available while acting as someone else: a superuser looking around must
+    not use up the person's tips.
+    """
+    if session.impersonated_by_user_id is not None:
+        raise ValidationError("Tips cannot be changed while acting as someone else.")
+    unknown = sorted(set(payload.seen) - set(TIP_IDS))
+    if unknown:
+        raise ValidationError(f"Unknown tip: {unknown[0]}.")
+    account = await db.get(Account, session.account_id) if session.account_id else None
+    if account is None:
+        raise ValidationError("This account has no tips to save.")
+    apply_update(account, seen=payload.seen, reset=payload.reset)
+    await db.flush()
+    return _tips_state(account, session)
 
 
 __all__ = ["resolve_session", "router"]

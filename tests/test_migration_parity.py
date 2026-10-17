@@ -84,6 +84,8 @@ LATER_REVISIONS = (
     "0033_package_audiences.py",
     # billing_free_months — see test_migration_0034.py.
     "0034_free_months.py",
+    # accounts.tips_seen — see test_migration_0035.py.
+    "0035_account_tips.py",
 )
 
 
