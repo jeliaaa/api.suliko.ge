@@ -44,6 +44,10 @@ def tips_enabled(
         return False
     if created.tzinfo is None:
         created = created.replace(tzinfo=UTC)
+    # A bare date in TIPS_ACCOUNTS_SINCE (2026-10-20) parses as a naive datetime;
+    # comparing that with an aware one raises, so read it as UTC too.
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=UTC)
     return created >= since
 
 

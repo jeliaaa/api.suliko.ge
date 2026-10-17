@@ -47,6 +47,12 @@ def test_a_naive_timestamp_is_read_as_utc() -> None:
     assert _enabled(_account(datetime(2026, 10, 21, tzinfo=UTC).replace(tzinfo=None)))
 
 
+def test_a_naive_cutoff_from_the_environment_is_read_as_utc() -> None:
+    account = _account(SINCE + timedelta(days=1))
+    naive = SINCE.replace(tzinfo=None)
+    assert tips_enabled(account, since=naive, onboarding_required=False, impersonated=False)
+
+
 def test_not_before_the_plan_is_chosen() -> None:
     assert not _enabled(_account(SINCE + timedelta(days=1)), onboarding_required=True)
 
