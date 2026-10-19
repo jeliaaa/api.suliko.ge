@@ -67,6 +67,10 @@ class Tenant(Base, IdMixin, TimestampMixin):
         server_default=DEFAULT_TIMEZONE,
         nullable=False,
     )
+    #: A freelancer's answer to "may other bureaus send you orders?", given when
+    #: the personal workspace is created. None: never asked (every bureau, and
+    #: personal workspaces made before the question existed).
+    accepts_bureau_orders: Mapped[bool | None] = mapped_column(Boolean, default=None)
     suspended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     #: A person's own freelancer workspace — the "Personal account" in the
     #: sign-in chooser. Created on first pick (`domain.accounts`), owned by

@@ -122,5 +122,5 @@ def test_signup_seeds_catalogues_but_not_prices() -> None:
 
     assert "create_bureau(db, account" in inspect.getsource(auth.signup)
     source = inspect.getsource(accounts._found_workspace)
-    assert "seed_reference_data(db)" in source
+    assert "seed_reference_data(db," in source
     assert "with_rates=True" not in source

@@ -118,11 +118,16 @@ class SeedResult:
     rates_added: int
 
 
-async def seed_reference_data(db: AsyncSession, *, with_rates: bool = False) -> SeedResult:
+async def seed_reference_data(
+    db: AsyncSession, *, with_rates: bool = False, document_types_active: bool = True
+) -> SeedResult:
     """Add whatever of the starter catalogues is missing. Idempotent.
 
     Existing rows are never touched, so running it on an organisation that has
     already edited its own list only fills gaps.
+
+    `document_types_active=False` adds the types switched off: a freelancer
+    states which kinds of document they translate, so none is assumed.
     """
     existing_codes = set((await db.execute(select(Language.code))).scalars())
     languages_added = 0
@@ -135,7 +140,14 @@ async def seed_reference_data(db: AsyncSession, *, with_rates: bool = False) -> 
     types_added = 0
     for name_en, name_ka in DOCUMENT_TYPES:
         if name_en not in existing_types:
-            db.add(DocumentType(name_en=name_en, name_ka=name_ka, price_multiplier=Decimal("1.0")))
+            db.add(
+                DocumentType(
+                    name_en=name_en,
+                    name_ka=name_ka,
+                    price_multiplier=Decimal("1.0"),
+                    is_active=document_types_active,
+                )
+            )
             types_added += 1
 
     rates_added = 0

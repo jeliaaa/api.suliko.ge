@@ -222,6 +222,30 @@ async def test_the_personal_workspace_starts_with_document_types(db: AsyncSessio
     assert count
 
 
+async def test_a_freelancer_chooses_their_document_types_and_a_bureau_does_not(
+    db: AsyncSession,
+) -> None:
+    account = await db.get(Account, NINO)
+    assert account is not None
+    freelancer = await create_personal_workspace(db, account)
+    bureau = await create_bureau(db, account, "Nino Translations")
+    with bypass_tenant_scope():
+        rows = (await db.execute(select(DocumentType.tenant_id, DocumentType.is_active))).all()
+    mine = {active for tenant_id, active in rows if tenant_id == freelancer.tenant.id}
+    theirs = {active for tenant_id, active in rows if tenant_id == bureau.tenant.id}
+    assert mine == {False}
+    assert theirs == {True}
+
+
+async def test_the_bureau_orders_answer_is_kept_when_given(db: AsyncSession) -> None:
+    account = await db.get(Account, NINO)
+    assert account is not None
+    created = await create_personal_workspace(db, account, accepts_bureau_orders=True)
+    assert created.tenant.accepts_bureau_orders is True
+    bureau = await create_bureau(db, account, "Nino Translations")
+    assert bureau.tenant.accepts_bureau_orders is None
+
+
 async def test_a_bureau_is_never_mistaken_for_the_personal_account(db: AsyncSession) -> None:
     """A freelancer-plan bureau someone was invited to is not theirs."""
     with bypass_tenant_scope():
