@@ -13,6 +13,7 @@
     python -m suliko.cli purge-files        # daily: reclaim removed order files
     python -m suliko.cli deletion-requests  # accounts closed by a request to delete them
     python -m suliko.cli cancel-deletion-request --id 7
+    python -m suliko.cli reset-account --login me@example.com   # shows the new-user flow again
     python -m suliko.cli purge-accounts     # daily: delete the data of approved requests
 
 The FIRST superuser is created here. There is no sign-up path, no "first user
@@ -464,6 +465,37 @@ async def cancel_deletion_request(request_id: int) -> None:
         )
         await db.commit()
     ok(f"Request {request_id} is cancelled. The account can sign in again.")
+
+
+async def reset_account(login: str) -> int:
+    """Give a (test) account the new-user experience again. Deletes nothing."""
+    from suliko.core.audit import record
+    from suliko.domain.accounts import find_account_by_login, reset_to_new
+
+    async with get_sessionmaker()() as db:
+        account = await find_account_by_login(db, login)
+        if account is None:
+            fail(f"No account signs in as {login}.")
+            return 1
+        try:
+            switched_off = await reset_to_new(db, account)
+        except ValidationError as exc:
+            fail(exc.detail)
+            return 1
+        await record(
+            db,
+            None,
+            action="account.reset_to_new",
+            entity_type="account",
+            entity_id=account.id,
+            after={"memberships_switched_off": switched_off},
+        )
+        await db.commit()
+    ok(f"{login} is reset: {len(switched_off)} membership(s) switched off, tips cleared.")
+    if switched_off:
+        ids = ", ".join(str(i) for i in switched_off)
+        say(f"  To undo: UPDATE users SET is_active = true WHERE id IN ({ids});")  # noqa: S608
+    return 0
 
 
 async def purge_accounts() -> int:
@@ -986,6 +1018,14 @@ def main() -> None:
     )
 
     p = sub.add_parser(
+        "reset-account",
+        help="give an account the new-user experience again (deletes nothing)",
+    )
+    p.add_argument(
+        "--login", required=True, help="the email address or phone number it signs in with"
+    )
+
+    p = sub.add_parser(
         "cancel-deletion-request",
         help="cancel a deletion request: the account can sign in again, nothing is deleted",
     )
@@ -1040,6 +1080,8 @@ def main() -> None:
                     await deletion_requests()
                 case "cancel-deletion-request":
                     await cancel_deletion_request(args.id)
+                case "reset-account":
+                    return await reset_account(args.login)
                 case "purge-accounts":
                     return await purge_accounts()
             return 0

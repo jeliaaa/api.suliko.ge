@@ -425,6 +425,33 @@ async def create_bureau(
     return await _found_workspace(db, account, name=name, plan=plan, is_personal=False)
 
 
+async def reset_to_new(db: AsyncSession, account: Account) -> list[int]:
+    """Make the account look brand new: no organisation to enter, no tips seen.
+
+    Nothing is deleted. Every active membership is switched off (the chooser
+    lists active ones only), so the next sign-in shows the registration view, and
+    signing in everywhere is revoked. The switched-off membership ids are
+    returned: set `users.is_active` back for them to undo. A platform superuser
+    is refused, since switching that off would lock the operator out.
+    """
+    with bypass_tenant_scope():
+        users = list(
+            (
+                await db.execute(
+                    select(User).where(User.account_id == account.id, User.is_active.is_(True))
+                )
+            ).scalars()
+        )
+        if any(user.role is Role.SUPERUSER for user in users):
+            raise ValidationError("This account is a platform superuser; it is not reset.")
+        for user in users:
+            user.is_active = False
+    account.tips_seen = []
+    await revoke_account_sessions(db, account.id)
+    await db.flush()
+    return [user.id for user in users]
+
+
 async def revoke_account_sessions(db: AsyncSession, account_id: int) -> None:
     """Sign the person out everywhere — every organisation, every device.
 
@@ -457,6 +484,7 @@ __all__ = [
     "normalise_email",
     "personal",
     "phone_variants",
+    "reset_to_new",
     "revoke_account_sessions",
     "slug_candidate",
     "unique_slug",

@@ -27,6 +27,7 @@ from suliko.domain.accounts import (
     find_account,
     memberships,
     personal,
+    reset_to_new,
     revoke_account_sessions,
 )
 from suliko.models.reference import DocumentType, Language, LanguagePairPrice, TenantSettings
@@ -244,6 +245,26 @@ async def test_the_bureau_orders_answer_is_kept_when_given(db: AsyncSession) -> 
     assert created.tenant.accepts_bureau_orders is True
     bureau = await create_bureau(db, account, "Nino Translations")
     assert bureau.tenant.accepts_bureau_orders is None
+
+
+async def test_reset_to_new_leaves_nothing_to_enter_and_deletes_nothing(
+    db: AsyncSession,
+) -> None:
+    account = await db.get(Account, NINO)
+    assert account is not None
+    await create_personal_workspace(db, account)
+    await create_bureau(db, account, "Nino Translations")
+    account.tips_seen = ["tour"]
+
+    switched_off = await reset_to_new(db, account)
+
+    assert len(switched_off) >= 2
+    assert await memberships(db, NINO) == []
+    assert account.tips_seen == []
+    # A fresh personal workspace can be made again, as for a new person.
+    again = await create_personal_workspace(db, account)
+    assert personal(await memberships(db, NINO)) is not None
+    assert again.tenant.is_personal
 
 
 async def test_a_bureau_is_never_mistaken_for_the_personal_account(db: AsyncSession) -> None:
