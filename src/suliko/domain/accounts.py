@@ -336,6 +336,7 @@ async def _found_workspace(
     name: str,
     plan: TenantPlan | None,
     is_personal: bool,
+    accepts_bureau_orders: bool | None = None,
 ) -> Membership:
     """A new organisation owned by `account` — the one way one is made, for
     sign-up, the chooser, the switcher and the personal account alike.
@@ -355,6 +356,7 @@ async def _found_workspace(
             plan=plan.value if plan else None,
             locale=settings.default_signup_locale,
             is_personal=is_personal,
+            accepts_bureau_orders=accepts_bureau_orders,
         )
         db.add(tenant)
         await db.flush()
@@ -365,7 +367,9 @@ async def _found_workspace(
     await bind_tenant_guc(db, tenant_id)
     with tenant_scope(tenant_id):
         db.add(TenantSettings(tenant_id=tenant_id, default_language=tenant.locale))
-        await seed_reference_data(db)
+        # A freelancer chooses the document types they translate (the setup
+        # checklist says so); a bureau starts with the whole catalogue on.
+        await seed_reference_data(db, document_types_active=not is_personal)
         user = User(
             tenant_id=tenant_id,
             account_id=account.id,
@@ -382,14 +386,22 @@ async def _found_workspace(
     return Membership(user=user, tenant=tenant)
 
 
-async def create_personal_workspace(db: AsyncSession, account: Account) -> Membership:
+async def create_personal_workspace(
+    db: AsyncSession, account: Account, *, accepts_bureau_orders: bool | None = None
+) -> Membership:
     """The person's own organisation, on the Freelancer plan, owned by them.
 
-    Created the first time they pick "Personal account".
+    Created the first time they pick "Personal account", together with their
+    answer to whether other bureaus may send them orders.
     """
     name = account.full_name.strip() or login_name(account).split("@")[0]
     return await _found_workspace(
-        db, account, name=name, plan=TenantPlan.FREELANCER, is_personal=True
+        db,
+        account,
+        name=name,
+        plan=TenantPlan.FREELANCER,
+        is_personal=True,
+        accepts_bureau_orders=accepts_bureau_orders,
     )
 
 

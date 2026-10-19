@@ -190,6 +190,9 @@ class SelectRequest(BaseModel):
     #: An organisation's slug, or omitted with `personal` set.
     tenant_slug: str | None = Field(default=None, max_length=63)
     personal: bool = False
+    #: With `personal`, when the workspace is about to be created: may other
+    #: bureaus send this freelancer orders? Ignored once it exists.
+    accepts_bureau_orders: bool | None = None
 
 
 class CreateBureauRequest(BaseModel):
@@ -535,6 +538,7 @@ async def _resolve_choice(
     tenant_slug: str | None,
     want_personal: bool,
     background: BackgroundTasks,
+    accepts_bureau_orders: bool | None = None,
 ) -> Membership:
     """The membership a pick refers to — creating the personal workspace on
     its first pick. Only ever one of the account's own: a slug it does not
@@ -544,7 +548,9 @@ async def _resolve_choice(
         own = personal(options)
         if own is not None:
             return own
-        own = await create_personal_workspace(db, account)
+        own = await create_personal_workspace(
+            db, account, accepts_bureau_orders=accepts_bureau_orders
+        )
 
         from suliko.core.audit import record
 
@@ -698,6 +704,7 @@ async def login_select(
             tenant_slug=payload.tenant_slug,
             want_personal=payload.personal,
             background=background,
+            accepts_bureau_orders=payload.accepts_bureau_orders,
         )
         response = await _start_session(
             db,

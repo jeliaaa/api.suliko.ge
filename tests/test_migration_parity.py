@@ -86,6 +86,8 @@ LATER_REVISIONS = (
     "0034_free_months.py",
     # accounts.tips_seen — see test_migration_0035.py.
     "0035_account_tips.py",
+    # tenants.accepts_bureau_orders — see test_migration_0036.py.
+    "0036_accepts_bureau_orders.py",
 )
 
 
