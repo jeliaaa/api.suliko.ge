@@ -599,6 +599,32 @@ def _unit_price(d: OrderDocument, characters_per_page: int) -> Decimal:
     return d.price
 
 
+async def _issuer(db: AsyncSession) -> tuple[Company, Company | None, CompanyBankAccount]:
+    """Who issues invoices and where they are paid, or a 409 saying what is
+    missing. Shared by the order invoice and the monthly one."""
+    legal = await _company(db, "legal_entity")
+    brand = await _company(db, "brand")
+
+    missing = _missing(legal)
+    if missing:
+        raise ConflictError(
+            "The invoicing company is incomplete: missing "
+            f"{', '.join(missing)}. Fill it in under Settings → Companies."
+        )
+
+    assert legal is not None  # _missing() returns every field when it is None
+    accounts = await _accounts(db, legal.id)
+    primary = next((a for a in accounts if a.is_primary), None) or (
+        accounts[0] if accounts else None
+    )
+    if primary is None or not primary.bank_iban.strip():
+        raise ConflictError(
+            "The invoicing company has no bank account with an IBAN. "
+            "Add one under Settings → Companies."
+        )
+    return legal, brand, primary
+
+
 @invoice_router.get("/{order_id}/invoice", response_model=InvoiceOut)
 async def order_invoice(
     order_id: int,
@@ -633,26 +659,7 @@ async def build_invoice(
     documents_total = Decimal(row[2] or 0)
     paid = Decimal(row[8] or 0)
 
-    legal = await _company(db, "legal_entity")
-    brand = await _company(db, "brand")
-
-    missing = _missing(legal)
-    if missing:
-        raise ConflictError(
-            "The invoicing company is incomplete: missing "
-            f"{', '.join(missing)}. Fill it in under Settings → Companies."
-        )
-
-    assert legal is not None  # _missing() returns every field when it is None
-    accounts = await _accounts(db, legal.id)
-    primary = next((a for a in accounts if a.is_primary), None) or (
-        accounts[0] if accounts else None
-    )
-    if primary is None or not primary.bank_iban.strip():
-        raise ConflictError(
-            "The invoicing company has no bank account with an IBAN. "
-            "Add one under Settings → Companies."
-        )
+    legal, brand, primary = await _issuer(db)
 
     docs = (await db.execute(_invoice_documents_query(order_id))).unique().scalars().all()
     settings = await tenant_settings(db)
