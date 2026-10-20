@@ -14,6 +14,7 @@ from suliko.api.v1 import (
     integrations,
     invoice_templates,
     mfa,
+    monthly_invoice,
     notaries,
     notifications,
     options,
@@ -56,6 +57,7 @@ api_router.include_router(tenant.router)
 api_router.include_router(companies.router)
 api_router.include_router(invoice_templates.router)
 api_router.include_router(companies.invoice_router)
+api_router.include_router(monthly_invoice.router)
 api_router.include_router(integrations.router)
 api_router.include_router(finances.router)
 api_router.include_router(exports.router)
