@@ -61,6 +61,11 @@ class LanguagePairPrice(Base, IdMixin, TenantScoped, TimestampMixin):
     #: What interpreting between these languages costs per minute. Null: the
     #: bureau has not set one, and an oral line is priced by hand.
     price_per_minute: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
+    #: What a bureau pays this freelancer per page, when it sends them an order.
+    #: ``price_per_page`` is what the freelancer charges their own clients; the
+    #: two differ. Null: not set. Only a freelancer who accepts bureau orders
+    #: (``Tenant.accepts_bureau_orders``) is asked for it.
+    price_per_page_bureau: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     @property

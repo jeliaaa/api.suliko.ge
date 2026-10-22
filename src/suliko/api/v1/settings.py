@@ -60,6 +60,9 @@ class GeneralSettings(BaseModel):
     due_days_standard: int
     due_days_express: int
     due_days_urgent: int
+    #: A freelancer's answer to "may other bureaus send you orders?". Null: a
+    #: bureau, or a personal workspace that was never asked.
+    accepts_bureau_orders: bool | None
 
 
 class GeneralSettingsUpdate(BaseModel):
@@ -85,10 +88,12 @@ class GeneralSettingsUpdate(BaseModel):
     due_days_urgent: int | None = Field(default=None, ge=0, le=365)
     organisation_name: str | None = Field(default=None, min_length=1, max_length=255)
     timezone: str | None = Field(default=None, min_length=1, max_length=64)
+    #: Only a personal (freelancer) workspace has one to give.
+    accepts_bureau_orders: bool | None = None
 
 
 #: Fields that live on the tenant row rather than the settings row.
-_TENANT_FIELDS = ("organisation_name", "timezone")
+_TENANT_FIELDS = ("organisation_name", "timezone", "accepts_bureau_orders")
 
 
 def _general_out(row: TenantSettings, tenant: Tenant) -> GeneralSettings:
@@ -107,6 +112,7 @@ def _general_out(row: TenantSettings, tenant: Tenant) -> GeneralSettings:
         due_days_standard=row.due_days_standard,
         due_days_express=row.due_days_express,
         due_days_urgent=row.due_days_urgent,
+        accepts_bureau_orders=tenant.accepts_bureau_orders,
     )
 
 
@@ -157,6 +163,8 @@ async def update_general(
         raise ValidationError(
             f"Unknown timezone {changes['timezone']!r}. Use an IANA name such as Asia/Tbilisi."
         )
+    if "accepts_bureau_orders" in changes and not tenant.is_personal:
+        raise ValidationError("Only a freelancer's personal workspace can accept bureau orders.")
 
     before = {
         k: (tenant.display_name if k == "organisation_name" else getattr(tenant, k))
@@ -170,6 +178,8 @@ async def update_general(
             tenant.display_name = str(value).strip()
         elif field == "timezone":
             tenant.timezone = str(value)
+        elif field == "accepts_bureau_orders":
+            tenant.accepts_bureau_orders = bool(value)
         else:
             setattr(row, field, value)
     await db.flush()
@@ -398,6 +408,9 @@ class PairPriceIn(BaseModel):
     price_per_page: Decimal = Field(ge=0, le=100_000)
     #: What interpreting costs per minute. Left out: not offered for this pair.
     price_per_minute: Decimal | None = Field(default=None, ge=0, le=100_000)
+    #: What a bureau pays per page. Left out on an update: the stored value
+    #: stays, so the Pricing tab (which does not know it) cannot wipe it.
+    price_per_page_bureau: Decimal | None = Field(default=None, ge=0, le=100_000)
     is_active: bool = True
 
 
@@ -407,6 +420,7 @@ class PairPriceOut(BaseModel):
     target_language: str
     price_per_page: Decimal
     price_per_minute: Decimal | None
+    price_per_page_bureau: Decimal | None
     is_active: bool
 
 
@@ -462,6 +476,7 @@ async def create_pair_price(
         target_language=target,
         price_per_page=payload.price_per_page,
         price_per_minute=payload.price_per_minute,
+        price_per_page_bureau=payload.price_per_page_bureau,
         is_active=payload.is_active,
     )
     db.add(row)
@@ -497,6 +512,7 @@ async def update_pair_price(
         "target_language": row.target_language,
         "price_per_page": row.price_per_page,
         "price_per_minute": row.price_per_minute,
+        "price_per_page_bureau": row.price_per_page_bureau,
         "is_active": row.is_active,
     }
 
@@ -504,6 +520,8 @@ async def update_pair_price(
     row.target_language = payload.target_language.lower()
     row.price_per_page = payload.price_per_page
     row.price_per_minute = payload.price_per_minute
+    if "price_per_page_bureau" in payload.model_fields_set:
+        row.price_per_page_bureau = payload.price_per_page_bureau
     row.is_active = payload.is_active
     await db.flush()
 
