@@ -579,18 +579,39 @@ async def import_tarjimnebi(
     commit: bool,
     keep_numbers: bool,
     package_tier: int | None = None,
+    since: str | None = None,
 ) -> int:
-    """Load a tarjimnebi dump into one organisation. Dry run unless ``commit``."""
+    """Load a tarjimnebi dump into one organisation. Dry run unless ``commit``.
+
+    With ``since`` (the dump the earlier import was made from) only what is new
+    or changed since then is applied.
+    """
     import json
     from pathlib import Path
 
-    from suliko.domain.tarjimnebi_import import RefusedError, import_dump, load_dump
+    from suliko.domain.tarjimnebi_import import (
+        RefusedError,
+        SyncSource,
+        import_dump,
+        load_dump,
+    )
 
     path = Path(dump_path)
     if not path.exists():
         fail(f"{path} does not exist.")
         return 1
     dump = load_dump(path)
+    sync = None
+    if since is not None:
+        earlier = Path(since)
+        if not earlier.exists():
+            fail(f"{earlier} does not exist.")
+            return 1
+        sync = SyncSource(previous=load_dump(earlier))
+        say(
+            f"earlier dump: {len(sync.previous.clients)} clients, "
+            f"{len(sync.previous.orders)} orders"
+        )
     say(
         f"dump: {len(dump.clients)} clients, {len(dump.translators)} translators, "
         f"{len(dump.notaries)} notaries, {len(dump.orders)} orders"
@@ -606,7 +627,9 @@ async def import_tarjimnebi(
             return 1
         with tenant_scope(int(tenant.id)):
             try:
-                report = await import_dump(db, int(tenant.id), dump, keep_numbers=keep_numbers)
+                report = await import_dump(
+                    db, int(tenant.id), dump, keep_numbers=keep_numbers, sync=sync
+                )
             except RefusedError as exc:
                 await db.rollback()
                 fail(str(exc))
@@ -625,6 +648,9 @@ async def import_tarjimnebi(
                 ok("Dry run: everything was inserted and rolled back. Nothing is saved.")
                 return 0
             await db.commit()
+            if sync is not None:
+                ok("Committed.")
+                return 0
             out = (
                 path.with_suffix(".idmap.json")
                 if path.is_file()
@@ -1010,6 +1036,10 @@ def main() -> None:
         type=int,
         help="raise the organisation to this order package (never lowers it); 3 is the biggest",
     )
+    p.add_argument(
+        "--since",
+        help="the dump the earlier import was made from: apply only what is new or changed since",
+    )
 
     sub.add_parser("deletion-requests", help="list the accounts closed by a deletion request")
     sub.add_parser(
@@ -1063,6 +1093,7 @@ def main() -> None:
                         commit=args.commit,
                         keep_numbers=args.keep_numbers,
                         package_tier=args.package_tier,
+                        since=args.since,
                     )
                 case "link-suliko-account":
                     await link_suliko_account(args.email, args.suliko_login)
