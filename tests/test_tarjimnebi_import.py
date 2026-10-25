@@ -6,7 +6,9 @@ writes. In-memory SQLite, as in `test_finance_ledgers.py`.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -17,7 +19,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from suliko.db.base import Base
 from suliko.db.tenancy import install_tenant_filter, tenant_scope
-from suliko.domain.tarjimnebi_import import Dump, RefusedError, import_dump, payment_method
+from suliko.domain.tarjimnebi_import import (
+    Dump,
+    RefusedError,
+    SyncSource,
+    import_dump,
+    payment_method,
+)
 from suliko.models.collaboration import OrderComment
 from suliko.models.directory import Client, Notary, Translator, TranslatorLanguagePair
 from suliko.models.finance import (
@@ -290,3 +298,154 @@ async def test_an_existing_client_with_the_same_email_is_reused(db: AsyncSession
         report = await import_dump(db, ACME, _dump(), keep_numbers=False)
         assert report.counts["clients matched to an existing one"] == 1
         assert await _count(db, Client) == 2
+
+
+def _newer() -> Dump:
+    """The same bureau a while later: order 1251 moved on and was paid, 1252 is new."""
+    dump = copy.deepcopy(_dump())
+    moved = dump.orders[1]
+    moved["status"] = "completed"
+    moved["history"] = [{"status": "completed", "at": "2026-10-03 12:00", "user": "Tako"}]
+    moved["payments"] = [{"payment_id": 900, "date": "2026-10-03", "method": "Cash", "amount": 20}]
+    moved["comments"] = [
+        {
+            "comment_id": 5,
+            "author_name": "Tako",
+            "message": "paid",
+            "pinned": False,
+            "created_at": "2026-10-03 12:01:00",
+        }
+    ]
+    dump.clients.append({"id": 804, "name": "Client Three", "client_type": "B2C"})
+    dump.orders.append(
+        {
+            "id": 1252,
+            "date": "2026-10-04",
+            "client_id": 804,
+            "status": "new",
+            "documents": [copy.deepcopy(dump.orders[0]["documents"][0])],
+            "payments": [],
+            "translator_payments": [],
+            "notary_payments": [],
+            "expenses": [],
+            "history": [],
+            "comments": [],
+        }
+    )
+    dump.expenses.append(
+        {
+            "date": "2026-10-04",
+            "category": "Courier",
+            "description": "Later",
+            "order_id": 1252,
+            "amount": 3,
+        }
+    )
+    return dump
+
+
+@pytest.mark.asyncio
+async def test_a_sync_adds_what_is_new_and_appends_what_changed(db: AsyncSession) -> None:
+    with tenant_scope(ACME):
+        await import_dump(db, ACME, _dump(), keep_numbers=False)
+        await db.commit()
+        report = await import_dump(
+            db, ACME, _newer(), keep_numbers=False, sync=SyncSource(previous=_dump())
+        )
+        await db.commit()
+
+        assert report.counts["orders created"] == 1
+        assert report.counts["existing orders brought up to date"] == 1
+        assert report.counts["clients created"] == 1  # only the new client
+        assert await _count(db, Client) == 3
+        assert await _count(db, Order) == 3
+        assert await _count(db, Translator) == 1  # not duplicated
+        assert await _count(db, Expense) == 2  # only the new one added
+        assert await _count(db, OrderComment) == 2
+
+        order = (
+            await db.execute(select(Order).where(Order.source == "tarjimnebi:1251"))
+        ).scalar_one()
+        statuses = (
+            (
+                await db.execute(
+                    select(OrderStatusEvent.status)
+                    .where(OrderStatusEvent.order_id == order.id)
+                    .order_by(OrderStatusEvent.changed_at, OrderStatusEvent.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert statuses[-1] == "completed"
+        paid = (
+            await db.execute(
+                select(func.sum(ClientPaymentAllocation.amount_allocated)).where(
+                    ClientPaymentAllocation.order_id == order.id
+                )
+            )
+        ).scalar_one()
+        assert Decimal(paid) == Decimal("20.00")
+
+
+@pytest.mark.asyncio
+async def test_a_sync_run_twice_changes_nothing_the_second_time(db: AsyncSession) -> None:
+    with tenant_scope(ACME):
+        await import_dump(db, ACME, _dump(), keep_numbers=False)
+        await db.commit()
+        source = SyncSource(previous=_dump())
+        await import_dump(db, ACME, _newer(), keep_numbers=False, sync=source)
+        await db.commit()
+        orders, payments, events = (
+            await _count(db, Order),
+            await _count(db, ClientPayment),
+            await _count(db, OrderStatusEvent),
+        )
+        # Run against the dump it just loaded: nothing differs.
+        again = await import_dump(
+            db, ACME, _newer(), keep_numbers=False, sync=SyncSource(previous=_newer())
+        )
+        assert again.counts.get("orders created", 0) == 0
+        assert await _count(db, Order) == orders
+        assert await _count(db, ClientPayment) == payments
+        assert await _count(db, OrderStatusEvent) == events
+
+
+@pytest.mark.asyncio
+async def test_a_sync_leaves_a_status_changed_in_office_alone(db: AsyncSession) -> None:
+    with tenant_scope(ACME):
+        await import_dump(db, ACME, _dump(), keep_numbers=False)
+        order = (
+            await db.execute(select(Order).where(Order.source == "tarjimnebi:1251"))
+        ).scalar_one()
+        db.add(
+            OrderStatusEvent(
+                order_id=order.id,
+                status="cancelled",
+                changed_at=datetime.now(UTC),
+                note="in Office",
+            )
+        )
+        await db.commit()
+        report = await import_dump(
+            db, ACME, _newer(), keep_numbers=False, sync=SyncSource(previous=_dump())
+        )
+        assert report.counts["status changes not applied (changed in Office)"] == 1
+        last = (
+            (
+                await db.execute(
+                    select(OrderStatusEvent.status)
+                    .where(OrderStatusEvent.order_id == order.id)
+                    .order_by(OrderStatusEvent.changed_at, OrderStatusEvent.id)
+                )
+            )
+            .scalars()
+            .all()[-1]
+        )
+        assert last == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_a_sync_needs_an_earlier_import(db: AsyncSession) -> None:
+    with tenant_scope(ACME), pytest.raises(RefusedError):
+        await import_dump(db, ACME, _newer(), keep_numbers=False, sync=SyncSource(previous=_dump()))

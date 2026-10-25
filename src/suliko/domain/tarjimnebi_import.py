@@ -13,6 +13,10 @@ Two rules shape it:
 * **Money is copied, never recomputed.** Prices, costs and payments arrive as
   they were. Nothing here applies the pricing rules.
 
+A second mode, ``sync`` (see :class:`SyncSource`), brings an earlier import up to
+date from a newer dump: it adds what is new and appends what changed since the
+dump that was loaded before, and never edits or deletes anything in Office.
+
 Not carried over (yet): order files and Google Drive folders (only the Drive
 folder id is kept on the order), portal accounts and passwords, and comments
 on orders that still had unread notes in the old system (reading them would
@@ -150,6 +154,46 @@ class Report:
         self.warnings.append(message)
 
 
+@dataclass
+class SyncSource:
+    """The dump the earlier import was made from; what differs from it is what to apply."""
+
+    previous: Dump
+
+
+def _same_name(a: str | None, b: str | None) -> bool:
+    return bool(a and b) and " ".join(a.split()).casefold() == " ".join(b.split()).casefold()
+
+
+def _delta(raw: dict[str, Any], old: dict[str, Any]) -> dict[str, Any]:
+    """Only what ``raw`` has and ``old`` did not: events, notes and payments.
+
+    Rows are compared by what they mean, not word for word: tarjimnebi has
+    renamed status labels since the first dump, and that is not a change.
+    """
+
+    def added(key: str, identity: Any) -> list[dict[str, Any]]:
+        before = {identity(row) for row in old.get(key) or []}
+        return [row for row in (raw.get(key) or []) if identity(row) not in before]
+
+    def pay(row: dict[str, Any]) -> Any:
+        return (row.get("payment_id"), row.get("person_id"), row.get("date"), row.get("amount"))
+
+    return {
+        "id": raw["id"],
+        "client_id": raw["client_id"],
+        "history": added("history", lambda e: (e.get("status"), e.get("at"), e.get("user"))),
+        "comments": added("comments", lambda c: c.get("comment_id")),
+        "payments": added("payments", pay),
+        "translator_payments": added("translator_payments", pay),
+        "notary_payments": added("notary_payments", pay),
+        "status": raw.get("status"),
+        "_delta": True,
+        "_new_status": raw.get("status") != old.get("status"),
+        "_old_status": old.get("status"),
+    }
+
+
 class RefusedError(Exception):
     """The database is not in a state this import can safely run against."""
 
@@ -160,6 +204,7 @@ async def import_dump(
     dump: Dump,
     *,
     keep_numbers: bool,
+    sync: SyncSource | None = None,
 ) -> Report:
     report = Report()
     tenant = (await db.execute(select(Tenant).where(Tenant.id == tenant_id))).scalar_one()
@@ -177,11 +222,15 @@ async def import_dump(
             select(func.count()).select_from(Order).where(Order.source.like(f"{SOURCE_PREFIX}%"))
         )
     ).scalar_one()
-    if already:
+    if already and sync is None:
         raise RefusedError(
             f"{already} orders from an earlier tarjimnebi import are already here. "
-            "Undo them first; this import will not run twice."
+            "Undo them first, or run it as a sync against the dump it was made from."
         )
+    if sync is not None and not already:
+        raise RefusedError("Nothing from tarjimnebi is here yet; run the full import first.")
+    if sync is not None and keep_numbers:
+        raise RefusedError("--keep-numbers cannot be combined with a sync.")
     if keep_numbers:
         have = (await db.execute(select(func.count()).select_from(Order))).scalar_one() + (
             await db.execute(select(func.count()).select_from(Client))
@@ -191,6 +240,62 @@ async def import_dump(
                 "--keep-numbers needs an organisation with no orders or clients, "
                 "otherwise the old numbers would collide with the new ones."
             )
+
+    # ── Sync: what is already here, and what is new or changed ──────────────
+    legacy_order: dict[int, Order] = {}
+    new_raw: list[dict[str, Any]] = list(dump.orders)
+    delta_raw: list[dict[str, Any]] = []
+    sync_clients: set[int] | None = None
+    sync_translators: set[int] | None = None
+    sync_notaries: set[int] | None = None
+    old_expenses: list[dict[str, Any]] = []
+    if sync is not None:
+        for row in (
+            await db.execute(select(Order).where(Order.source.like(f"{SOURCE_PREFIX}%")))
+        ).scalars():
+            legacy_order[int(str(row.source)[len(SOURCE_PREFIX) :])] = row
+        old_raw_by_id = {o["id"]: o for o in sync.previous.orders}
+        new_raw = [o for o in dump.orders if o["id"] not in legacy_order]
+        report.counts["orders already here"] = sum(
+            1 for o in dump.orders if o["id"] in legacy_order
+        )
+        for gone in sorted(set(legacy_order) - {o["id"] for o in dump.orders}):
+            report.warn(f"Order {gone} is in Office but no longer in tarjimnebi; left as it is.")
+        for raw in dump.orders:
+            if raw["id"] not in legacy_order:
+                continue
+            old = old_raw_by_id.get(raw["id"])
+            if old is None:
+                report.warn(
+                    f"Order {raw['id']} is in Office but was not in the earlier dump; skipped."
+                )
+                continue
+            delta = _delta(raw, old)
+            if old.get("documents") != raw.get("documents"):
+                report.warn(
+                    f"Order {raw['id']}: its documents changed in tarjimnebi. "
+                    "Not applied; check it by hand."
+                )
+                report.add("orders with changed documents (not applied)")
+            news = ("history", "comments", "payments", "translator_payments", "notary_payments")
+            if delta["_new_status"] or any(delta[k] for k in news):
+                delta_raw.append(delta)
+        # Only the people the new orders and the changes need, plus anyone new.
+        prev = sync.previous
+        sync_clients = {c["id"] for c in dump.clients} - {c["id"] for c in prev.clients}
+        sync_clients |= {o["client_id"] for o in new_raw + delta_raw}
+        sync_translators = {t["id"] for t in dump.translators} - {t["id"] for t in prev.translators}
+        sync_translators |= {
+            d["translator_id"]
+            for o in new_raw
+            for d in o.get("documents") or []
+            if d.get("translator_id")
+        }
+        sync_notaries = {n["id"] for n in dump.notaries} - {n["id"] for n in prev.notaries}
+        sync_notaries |= {
+            d["notary_id"] for o in new_raw for d in o.get("documents") or [] if d.get("notary_id")
+        }
+        old_expenses = prev.expenses
 
     # ── Reference data ──────────────────────────────────────────────────────
     languages = {row.code: row for row in (await db.execute(select(Language))).scalars()}
@@ -230,12 +335,32 @@ async def import_dump(
     by_personal = {c.personal_number: c for c in existing_clients if c.personal_number}
     client_of: dict[int, Client] = {}
     fresh_clients: list[tuple[int, Client]] = []
+    by_id = {c.id: c for c in existing_clients}
+    if sync is not None:
+        # A client who already had an order here is known by that order.
+        for raw_order in dump.orders:
+            here = legacy_order.get(raw_order["id"])
+            if here is not None and here.client_id in by_id:
+                client_of[raw_order["client_id"]] = by_id[here.client_id]
     for raw in sorted(dump.clients, key=lambda c: c["id"]):
+        if sync_clients is not None and (raw["id"] not in sync_clients or raw["id"] in client_of):
+            continue
         email = _clip(raw.get("email"), 255)
         personal = _clip(raw.get("personal_number"), 50)
         found_client = (by_email.get(email.casefold()) if email else None) or (
             by_personal.get(personal) if personal else None
         )
+        if found_client is None and sync is not None:
+            phone = _digits(raw.get("phone"))
+            found_client = next(
+                (
+                    c
+                    for c in existing_clients
+                    if _same_name(c.name, raw.get("name"))
+                    and (not phone or _digits(c.phone) == phone)
+                ),
+                None,
+            )
         if found_client is not None:
             client_of[raw["id"]] = found_client
             report.add("clients matched to an existing one")
@@ -264,10 +389,16 @@ async def import_dump(
     translator_of: dict[int, Translator] = {}
     fresh_translators: list[tuple[int, Translator, dict[str, Any]]] = []
     for raw in sorted(dump.translators, key=lambda t: t["id"]):
+        if sync_translators is not None and raw["id"] not in sync_translators:
+            continue
         email = _clip(raw.get("email"), 255)
         found_tr = (tr_by_email.get(email.casefold()) if email else None) or tr_by_phone.get(
             _digits(raw.get("phone"))
         )
+        if found_tr is None and sync is not None:
+            found_tr = next(
+                (t for t in existing_translators if _same_name(t.name, raw.get("name"))), None
+            )
         if found_tr is not None:
             translator_of[raw["id"]] = found_tr
             report.add("translators matched to an existing one")
@@ -294,7 +425,13 @@ async def import_dump(
     no_by_reg = {n.registration_number: n for n in existing_notaries if n.registration_number}
     notary_of: dict[int, Notary] = {}
     for raw in sorted(dump.notaries, key=lambda n: n["id"]):
+        if sync_notaries is not None and raw["id"] not in sync_notaries:
+            continue
         found_no = no_by_reg.get(_clip(raw.get("registration_number"), 100) or "\0")
+        if found_no is None and sync is not None:
+            found_no = next(
+                (n for n in existing_notaries if _same_name(n.name, raw.get("name"))), None
+            )
         if found_no is not None:
             notary_of[raw["id"]] = found_no
             report.add("notaries matched to an existing one")
@@ -332,7 +469,7 @@ async def import_dump(
     # ── Orders ──────────────────────────────────────────────────────────────
     known_statuses = set(STATUS_DEFINITIONS)
     orders: list[tuple[dict[str, Any], Order]] = []
-    for raw in dump.orders:
+    for raw in new_raw:
         owner = client_of.get(raw["client_id"])
         if owner is None:
             report.warn(
@@ -408,9 +545,82 @@ async def import_dump(
         documents_of[raw["id"]] = rows
     await db.flush()
 
+    # Sync: orders that are already here take part in the steps below with only
+    # what is new about them. Their documents are the rows already in Office.
+    latest_status: dict[int, str] = {}
+    orders_all: list[tuple[dict[str, Any], Order]] = list(orders)
+    if sync is not None and delta_raw:
+        here_ids = [legacy_order[d["id"]].id for d in delta_raw]
+        for event in (
+            await db.execute(
+                select(OrderStatusEvent)
+                .where(OrderStatusEvent.order_id.in_(here_ids))
+                .order_by(OrderStatusEvent.changed_at, OrderStatusEvent.id)
+            )
+        ).scalars():
+            latest_status[event.order_id] = event.status
+        stored: dict[int, list[OrderDocument]] = {}
+        for document in (
+            await db.execute(
+                select(OrderDocument)
+                .where(OrderDocument.order_id.in_(here_ids))
+                .order_by(OrderDocument.id)
+            )
+        ).scalars():
+            stored.setdefault(document.order_id, []).append(document)
+        full = {o["id"]: o for o in dump.orders}
+        for delta in delta_raw:
+            order = legacy_order[delta["id"]]
+            raw_docs = full[delta["id"]].get("documents") or []
+            rows_here = stored.get(order.id, [])
+            documents_of[delta["id"]] = (
+                list(zip(raw_docs, rows_here, strict=True))
+                if len(raw_docs) == len(rows_here)
+                else []
+            )
+            orders_all.append((delta, order))
+            report.add("existing orders brought up to date")
+
     # Status history, oldest first; the order's current status must be last.
-    for raw, order in orders:
+    for raw, order in orders_all:
         events = sorted(raw.get("history") or [], key=lambda h: h.get("at") or "")
+        if raw.get("_delta"):
+            if not (events or raw["_new_status"]):
+                continue
+            if latest_status.get(order.id) != raw["_old_status"]:
+                report.warn(
+                    f"Order {raw['id']}: its status was changed in Office after the import "
+                    f"('{latest_status.get(order.id)}'); the tarjimnebi change is not applied."
+                )
+                report.add("status changes not applied (changed in Office)")
+                continue
+            last = latest_status.get(order.id)
+            for ev in events:
+                when = moment(ev.get("at")) or datetime.now(UTC)
+                db.add(
+                    OrderStatusEvent(
+                        order_id=order.id,
+                        status=ev["status"][:60],
+                        changed_at=when,
+                        note=_clip(
+                            f"Imported. Changed by {ev['user']}" if ev.get("user") else "Imported",
+                            500,
+                        ),
+                    )
+                )
+                last = ev["status"]
+                report.add("status events")
+            if raw.get("status") and raw["status"] != last:
+                db.add(
+                    OrderStatusEvent(
+                        order_id=order.id,
+                        status=raw["status"][:60],
+                        changed_at=datetime.now(UTC),
+                        note="Imported (current status)",
+                    )
+                )
+                report.add("status events")
+            continue
         last = None
         for ev in events:
             status = ev["status"]
@@ -456,7 +666,7 @@ async def import_dump(
         report.add("status events", max(len(events), 1))
 
     # Internal notes.
-    for raw, order in orders:
+    for raw, order in orders_all:
         for c in raw.get("comments") or []:
             comment = OrderComment(
                 order_id=order.id,
@@ -469,13 +679,13 @@ async def import_dump(
                 comment.created_at = posted
             db.add(comment)
             report.add("comments")
-        if raw.get("comments") is None:
+        if raw.get("comments") is None and not raw.get("_delta"):
             report.add("orders with comments skipped (unread in the old system)")
 
     # ── Money in: client payments ───────────────────────────────────────────
     async def _money_in() -> None:
         groups: dict[Any, dict[str, Any]] = {}
-        for raw, order in orders:
+        for raw, order in orders_all:
             for i, p in enumerate(raw.get("payments") or []):
                 if not p.get("amount"):
                     continue
@@ -519,7 +729,7 @@ async def import_dump(
     # ── Money out: translators ──────────────────────────────────────────────
     async def _money_out_translators() -> None:
         groups: dict[Any, dict[str, Any]] = {}
-        for raw, order in orders:
+        for raw, order in orders_all:
             docs = documents_of[raw["id"]]
             for i, p in enumerate(raw.get("translator_payments") or []):
                 if not p.get("amount"):
@@ -569,7 +779,7 @@ async def import_dump(
     # ── Money out: notaries (allocated to documents) ────────────────────────
     async def _money_out_notaries() -> None:
         groups: dict[Any, dict[str, Any]] = {}
-        for raw, _ in orders:
+        for raw, _ in orders_all:
             for i, p in enumerate(raw.get("notary_payments") or []):
                 if not p.get("amount"):
                     continue
@@ -629,7 +839,10 @@ async def import_dump(
 
     # ── Expenses ───────────────────────────────────────────────────────────
     order_by_legacy = {raw["id"]: order for raw, order in orders}
+    order_by_legacy.update(legacy_order)
     for e in dump.expenses:
+        if sync is not None and e in old_expenses:
+            continue
         if not e.get("amount") or e["amount"] <= 0:
             continue
         linked = order_by_legacy.get(e["order_id"]) if e.get("order_id") else None
