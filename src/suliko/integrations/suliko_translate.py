@@ -36,6 +36,7 @@ from fastapi import status as http_status
 
 from suliko.config import get_settings
 from suliko.core.errors import AppError, ValidationError
+from suliko.core.slow_requests import upstream_hooks
 from suliko.integrations.suliko_backend import KEY_HEADER, SulikoUnavailableError
 
 log = structlog.get_logger()
@@ -200,7 +201,9 @@ class HttpSulikoTranslator:
         # Preparing a file uploads it twice over (to suliko.ge, and from there
         # to the model's file store), so the limit is a long one.
         self._http = client or httpx.AsyncClient(
-            base_url=base_url.rstrip("/"), timeout=httpx.Timeout(timeout, connect=5.0)
+            base_url=base_url.rstrip("/"),
+            timeout=httpx.Timeout(timeout, connect=5.0),
+            event_hooks=upstream_hooks("suliko_translate"),
         )
         self._languages: tuple[float, list[SulikoLanguage]] | None = None
 

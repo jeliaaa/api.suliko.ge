@@ -22,6 +22,7 @@ import structlog
 
 from suliko.config import get_settings
 from suliko.core.errors import ValidationError
+from suliko.core.slow_requests import upstream_hooks
 from suliko.integrations.suliko_backend import KEY_HEADER, SulikoUnavailableError
 
 log = structlog.get_logger()
@@ -56,7 +57,9 @@ class HttpWordEditorImporter:
     ) -> None:
         self._api_key = api_key
         self._http = client or httpx.AsyncClient(
-            base_url=base_url.rstrip("/"), timeout=httpx.Timeout(timeout, connect=5.0)
+            base_url=base_url.rstrip("/"),
+            timeout=httpx.Timeout(timeout, connect=5.0),
+            event_hooks=upstream_hooks("word_editor"),
         )
 
     async def aclose(self) -> None:
