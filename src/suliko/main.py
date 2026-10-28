@@ -19,6 +19,7 @@ from suliko.config import get_settings
 from suliko.core import build_info
 from suliko.core.errors import install_error_handlers
 from suliko.core.gateway import GatewayMiddleware
+from suliko.core.slow_requests import SlowRequestMiddleware
 from suliko.db.session import dispose_engine
 from suliko.db.tenancy import install_tenant_filter
 from suliko.integrations.object_storage import close_object_storage, get_object_storage
@@ -167,6 +168,9 @@ def create_app() -> FastAPI:
     # else touches the request — but it exempts OPTIONS so CORS preflight,
     # which browsers send without custom headers, still succeeds.
     app.add_middleware(GatewayMiddleware)
+
+    # Added last, so it is outermost and times everything, the gateway included.
+    app.add_middleware(SlowRequestMiddleware)
 
     # Narrow by design: only the BFF calls this API, server-side.
     app.add_middleware(

@@ -69,6 +69,11 @@ class Settings(BaseSettings):
     #: worker*. If you scale out, install Redis (or Memurai) and unset this.
     rate_limit_single_instance: bool = False
 
+    #: A request taking at least this long is logged as ``slow_request``, with
+    #: the time it spent waiting on suliko.ge and the Word editor (see
+    #: `core/slow_requests.py`). 0 switches it off.
+    slow_request_seconds: float = 1.0
+
     login_max_attempts_per_account: int = 5
     login_max_attempts_per_ip: int = 20
     login_window_seconds: int = 900  # 15 minutes
