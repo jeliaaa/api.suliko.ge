@@ -1827,6 +1827,8 @@ class SessionInfo(BaseModel):
     is_impersonated: bool
     #: IANA zone for formatting dates and deciding "today" on screen.
     timezone: str
+    #: Whether the organisation has Claude Translate (switched on by a superuser).
+    claude_translate: bool = False
     #: Whether this user has a confirmed second factor (Account screen).
     has_mfa: bool
     #: Whether two-factor is switched on at all (`MFA_ENFORCED`). Off, a factor
@@ -1887,6 +1889,7 @@ async def current_session(
         mfa_satisfied=(session.mfa_satisfied_at is not None or not get_settings().mfa_enforced),
         is_impersonated=session.is_impersonated,
         timezone=session.timezone,
+        claude_translate=session.claude_translate,
         has_mfa=session.has_mfa,
         mfa_enforced=get_settings().mfa_enforced,
         email_verified=session.email_verified,
