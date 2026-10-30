@@ -6,8 +6,8 @@ worker) asks this API for jobs, translates each file to a Word document and
 sends it back. Nothing is translated when a file is merely uploaded, and the
 worker only ever sees files someone picked.
 
-This file is the contract between Suliko Office and the worker. The worker
-itself is not part of this repository.
+This file is the contract between Suliko Office and the worker. A ready-made worker for
+a Windows server is in `worker/` (see `worker/README.md`).
 
 ## What Office does
 
