@@ -306,6 +306,20 @@ class Settings(BaseSettings):
     #: suliko.ge takes files up to 20 MB; a larger one is refused here, before
     #: the upload, with a message that says so.
     suliko_translate_max_bytes: int = 20 * 1024 * 1024
+    # ── Claude Translate (`api/v1/claude_worker.py`) ─────────────────────────
+    #: Bearer tokens the Claude Code server may present, comma separated so a
+    #: new one can be added before the old one is removed. Empty switches the
+    #: worker API off: every call is refused with 401.
+    claude_worker_tokens: SecretStr = SecretStr("")
+    #: Addresses the worker API answers to, comma separated. Empty: any address
+    #: holding a token. The address is the one the reverse proxy saw.
+    claude_worker_allowed_ips: str = ""
+    #: A job the worker has held longer than this goes back to the queue.
+    claude_job_stuck_minutes: int = 30
+    #: A job that has been put back this often is failed instead.
+    claude_job_max_attempts: int = 3
+    #: A worker silent for this long is shown as down.
+    claude_worker_offline_seconds: int = 300
     #: The most an edited translation may weigh when it is saved back.
     translation_html_max_bytes: int = 5 * 1024 * 1024
     #: The Word editor (`integrations/word_editor.py`): how long suliko.ge may

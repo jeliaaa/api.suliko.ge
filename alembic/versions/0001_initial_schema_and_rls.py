@@ -115,6 +115,9 @@ LATER_REVISION_TABLES = frozenset(
         "invoice_templates",
         # 0034
         "billing_free_months",
+        # 0038
+        "claude_translation_jobs",
+        "claude_worker_heartbeats",
     }
 )
 

@@ -71,6 +71,13 @@ class Tenant(Base, IdMixin, TimestampMixin):
     #: the personal workspace is created. None: never asked (every bureau, and
     #: personal workspaces made before the question existed).
     accepts_bureau_orders: Mapped[bool | None] = mapped_column(Boolean, default=None)
+    #: Whether the organisation may use Claude Translate: a person clicks, a
+    #: separate Claude Code server does the work (`models/claude_translation.py`).
+    #: Granted per organisation, a bureau or a freelancer's personal account
+    #: alike, by a superuser; off for everyone else.
+    claude_translate_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
     suspended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     #: A person's own freelancer workspace — the "Personal account" in the
     #: sign-in chooser. Created on first pick (`domain.accounts`), owned by
