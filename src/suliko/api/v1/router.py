@@ -6,6 +6,8 @@ from suliko.api.v1 import (
     auth,
     billing,
     calculator,
+    claude_translate,
+    claude_worker,
     clients,
     companies,
     exports,
@@ -48,6 +50,7 @@ api_router.include_router(orders.router)
 api_router.include_router(order_files.router)
 api_router.include_router(order_mail.router)
 api_router.include_router(order_translations.router)
+api_router.include_router(claude_translate.router)
 api_router.include_router(order_word_editor.router)
 api_router.include_router(calculator.router)
 api_router.include_router(reports.router)
@@ -78,6 +81,9 @@ api_router.include_router(billing.router)
 # session chain in api/deps.py; see api/portal_deps.py.
 api_router.include_router(portal.router)
 api_router.include_router(portal_admin.router)
+
+# The Claude Code server: a bearer token, not a session. See claude_worker.py.
+api_router.include_router(claude_worker.router)
 
 # Every screen in Suliko Office now has a router. What is deliberately still absent:
 #

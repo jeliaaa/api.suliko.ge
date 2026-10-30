@@ -55,6 +55,16 @@ EXEMPT_PATHS = frozenset({"/health"})
 PORTAL_TICKET_PARAM = "ticket"
 
 
+def _is_worker_request(request: Request) -> bool:
+    """The Claude Code server's calls (`api/v1/claude_worker.py`).
+
+    That server is not the frontend and holds no gateway secret. Every route
+    there demands its own bearer token, and optionally its address, and answers
+    401 to anything else.
+    """
+    return request.url.path.startswith(f"{get_settings().api_v1_prefix}/worker/")
+
+
 def _is_portal_ticket_request(request: Request) -> bool:
     prefix = f"{get_settings().api_v1_prefix}/portal/"
     return (
@@ -77,7 +87,7 @@ class GatewayMiddleware(BaseHTTPMiddleware):
         if request.url.path in EXEMPT_PATHS or request.method == "OPTIONS":
             return await call_next(request)
 
-        if _is_portal_ticket_request(request):
+        if _is_portal_ticket_request(request) or _is_worker_request(request):
             return await call_next(request)
 
         presented = request.headers.get(HEADER_NAME, "")

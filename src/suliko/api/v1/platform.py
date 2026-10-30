@@ -145,6 +145,9 @@ class TenantSummary(BaseModel):
     package_tier: int
     #: Which set of packages it is on: "bureau" or "freelancer".
     package_audience: str
+    #: Whether the organisation may use Claude Translate (a worker on a
+    #: separate Claude Code server translates files its staff pick).
+    claude_translate: bool
     locale: str
     users: int
     active_users: int
@@ -247,6 +250,22 @@ class StatusChange(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
 
 
+class ClaudeTranslateChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+
+
+class ClaudeWorkerStatus(BaseModel):
+    """Whether the Claude Code server is about, and what is waiting for it."""
+
+    online: bool
+    last_seen: datetime | None
+    #: Jobs waiting in organisations that have the feature, and jobs a worker holds.
+    queued: int
+    translating: int
+
+
 class PlatformTotals(BaseModel):
     tenants: int
     active_tenants: int
@@ -321,6 +340,7 @@ def _summary(tenant: Tenant, *, users: int, active_users: int, orders: int) -> T
         onboarding_required=parse(tenant.plan) is None,
         package_tier=tenant.package_tier,
         package_audience=audience_of(tenant),
+        claude_translate=tenant.claude_translate_enabled,
         locale=tenant.locale,
         users=users,
         active_users=active_users,
@@ -573,6 +593,91 @@ async def set_tenant_status(
 
     return _summary(
         tenant, users=int(counts[0]), active_users=int(counts[1] or 0), orders=figures.orders
+    )
+
+
+@router.put("/tenants/{tenant_id}/claude-translate", response_model=TenantSummary)
+async def set_claude_translate(
+    tenant_id: int,
+    payload: ClaudeTranslateChange,
+    db: Db,
+    session: Superuser,
+) -> TenantSummary:
+    """Give an organisation Claude Translate, or take it away.
+
+    Turning it off keeps the jobs it has: the worker simply stops being asked
+    for them, and they go on where they were if it is turned on again.
+    """
+    tenant = await _tenant_or_404(db, tenant_id)
+    before = tenant.claude_translate_enabled
+    with bypass_tenant_scope():
+        tenant.claude_translate_enabled = payload.enabled
+        await db.flush()
+
+    if before != payload.enabled:
+        from suliko.core.audit import record
+
+        await record(
+            db,
+            session,
+            action="platform.claude_translate_changed",
+            entity_type="tenant",
+            entity_id=tenant.id,
+            tenant_id=tenant.id,
+            before={"enabled": before},
+            after={"enabled": payload.enabled},
+        )
+
+    figures = await _figures(db, tenant_id)
+    with bypass_tenant_scope():
+        counts = (
+            await db.execute(
+                select(func.count(), func.coalesce(func.sum(_ACTIVE), 0)).where(
+                    User.tenant_id == tenant_id
+                )
+            )
+        ).one()
+    return _summary(
+        tenant, users=int(counts[0]), active_users=int(counts[1] or 0), orders=figures.orders
+    )
+
+
+@router.get("/claude-worker", response_model=ClaudeWorkerStatus)
+async def claude_worker_status(db: Db, _: Superuser) -> ClaudeWorkerStatus:
+    """When the Claude Code server last asked for work, and the queue it faces."""
+    from suliko.domain.claude_translate import last_heartbeat, worker_online
+    from suliko.models.claude_translation import ClaudeJobStatus, ClaudeTranslationJob
+
+    seen = await last_heartbeat(db)
+    with bypass_tenant_scope():
+        # Only the organisations that have the feature are counted, and RLS
+        # shows this session just its own tenant's rows, so the figures are
+        # taken one organisation at a time.
+        enabled = (
+            (await db.execute(select(Tenant.id).where(Tenant.claude_translate_enabled.is_(True))))
+            .scalars()
+            .all()
+        )
+    queued = translating = 0
+    for tenant_id in enabled:
+        with tenant_scope(int(tenant_id)):
+            await bind_tenant_guc(db, int(tenant_id))
+            rows = await db.execute(
+                select(ClaudeTranslationJob.status, func.count())
+                .where(
+                    ClaudeTranslationJob.status.in_(
+                        (ClaudeJobStatus.QUEUED, ClaudeJobStatus.TRANSLATING)
+                    )
+                )
+                .group_by(ClaudeTranslationJob.status)
+            )
+            for job_status, count in rows:
+                if job_status is ClaudeJobStatus.QUEUED:
+                    queued += int(count)
+                else:
+                    translating += int(count)
+    return ClaudeWorkerStatus(
+        online=worker_online(seen), last_seen=seen, queued=queued, translating=translating
     )
 
 

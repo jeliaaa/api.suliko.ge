@@ -63,6 +63,8 @@ class TenantOut(BaseModel):
     status: TenantStatus
     locale: str
     onboarding_required: bool
+    #: Whether a superuser has given this organisation Claude Translate.
+    claude_translate: bool = False
     plans: dict[str, PlanOut]
     current: PlanOut
 
@@ -128,6 +130,7 @@ async def get_tenant(db: Db, session: CurrentSession) -> TenantOut:
         status=tenant.status,
         locale=tenant.locale,
         onboarding_required=stored is None,
+        claude_translate=tenant.claude_translate_enabled,
         plans={plan.value: _plan_out(plan, chosen=plan == stored) for plan in TenantPlan},
         current=_plan_out(session.plan, chosen=stored is not None),
     )

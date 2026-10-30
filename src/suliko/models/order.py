@@ -137,6 +137,10 @@ class Order(Base, IdMixin, TenantScoped, TimestampMixin):
 
     google_drive_folder: Mapped[str | None] = mapped_column(String(100), default=None)
     notes: Mapped[str | None] = mapped_column(Text, default=None)
+    #: What a translator of this order should know: spellings of names, a
+    #: glossary, rules for the client. Unlike ``notes`` it is sent to Claude
+    #: Translate with every file of the order.
+    translation_instructions: Mapped[str | None] = mapped_column(Text, default=None)
 
     created_by_user_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), default=None

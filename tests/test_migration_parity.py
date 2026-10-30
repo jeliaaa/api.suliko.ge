@@ -90,6 +90,9 @@ LATER_REVISIONS = (
     "0036_accepts_bureau_orders.py",
     # language_pair_prices.price_per_page_bureau — see test_migration_0037.py.
     "0037_pair_price_bureau.py",
+    # claude_translation_jobs, claude_worker_heartbeats and two columns - see
+    # test_migration_0038.py.
+    "0038_claude_translate.py",
 )
 
 

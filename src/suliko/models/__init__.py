@@ -13,6 +13,11 @@ from suliko.models.billing import (
     BillingInvoiceStatus,
     BillingPackage,
 )
+from suliko.models.claude_translation import (
+    ClaudeJobStatus,
+    ClaudeTranslationJob,
+    ClaudeWorkerHeartbeat,
+)
 from suliko.models.cms import PageStatus, ServicePage, SiteString
 from suliko.models.collaboration import (
     Notification,
@@ -95,6 +100,9 @@ __all__ = [
     "AccountDeletionRequest",
     "ActorType",
     "AuditLog",
+    "ClaudeJobStatus",
+    "ClaudeTranslationJob",
+    "ClaudeWorkerHeartbeat",
     "Base",
     "BillingFreeMonth",
     "BillingInvoice",

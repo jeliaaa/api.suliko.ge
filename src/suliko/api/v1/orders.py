@@ -178,6 +178,8 @@ class OrderCreate(BaseModel):
     delivery_address: str | None = Field(default=None, max_length=500)
     source: str | None = Field(default=None, max_length=50)
     notes: str | None = Field(default=None, max_length=NOTES_MAX)
+    #: For Claude Translate: names, a glossary, rules. Blank is none.
+    translation_instructions: str | None = Field(default=None, max_length=NOTES_MAX)
 
 
 class OrderUpdate(BaseModel):
@@ -197,6 +199,8 @@ class OrderUpdate(BaseModel):
     #: Omitted with a handover change -> the tenant's fee or zero.
     delivery_cost: Money | None = None
     notes: str | None = Field(default=None, max_length=NOTES_MAX)
+    #: Null or blank clears it.
+    translation_instructions: str | None = Field(default=None, max_length=NOTES_MAX)
 
 
 class OrderDocumentUpdate(BaseModel):
@@ -339,6 +343,7 @@ class OrderDetail(OrderSummary):
     delivery_cost: Decimal
     source: str | None
     notes: str | None
+    translation_instructions: str | None
     documents_total: Decimal
     translator_total: Decimal | None
     notary_total: Decimal | None
@@ -735,6 +740,7 @@ async def _load_detail(
         delivery_cost=order.delivery_cost,
         source=order.source,
         notes=order.notes,
+        translation_instructions=order.translation_instructions,
         documents_total=Decimal(row[2] or 0),
         translator_total=cost(Decimal(row[3] or 0)),
         notary_total=cost(Decimal(row[4] or 0)),
@@ -896,6 +902,7 @@ async def create_order(payload: OrderCreate, db: Db, session: OrdersWriter) -> O
         ),
         source=order_source(payload.source),
         notes=payload.notes,
+        translation_instructions=(payload.translation_instructions or "").strip() or None,
         created_by_user_id=session.user_id,
     )
     db.add(order)
@@ -995,6 +1002,10 @@ async def update_order(
 
     if "identifier" in changes:
         changes["identifier"] = (changes["identifier"] or "").strip() or None
+    if "translation_instructions" in changes:
+        changes["translation_instructions"] = (
+            changes["translation_instructions"] or ""
+        ).strip() or None
 
     for field, value in changes.items():
         setattr(order, field, value)
