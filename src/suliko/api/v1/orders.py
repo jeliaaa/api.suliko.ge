@@ -69,6 +69,7 @@ from suliko.models.finance import (
     NotaryPaymentAllocation,
     TranslatorPaymentAllocation,
 )
+from suliko.models.integration import IntegrationCredential, IntegrationProvider
 from suliko.models.order import (
     CopyType,
     HandoverMethod,
@@ -344,6 +345,11 @@ class OrderDetail(OrderSummary):
     source: str | None
     notes: str | None
     translation_instructions: str | None
+    #: The order's folder in the organisation's Google Drive, once made.
+    drive_folder_url: str | None = None
+    #: The organisation has Google Drive connected, so the order page offers
+    #: the copy button.
+    drive_connected: bool = False
     documents_total: Decimal
     translator_total: Decimal | None
     notary_total: Decimal | None
@@ -741,6 +747,19 @@ async def _load_detail(
         source=order.source,
         notes=order.notes,
         translation_instructions=order.translation_instructions,
+        drive_folder_url=(
+            f"https://drive.google.com/drive/folders/{order.google_drive_folder}"
+            if order.google_drive_folder
+            else None
+        ),
+        drive_connected=bool(
+            await db.scalar(
+                select(IntegrationCredential.id).where(
+                    IntegrationCredential.provider == IntegrationProvider.GOOGLE_DRIVE,
+                    IntegrationCredential.is_enabled.is_(True),
+                )
+            )
+        ),
         documents_total=Decimal(row[2] or 0),
         translator_total=cost(Decimal(row[3] or 0)),
         notary_total=cost(Decimal(row[4] or 0)),
@@ -942,6 +961,11 @@ async def create_order(payload: OrderCreate, db: Db, session: OrdersWriter) -> O
         subject_label=f"{client.name} #{order.number}",
     )
     await db.flush()
+
+    # The order's Drive folder, if the organisation has one connected.
+    from suliko.domain import drive_mirror
+
+    drive_mirror.schedule_sync(session.tenant_id, order.id)
 
     return await _load_detail(order.id, db, session)
 
@@ -1522,3 +1546,39 @@ async def delete_order(
     # Documents and status events cascade.
     await db.delete(order)
     await db.flush()
+
+
+class DriveSyncOut(BaseModel):
+    #: False: the organisation has no Google Drive connected (or not enabled).
+    connected: bool
+    copied: int
+    #: Files still not in Drive after this run; each says why on its own row.
+    failed: int
+    drive_folder_url: str | None = None
+
+
+@router.post("/{order_id}/drive/sync", response_model=DriveSyncOut)
+async def sync_order_to_drive(order_id: int, db: Db, session: OrdersWriter) -> DriveSyncOut:
+    """Copy whatever of the order's files is not in Google Drive yet, now.
+
+    The same work runs by itself after every upload; this is the button for a
+    run that failed (Google was down, the key was wrong) and for an order made
+    before Drive was connected.
+    """
+    if await db.get(Order, order_id) is None:
+        raise NotFoundError("Order not found.")
+    # Everything this request changed is committed before the sync looks.
+    await db.commit()
+    from suliko.domain import drive_mirror
+
+    result = await drive_mirror.sync_order(session.tenant_id, order_id)
+    return DriveSyncOut(
+        connected=result.connected,
+        copied=result.copied,
+        failed=result.failed,
+        drive_folder_url=(
+            f"https://drive.google.com/drive/folders/{result.folder_id}"
+            if result.folder_id
+            else None
+        ),
+    )

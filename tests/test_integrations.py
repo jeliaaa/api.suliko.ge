@@ -144,7 +144,7 @@ def test_optional_fields_do_not_block_completeness() -> None:
     spec = PROVIDERS[IntegrationProvider.GOOGLE_DRIVE]
     row = Row(
         IntegrationProvider.GOOGLE_DRIVE,
-        config={},  # root_folder_id and impersonate_subject are optional
+        config={"root_folder_id": "1abc"},  # impersonate_subject is optional
         secrets={"service_account_json": "{}"},
     )
     assert _out(row, spec, TENANT).is_complete  # type: ignore[arg-type]

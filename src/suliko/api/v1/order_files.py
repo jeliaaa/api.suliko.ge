@@ -86,6 +86,10 @@ class StaffFileOut(BaseModel):
     #: Whether the Word editor can open it: see
     #: `domain.order_files.is_editable_translation`.
     editable: bool = False
+    #: Copied to the organisation's Google Drive.
+    in_drive: bool = False
+    #: Why the last copy to Drive failed.
+    drive_error: str | None = None
 
 
 def _out(row: OrderFile) -> StaffFileOut:
@@ -102,6 +106,8 @@ def _out(row: OrderFile) -> StaffFileOut:
         vault_order=vault_no,
         downloadable=downloadable(row),
         editable=is_editable_translation(row),
+        in_drive=row.drive_file_id is not None,
+        drive_error=row.drive_error,
     )
 
 

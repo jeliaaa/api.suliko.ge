@@ -93,15 +93,16 @@ PROVIDERS: dict[IntegrationProvider, ProviderSpec] = {
     IntegrationProvider.GOOGLE_DRIVE: ProviderSpec(
         provider=IntegrationProvider.GOOGLE_DRIVE,
         name="Google Drive",
-        summary="Per-order folders and document storage.",
-        enables="Attaching documents to orders and archiving generated invoices.",
+        summary="A copy of every order's files in a shared Google Drive folder.",
+        enables="A folder per order with the source files and the translations, "
+        "next to the files Suliko keeps itself.",
         fields=(
             FieldSpec(
                 key="root_folder_id",
                 label="Root folder ID",
-                required=False,
-                help="The Drive folder new order folders are created inside. "
-                "Leave blank to use the service account's own My Drive.",
+                help="The shared Drive folder the order folders are created in "
+                "(the long id at the end of its link). Add the service account's "
+                "email to that shared drive as Content manager.",
             ),
             FieldSpec(
                 key="impersonate_subject",
@@ -276,15 +277,10 @@ class CheckResult(BaseModel):
 
 #: Providers that exist in the registry but are NOT offered on the screen.
 #:
-#: Google Drive: order files used to live in each bureau's Google Shared
-#: Drive. They are now stored by Suliko itself (`integrations/object_storage.py`),
-#: so there is nothing left for a bureau to connect. Even before that, this
-#: generic card asked for a per-bureau service-account key that nothing ever
-#: read.
-#:
-#: Kept in `PROVIDERS` rather than deleted, because the enum value is baked
-#: into a CHECK constraint (revision 0003) and existing rows may hold it.
-HIDDEN_PROVIDERS: frozenset[IntegrationProvider] = frozenset({IntegrationProvider.GOOGLE_DRIVE})
+#: Empty since Google Drive came back as a mirror of the order files
+#: (`domain/drive_mirror.py`): Suliko still stores the files itself, Drive is a
+#: copy. The mechanism stays for the next provider that is retired.
+HIDDEN_PROVIDERS: frozenset[IntegrationProvider] = frozenset()
 
 
 def _require_allowed(session: AuthenticatedSession, provider: IntegrationProvider) -> None:
@@ -477,6 +473,32 @@ async def save_integration(
     return _out(row, spec, session.tenant_id)
 
 
+async def _check_drive(config: dict[str, Any], secrets: dict[str, str]) -> CheckResult:
+    """The one live check so far: sign in and open the root folder."""
+    from suliko.integrations.google_drive import DriveError, GoogleDrive, ServiceAccount
+
+    try:
+        account = ServiceAccount.parse(
+            secrets.get("service_account_json", ""),
+            subject=str(config.get("impersonate_subject", "")),
+        )
+    except ValidationError as exc:
+        return CheckResult(ok=False, detail=str(exc))
+    drive = GoogleDrive(account)
+    try:
+        folder = await drive.get_folder(str(config.get("root_folder_id", "")).strip())
+    except DriveError as exc:
+        return CheckResult(
+            ok=False,
+            detail=f"{exc} Share the folder's drive with {account.email} as Content manager.",
+        )
+    finally:
+        await drive.aclose()
+    return CheckResult(
+        ok=True, detail=f"Connected. Order folders will be created in “{folder.name}”."
+    )
+
+
 @router.post("/{provider}/check", response_model=CheckResult)
 async def check_integration(
     provider: IntegrationProvider,
@@ -518,6 +540,8 @@ async def check_integration(
             detail="The stored secrets cannot be decrypted with the current "
             "ENCRYPTION_MASTER_KEY. Re-enter them.",
         )
+    elif provider is IntegrationProvider.GOOGLE_DRIVE:
+        result = await _check_drive(row.config, secrets)
     else:
         result = CheckResult(
             ok=True,
