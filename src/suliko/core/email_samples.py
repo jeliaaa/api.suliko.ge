@@ -59,7 +59,7 @@ def sample_emails() -> dict[str, Email]:
 
     return {
         "01-reset-password": auth._reset_email(account, _RESET, 60),
-        "02-reset-on-suliko-ge": auth._suliko_password_email(account, "https://suliko.ge/login"),
+        "02-reset-on-suliko-ge": auth._suliko_password_email(account, "https://suliko.ge/sign-in"),
         "03-confirm-email": auth._verification_email(user, tenant, _RESET, 72),
         "04-personal-enabled": auth._personal_enabled_email(
             account, "https://office.suliko.ge/ka/login"
