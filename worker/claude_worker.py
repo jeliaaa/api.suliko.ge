@@ -335,14 +335,18 @@ def declared_orientation(html: str) -> bool | None:
     return None if found is None else found.group(1).lower() == "landscape"
 
 
-def page_layouts(*, wide: bool, landscape: bool) -> list[PageLayout]:
-    """From the roomiest page to the tightest. Margins go first, then type size;
-    a wide table may go down to 8 pt, other text never below 10."""
-    steps = (
-        ((10.0, 1.2), (9.0, 1.2), (8.5, 1.0), (8.0, 1.0))
-        if wide
-        else ((11.0, 2.0), (11.0, 1.5), (10.5, 1.5), (10.0, 1.5))
-    )
+def page_layouts(*, wide: bool, landscape: bool, columns: int = 0) -> list[PageLayout]:
+    """From the roomiest page to the tightest. Margins go first, then type size.
+    Ordinary text never goes below 10 pt. A wide table may go down to 6 pt, because
+    the original it mirrors is printed that small; with 20 or more columns the
+    larger steps are skipped, as they cannot fit."""
+    if wide:
+        steps = [(10.0, 1.2), (9.0, 1.2), (8.5, 1.0), (8.0, 1.0)]
+        steps += [(7.5, 1.0), (7.0, 0.8), (6.5, 0.8), (6.0, 0.8)]
+        if columns >= 20:
+            steps = steps[3:]
+    else:
+        steps = [(11.0, 2.0), (11.0, 1.5), (10.5, 1.5), (10.0, 1.5)]
     return [PageLayout(landscape=landscape, size=size, margin_cm=margin) for size, margin in steps]
 
 
@@ -411,13 +415,13 @@ def make_docx(config: Config, html: str, *, language: str, pages: int | None) ->
     columns = widest_table(html)
     wide = columns >= WIDE_COLUMNS
     landscape = declared if declared is not None else wide
-    layouts = page_layouts(wide=wide, landscape=landscape)
+    layouts = page_layouts(wide=wide, landscape=landscape, columns=columns)
     soffice = find_soffice(config)
 
     if pages is None or soffice is None:
         if not (wide or landscape):
             return html_to_docx(html, language=language)
-        step = (3 if columns >= 20 else 1) if wide else 0
+        step = (0 if columns >= 20 else 1) if wide else 0
         return html_to_docx(html, language=language, layout=layouts[step])
 
     docx = b""
