@@ -62,3 +62,8 @@ class OrderFile(Base, IdMixin, TenantScoped, TimestampMixin):
     uploaded_by: Mapped[str] = mapped_column(String(500), nullable=False)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     deleted_by: Mapped[str | None] = mapped_column(String(500), default=None)
+    #: The copy in the organisation's Google Drive (``domain/drive_mirror.py``).
+    #: NULL: not copied yet, or no Drive connected.
+    drive_file_id: Mapped[str | None] = mapped_column(String(100), default=None)
+    #: Why the last copy failed. Cleared by the next success.
+    drive_error: Mapped[str | None] = mapped_column(String(300), default=None)

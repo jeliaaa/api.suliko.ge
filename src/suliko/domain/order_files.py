@@ -290,6 +290,11 @@ async def upload_document_file(
     )
     db.add(row)
     await db.flush()
+    # A copy in the organisation's Google Drive, if one is connected. Started in
+    # the background; it never fails the upload.
+    from suliko.domain import drive_mirror
+
+    drive_mirror.schedule_sync(order.tenant_id, order.id)
     return row
 
 

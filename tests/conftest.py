@@ -46,3 +46,11 @@ def _reset_rate_limiter() -> None:
 @pytest.fixture(scope="session")
 def settings():  # type: ignore[no-untyped-def]
     return get_settings()
+
+
+@pytest.fixture(autouse=True)
+def _no_drive_mirror(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Uploads start a background copy to Google Drive; tests have none."""
+    from suliko.domain import drive_mirror
+
+    monkeypatch.setattr(drive_mirror, "schedule_sync", lambda *args, **kwargs: None)

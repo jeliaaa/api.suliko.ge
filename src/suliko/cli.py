@@ -858,6 +858,38 @@ async def purge_files() -> int:
     return 0
 
 
+async def drive_sync() -> int:
+    """Copy every order file not yet in Google Drive, for each organisation
+    that has Drive connected. For files a request-time copy missed (Google was
+    down) and for orders made before Drive was connected. Safe to repeat."""
+    from suliko.domain import drive_mirror
+    from suliko.models.order import Order, OrderDocument
+    from suliko.models.order_file import OrderFile
+
+    storage = get_object_storage()
+    if not storage.configured:
+        fail("STORAGE_BACKEND is not set: nothing to copy from")
+        return 1
+    async with get_sessionmaker()() as db, db.begin():
+        with bypass_tenant_scope():
+            pending = (
+                await db.execute(
+                    select(Order.tenant_id, Order.id)
+                    .join(OrderDocument, OrderDocument.order_id == Order.id)
+                    .join(OrderFile, OrderFile.order_document_id == OrderDocument.id)
+                    .where(OrderFile.drive_file_id.is_(None), OrderFile.deleted_at.is_(None))
+                    .distinct()
+                )
+            ).all()
+    copied = failed = 0
+    for tenant_id, order_id in pending:
+        result = await drive_mirror.sync_order(tenant_id, order_id, storage)
+        copied += result.copied
+        failed += result.failed
+    say(f"{copied} file(s) copied to Drive, {failed} failed, {len(pending)} order(s) looked at")
+    return 1 if failed else 0
+
+
 # ── Interactive bootstrap ───────────────────────────────────────────────────
 
 
@@ -978,6 +1010,10 @@ def main() -> None:
         "purge-files", help="delete the bytes of order files removed past the retention period"
     )
 
+    sub.add_parser(
+        "drive-sync", help="copy order files not yet in Google Drive, for organisations with Drive"
+    )
+
     p = sub.add_parser("create-tenant", help="register a partner bureau")
     p.add_argument("--slug", required=True)
     p.add_argument("--name", required=True)
@@ -1078,6 +1114,8 @@ def main() -> None:
                     return await schema_diff()
                 case "purge-files":
                     return await purge_files()
+                case "drive-sync":
+                    return await drive_sync()
                 case "create-tenant":
                     await create_tenant(args.slug, args.name, args.locale)
                 case "create-superuser":
