@@ -64,13 +64,17 @@ hyphens in a row. This applies to every translation.
 - Hyphens inside things copied exactly stay: dates (`04-10-2004`), standard codes,
   serial and licence numbers, product designations. Those are data.
 
-### 4. Type size
+### 4. Page and type size
 
-You write HTML, and the converter sets the page (A4, 2 cm margins, 11 pt single
-spacing), so you cannot and should not change sizes. Do not add empty paragraphs or
-repeated `br` to push things around, and keep a table in one piece rather than
-splitting it into several. Compactness comes from mirroring the original and adding
-nothing to it.
+You write HTML; the worker builds the Word file and fits it to the original's page
+count. You only say one thing about the page: if the original is landscape (its content
+is wider than tall, such as a long table, even when the scan is turned sideways), make
+the first line of `translation.html` the comment `<!--page: landscape-->`.
+
+Do not try to control sizes or margins, and do not add empty paragraphs or repeated
+`br` to push things around. Keep a table in one piece, with all its columns, rather
+than splitting it into several. Mirror the original and add nothing to it: that is what
+keeps the page count the same.
 
 ### 5. Passports
 

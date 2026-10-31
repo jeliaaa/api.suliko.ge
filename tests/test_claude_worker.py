@@ -374,3 +374,151 @@ def test_a_dash_that_survives_the_fix_is_not_looped_on(
 
     assert len(runs) == 2
     assert len(office.uploads) == 1
+
+
+# ── The Word file: landscape, widths, fitting ────────────────────────────────
+
+import re  # noqa: E402
+
+import translation_docx as converter  # noqa: E402
+
+
+def wide_table(columns: int = 31, rows: int = 5, *, first: str = "Heat no") -> str:
+    head = f"<th>{first}</th>" + "".join(f"<th>C{i}</th>" for i in range(1, columns))
+    body = "<td>A-1234567 long name</td>" + "".join(
+        f"<td>0.0{i % 9}</td>" for i in range(1, columns)
+    )
+    return f'<table border="1"><tr>{head}</tr>' + f"<tr>{body}</tr>" * rows + "</table>"
+
+
+def document_xml(docx: bytes) -> str:
+    with zipfile.ZipFile(io.BytesIO(docx)) as archive:
+        return archive.read("word/document.xml").decode("utf-8")
+
+
+def normal_size(docx: bytes) -> float:
+    with zipfile.ZipFile(io.BytesIO(docx)) as archive:
+        styles = archive.read("word/styles.xml").decode("utf-8")
+    normal = re.search(r'w:styleId="Normal".*?</w:style>', styles, re.DOTALL).group(0)
+    return int(re.search(r'<w:sz w:val="(\d+)"', normal).group(1)) / 2
+
+
+def test_the_widest_table_is_counted_with_its_colspans() -> None:
+    assert converter.widest_table("<p>no table</p>") == 0
+    assert converter.widest_table(wide_table(31)) == 31
+    assert converter.widest_table('<table><tr><td colspan="4">a</td><td>b</td></tr></table>') == 5
+
+
+def test_without_a_layout_the_page_is_a_portrait_and_columns_are_equal() -> None:
+    xml = document_xml(converter.html_to_docx(wide_table(6)))
+    assert 'w:w="11906" w:h="16838"' in xml
+    grid = re.findall(r'<w:gridCol w:w="(\d+)"', xml)
+    assert len(set(grid)) == 1 and "tblLayout" not in xml
+
+
+def test_a_landscape_layout_turns_the_page_and_sizes_columns_to_their_content() -> None:
+    layout = converter.PageLayout(landscape=True, size=8, margin_cm=1.0)
+    xml = document_xml(converter.html_to_docx(wide_table(8), layout=layout))
+
+    assert 'w:w="16838" w:h="11906"' in xml and 'w:orient="landscape"' in xml
+    grid = [int(w) for w in re.findall(r'<w:gridCol w:w="(\d+)"', xml)]
+    assert len(grid) == 8
+    # The column with the long text is the widest; all together they fill the text width.
+    assert grid[0] == max(grid) and grid[0] > 2 * grid[-1]
+    assert abs(sum(grid) - 15_000) < 1_000  # 29.7 cm less two 1 cm margins, in twips
+    assert 'w:type="fixed"' in xml
+    assert normal_size(converter.html_to_docx(wide_table(8), layout=layout)) == 8.0
+
+
+def test_a_wide_table_without_libreoffice_gets_a_landscape_page(tmp_path: Path) -> None:
+    config = worker.Config(token="t", soffice_bin=str(tmp_path / "nothing.exe"))
+    docx = worker.make_docx(config, wide_table(31), language="ka", pages=1)
+    xml = document_xml(docx)
+
+    assert 'w:orient="landscape"' in xml
+    assert 'w:type="fixed"' in xml
+
+
+def test_a_plain_document_is_left_as_it_was(tmp_path: Path) -> None:
+    config = worker.Config(token="t", soffice_bin=str(tmp_path / "nothing.exe"))
+    plain = worker.make_docx(config, "<p>Hello</p>", language="ka", pages=1)
+    assert plain == converter.html_to_docx("<p>Hello</p>", language="ka")
+
+
+def test_the_page_directive_makes_a_plain_document_landscape(tmp_path: Path) -> None:
+    config = worker.Config(token="t", soffice_bin=str(tmp_path / "nothing.exe"))
+    html = "<!--page: landscape--><p>Hello</p>"
+    assert worker.declared_orientation(html) is True
+    assert worker.declared_orientation("<!-- page:portrait --><p>x</p>") is False
+    assert worker.declared_orientation("<p>x</p>") is None
+    assert 'w:orient="landscape"' in document_xml(
+        worker.make_docx(config, html, language="ka", pages=None)
+    )
+
+
+def test_the_page_is_tightened_until_it_is_no_longer_than_the_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    soffice = tmp_path / "soffice.exe"
+    soffice.write_text("", encoding="utf-8")
+    config = worker.Config(token="t", soffice_bin=str(soffice))
+    tried: list[float | None] = []
+    answers = iter([4, 2, 1])
+
+    def count(docx: bytes, _soffice: str) -> int:
+        tried.append(normal_size(docx))
+        return next(answers)
+
+    monkeypatch.setattr(worker, "count_pages", count)
+
+    docx = worker.make_docx(config, wide_table(31), language="ka", pages=1)
+
+    # 10 pt, 9 pt, 8.5 pt: stops at the first that fits, never goes on to 8.
+    assert tried == [10.0, 9.0, 8.5]
+    assert 'w:orient="landscape"' in document_xml(docx)
+
+
+def test_a_page_count_that_cannot_be_measured_stops_the_loop_at_the_first_try(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    soffice = tmp_path / "soffice.exe"
+    soffice.write_text("", encoding="utf-8")
+    config = worker.Config(token="t", soffice_bin=str(soffice))
+    calls: list[int] = []
+    monkeypatch.setattr(worker, "count_pages", lambda *_: calls.append(1))
+
+    worker.make_docx(config, wide_table(31), language="ka", pages=1)
+
+    assert len(calls) == 1
+
+
+def test_the_original_page_count_is_known_for_a_picture_and_not_for_word(tmp_path: Path) -> None:
+    assert worker.source_pages(tmp_path / "scan.JPG") == 1
+    assert worker.source_pages(tmp_path / "contract.docx") is None
+    assert worker.source_pages(tmp_path / "missing.pdf") is None
+
+
+def test_a_pdfs_pages_are_counted() -> None:
+    pypdf = pytest.importorskip("pypdf")
+    import tempfile
+
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    writer.add_blank_page(width=200, height=200)
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "two.pdf"
+        with path.open("wb") as handle:
+            writer.write(handle)
+        assert worker.source_pages(path) == 2
+
+
+def test_a_landscape_job_goes_through_to_a_landscape_word_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, office, client = make(tmp_path, [JOB])
+    fake_claude(monkeypatch, write="<!--page: landscape-->" + wide_table(12))
+
+    assert worker.run(config, once=True, office=client) == 0
+
+    (_, docx) = office.uploads[0]
+    assert 'w:orient="landscape"' in document_xml(docx)

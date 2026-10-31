@@ -76,6 +76,7 @@ The log has job ids, order numbers and statuses only, never document text.
 | `POLL_SECONDS` | 15 | Wait when nothing is queued |
 | `JOB_TIMEOUT_MINUTES` | 25 | Office puts a job back after 30, so keep it lower |
 | `USAGE_LIMIT_PAUSE_MINUTES` | 30 | Pause after Claude's usage limit |
+| `SOFFICE_BIN` | found automatically | LibreOffice's `soffice.exe`, for the page count |
 | `RULES_FILE` | `translation-rules.md` beside the script | The bureau's standing rules, put in every job |
 
 ## The bureau's rules
@@ -90,8 +91,22 @@ restart is needed. After Claude writes the translation the worker looks for an e
 dash, an en dash or three hyphens in the text and, if it finds one, asks Claude once to
 fix only those places.
 
-The converter sets the page (A4, 2 cm margins, 11 pt), so rules about page count and
-type size can only be met by mirroring the original; they cannot be set from here.
+## Landscape and page count
+
+A table with 10 or more columns, or a translation Claude marks `<!--page: landscape-->`,
+gets a landscape A4 page, narrow margins and columns sized to what they hold (not
+split equally).
+
+To make the Word file no longer than the original, install LibreOffice on this
+machine (`winget install TheDocumentFoundation.LibreOffice`) and
+`.\.venv\Scripts\python.exe -m pip install -r requirements.txt` again (it adds
+`pypdf`). The worker then lays the file out, counts the pages and tightens the page in
+steps: margins first, then type size. Ordinary text goes down to 10 pt, a wide table to
+8 pt, never lower. The target is the original's page count (a PDF's pages; 1 for a
+picture; Word and Excel sources are not fitted). If LibreOffice is not at
+`C:\Program Files\LibreOffice`, set `SOFFICE_BIN` to its `soffice.exe`. Without it, a
+wide table still gets a landscape page and one fixed size, but the page count is not
+checked.
 
 ## What it does and does not do
 
