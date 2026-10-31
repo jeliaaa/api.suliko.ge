@@ -473,8 +473,9 @@ def test_the_page_is_tightened_until_it_is_no_longer_than_the_original(
 
     docx = worker.make_docx(config, wide_table(31), language="ka", pages=1)
 
-    # 10 pt, 9 pt, 8.5 pt: stops at the first that fits, never goes on to 8.
-    assert tried == [10.0, 9.0, 8.5]
+    # 31 columns skip the sizes that cannot fit: 8, 7.5, 7 pt, stopping at the first that
+    # fits and never going on to 6.5.
+    assert tried == [8.0, 7.5, 7.0]
     assert 'w:orient="landscape"' in document_xml(docx)
 
 
@@ -522,3 +523,11 @@ def test_a_landscape_job_goes_through_to_a_landscape_word_file(
 
     (_, docx) = office.uploads[0]
     assert 'w:orient="landscape"' in document_xml(docx)
+
+
+def test_a_wide_table_may_go_down_to_6_pt_and_ordinary_text_not_below_10() -> None:
+    wide = worker.page_layouts(wide=True, landscape=True, columns=12)
+    assert wide[0].size == 10.0 and wide[-1].size == 6.0
+    assert worker.page_layouts(wide=True, landscape=True, columns=31)[0].size == 8.0
+    plain = worker.page_layouts(wide=False, landscape=False)
+    assert min(layout.size for layout in plain) == 10.0

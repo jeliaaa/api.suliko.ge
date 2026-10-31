@@ -102,7 +102,7 @@ machine (`winget install TheDocumentFoundation.LibreOffice`) and
 `.\.venv\Scripts\python.exe -m pip install -r requirements.txt` again (it adds
 `pypdf`). The worker then lays the file out, counts the pages and tightens the page in
 steps: margins first, then type size. Ordinary text goes down to 10 pt, a wide table to
-8 pt, never lower. The target is the original's page count (a PDF's pages; 1 for a
+6 pt (the original it mirrors is printed that small), never lower. The target is the original's page count (a PDF's pages; 1 for a
 picture; Word and Excel sources are not fitted). If LibreOffice is not at
 `C:\Program Files\LibreOffice`, set `SOFFICE_BIN` to its `soffice.exe`. Without it, a
 wide table still gets a landscape page and one fixed size, but the page count is not
