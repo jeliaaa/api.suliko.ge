@@ -33,6 +33,11 @@ A4, 2 cm margins, 11 pt, a little space after each paragraph and none inside
 table cells and list items, so a translation takes about the pages the
 original did.
 
+A caller that passes a `PageLayout` also gets a page that fits the content:
+landscape, narrower margins, a chosen type size, and table columns sized to what
+they hold instead of split equally (a certificate with thirty columns is not
+readable otherwise). Without one, nothing above changes.
+
 A conversion that cannot be done (a document too large or too deeply nested)
 raises `DocxConversionError`; the caller keeps the HTML rather than lose a
 translation that has already been paid for.
@@ -51,11 +56,12 @@ from urllib.parse import urlparse
 
 from docx import Document
 from docx.document import Document as DocumentObject
+from docx.enum.section import WD_ORIENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.opc.constants import RELATIONSHIP_TYPE
 from docx.oxml import OxmlElement, parse_xml
 from docx.oxml.ns import qn
-from docx.shared import Cm, Pt, RGBColor
+from docx.shared import Cm, Length, Pt, RGBColor
 from docx.table import _Cell
 from docx.text.paragraph import Paragraph
 from docx.text.run import Run
@@ -77,6 +83,40 @@ MAX_TABLE_CELLS = 20_000
 MAX_COLUMNS = 63  # Word's own limit
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 TEXT_WIDTH = Cm(17)  # A4 less two 2 cm margins
+
+
+@dataclass(frozen=True)
+class PageLayout:
+    """How the page is set when the caller wants the content to fit it.
+
+    `size` is the type size in points (headings follow it); `margin_cm` is the
+    margin on all four sides. None: 11 pt and 2 cm.
+    """
+
+    landscape: bool = False
+    size: float | None = None
+    margin_cm: float | None = None
+
+
+def widest_table(html: str) -> int:
+    """The most columns any table in the HTML has (a colspan counts as its span);
+    0 when there is no table. A table this wide does not fit a portrait page."""
+    try:
+        root = lxml_html.document_fromstring(_XML_FORBIDDEN.sub("", html))
+    except (etree.ParserError, ValueError):
+        return 0
+    widest = 0
+    for table in root.iter("table"):
+        for row in table.xpath("./tr | ./thead/tr | ./tbody/tr | ./tfoot/tr"):
+            total = 0
+            for cell in row.xpath("./td | ./th"):
+                try:
+                    total += max(1, int((cell.get("colspan") or "1").strip()))
+                except ValueError:
+                    total += 1
+            widest = max(widest, total)
+    return min(widest, MAX_COLUMNS)
+
 
 _COLLAPSIBLE = re.compile(r"[ \t\n\r\f]+")
 #: Characters XML cannot carry: python-docx refuses a string that has one.
@@ -424,25 +464,35 @@ class _Cursor:
 
 
 class _Writer:
-    def __init__(self, language: str | None) -> None:
+    def __init__(self, language: str | None, layout: PageLayout | None = None) -> None:
         self.document: DocumentObject = Document()
+        self.layout = layout
         self.nodes = 0
         self.page_break_next = False
         self._bullet_num: int | None = None
         self._abstract: dict[bool, int] = {}
+        self.base_size = layout.size if layout and layout.size else BASE_SIZE
+        self.text_width = Cm(17)
         self._prepare(language)
 
     # ── The empty document ────────────────────────────────────────────────
 
     def _prepare(self, language: str | None) -> None:
         section = self.document.sections[0]
-        section.page_width, section.page_height = Cm(21), Cm(29.7)
-        section.left_margin = section.right_margin = Cm(2)
-        section.top_margin = section.bottom_margin = Cm(2)
+        landscape = bool(self.layout and self.layout.landscape)
+        margin = self.layout.margin_cm if self.layout and self.layout.margin_cm else 2.0
+        if landscape:
+            section.orientation = WD_ORIENT.LANDSCAPE
+            section.page_width, section.page_height = Cm(29.7), Cm(21)
+        else:
+            section.page_width, section.page_height = Cm(21), Cm(29.7)
+        section.left_margin = section.right_margin = Cm(margin)
+        section.top_margin = section.bottom_margin = Cm(margin)
+        self.text_width = Length(section.page_width - Cm(2 * margin))
 
         styles = self.document.styles
         normal = styles["Normal"]
-        self._set_font(normal, FONT, BASE_SIZE)
+        self._set_font(normal, FONT, self.base_size)
         normal.paragraph_format.space_before = Pt(0)
         normal.paragraph_format.space_after = PARAGRAPH_AFTER
         normal.paragraph_format.line_spacing = 1.0
@@ -455,7 +505,10 @@ class _Writer:
 
         for level, size in _HEADING_SIZES.items():
             heading = styles[f"Heading {level}"]
-            self._set_font(heading, FONT, size)
+            # Relative to the body size when one was chosen, so a smaller page
+            # does not keep headings that are bigger than the table under them.
+            size = size + (self.base_size - BASE_SIZE) if self.layout else size
+            self._set_font(heading, FONT, max(size, self.base_size))
             heading.font.bold = True
             heading.font.italic = False
             heading.font.color.rgb = RGBColor(0, 0, 0)
@@ -840,12 +893,85 @@ class _Writer:
         table = cursor.container.add_table(len(rows), width)
         if self._has_borders(element):
             table.style = self.document.styles["Table Grid"]
+        if self.layout is not None:
+            self._fit_columns(table, placements, width)
         for row_index, column, span_rows, columns, cell in placements:
             target = table.cell(row_index, column)
             if span_rows > 1 or columns > 1:
                 target = target.merge(table.cell(row_index + span_rows - 1, column + columns - 1))
             self._cell(target, cell, rows[row_index], ctx)
         cursor.after_table = True
+
+    def _fit_columns(
+        self, table: Any, placements: list[tuple[int, int, int, int, Any]], width: int
+    ) -> None:
+        """Column widths that follow the content, in a table that keeps them.
+
+        Word splits a table's width equally unless told otherwise, so thirty
+        columns of numbers get the same room as a column of names. A column's
+        weight is its longest word (it cannot be narrower than that without
+        breaking inside it) or a share of its longest text, whichever is more.
+        """
+        weights = [0.0] * width
+        for _, column, _span_rows, columns, cell in placements:
+            if columns != 1:
+                continue
+            text = " ".join(cell.text_content().split())
+            longest = max((len(word) for word in text.split()), default=0)
+            weights[column] = max(weights[column], longest, 0.6 * min(len(text), 30))
+        weights = [max(weight, 2.0) for weight in weights]
+        total_twips = int(self.text_width.twips)
+        minimum = 280  # about half a centimetre
+        spare = sum(weights)
+        grid = [max(minimum, int(total_twips * weight / spare)) for weight in weights]
+        over = sum(grid) - total_twips
+        if over > 0:  # the minimums took more than the page has: shave the widest
+            grid[grid.index(max(grid))] -= over
+
+        table.autofit = False
+        properties = table._tbl.tblPr
+        for tag in ("w:tblLayout", "w:tblW", "w:tblCellMar"):
+            for old in properties.findall(qn(tag)):
+                properties.remove(old)
+        layout = OxmlElement("w:tblLayout")
+        layout.set(qn("w:type"), "fixed")
+        total = OxmlElement("w:tblW")
+        total.set(qn("w:w"), str(sum(grid)))
+        total.set(qn("w:type"), "dxa")
+        margins = OxmlElement("w:tblCellMar")
+        for side in ("left", "right"):
+            edge = OxmlElement(f"w:{side}")
+            edge.set(qn("w:w"), "40")
+            edge.set(qn("w:type"), "dxa")
+            margins.append(edge)
+        # The schema is strict about the order of a table's properties: the width
+        # follows the style, the layout and cell margins come before the look.
+        style = properties.find(qn("w:tblStyle"))
+        if style is not None:
+            style.addnext(total)
+        else:
+            properties.insert(0, total)
+        look = properties.find(qn("w:tblLook"))
+        for node in (layout, margins):
+            if look is not None:
+                look.addprevious(node)
+            else:
+                properties.append(node)
+        for index, column in enumerate(table.columns):
+            column.width = Pt(grid[index] / 20)
+        for row in table.rows:
+            position = 0
+            for tc in row._tr.tc_lst:
+                span = tc.grid_span
+                cell_width = sum(grid[position : position + span])
+                properties_tc = tc.get_or_add_tcPr()
+                for old in properties_tc.findall(qn("w:tcW")):
+                    properties_tc.remove(old)
+                tcw = OxmlElement("w:tcW")
+                tcw.set(qn("w:w"), str(cell_width))
+                tcw.set(qn("w:type"), "dxa")
+                properties_tc.insert(0, tcw)
+                position += span
 
     @staticmethod
     def _span(raw: str | None, minimum: int, maximum: int) -> int:
@@ -911,15 +1037,18 @@ class _Writer:
         cursor.close()
 
 
-def html_to_docx(html: str, *, language: str | None = None) -> bytes:
+def html_to_docx(
+    html: str, *, language: str | None = None, layout: PageLayout | None = None
+) -> bytes:
     """The translation as the bytes of a .docx.
 
     `language` is the code the translation is in ("en", "ka"), so Word checks
-    its spelling in that language. Raises `DocxConversionError`.
+    its spelling in that language. `layout` sets the page to fit the content (see
+    `PageLayout`); without it the page is A4 portrait. Raises `DocxConversionError`.
     """
     text = _XML_PROLOG.sub("", html.lstrip("﻿"))
     try:
-        writer = _Writer(language)
+        writer = _Writer(language, layout)
         if text.strip():
             try:
                 root = lxml_html.document_fromstring(_XML_FORBIDDEN.sub("", text))
@@ -944,4 +1073,4 @@ def html_to_docx(html: str, *, language: str | None = None) -> bytes:
     return out.getvalue()
 
 
-__all__ = ["DOCX_CONTENT_TYPE", "DocxConversionError", "html_to_docx"]
+__all__ = ["DOCX_CONTENT_TYPE", "DocxConversionError", "PageLayout", "html_to_docx", "widest_table"]

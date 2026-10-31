@@ -21,6 +21,8 @@ Configuration is by environment variable:
     POLL_SECONDS              default 15: wait when no job is waiting
     JOB_TIMEOUT_MINUTES       default 25: Office puts a job back after 30
     USAGE_LIMIT_PAUSE_MINUTES default 30: stop asking after a usage limit
+    SOFFICE_BIN               optional: LibreOffice's soffice, to count the pages of the
+                              Word file and shrink it to the original's page count
     RULES_FILE                default translation-rules.md next to this script: the
                               bureau's standing rules, put in every job's CLAUDE.md
     KEEP_WORK                 set to 1 to keep each job's folder (debugging only)
@@ -37,6 +39,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -45,7 +48,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from translation_docx import DocxConversionError, html_to_docx
+from translation_docx import DocxConversionError, PageLayout, html_to_docx, widest_table
 
 VERSION = "1.0"
 log = logging.getLogger("claude-worker")
@@ -74,6 +77,8 @@ class Config:
     keep_work: bool = False
     #: The bureau's standing rules, a Markdown file. Missing or empty: none.
     rules_file: Path | None = None
+    #: LibreOffice's `soffice`. None: looked for on this machine.
+    soffice_bin: str | None = None
 
     @staticmethod
     def from_env() -> Config:
@@ -92,6 +97,7 @@ class Config:
             usage_limit_pause_minutes=float(os.environ.get("USAGE_LIMIT_PAUSE_MINUTES", "30")),
             keep_work=os.environ.get("KEEP_WORK") == "1",
             rules_file=Path(os.environ.get("RULES_FILE") or DEFAULT_RULES_FILE).resolve(),
+            soffice_bin=os.environ.get("SOFFICE_BIN") or None,
         )
 
 
@@ -242,6 +248,11 @@ u, ul, ol, li, table, thead, tbody, tr, th, td, and span with `style` limited to
 `color`, `background-color` and `text-align`. No scripts, no classes, no images, no
 links, no `<html>` or `<body>` wrapper.
 
+If the original is landscape (its content is wider than tall, such as a long table,
+even when the scan is turned sideways), make the first line of the file the comment
+`<!--page: landscape-->`. The worker then sets a landscape page and fits the table to
+it. Do nothing about sizes or margins: that is done for you.
+
 ## Instructions from the order
 
 {instructions or "None."}
@@ -305,6 +316,120 @@ def run_claude(config: Config, folder: Path, prompt: str) -> None:
         raise JobFailedError(f"Claude Code stopped with an error (exit code {done.returncode}).")
 
 
+# ── The Word file: page, type size, page count ───────────────────────────────
+
+#: A table with this many columns does not fit a portrait page.
+WIDE_COLUMNS = 10
+
+_PAGE_DIRECTIVE = re.compile(r"^\s*<!--\s*page\s*:\s*(landscape|portrait)\s*-->", re.IGNORECASE)
+
+_SOFFICE_PLACES = (
+    r"C:\Program Files\LibreOffice\program\soffice.exe",
+    r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+)
+
+
+def declared_orientation(html: str) -> bool | None:
+    """True for landscape, False for portrait, None when Claude said nothing."""
+    found = _PAGE_DIRECTIVE.match(html)
+    return None if found is None else found.group(1).lower() == "landscape"
+
+
+def page_layouts(*, wide: bool, landscape: bool) -> list[PageLayout]:
+    """From the roomiest page to the tightest. Margins go first, then type size;
+    a wide table may go down to 8 pt, other text never below 10."""
+    steps = (
+        ((10.0, 1.2), (9.0, 1.2), (8.5, 1.0), (8.0, 1.0))
+        if wide
+        else ((11.0, 2.0), (11.0, 1.5), (10.5, 1.5), (10.0, 1.5))
+    )
+    return [PageLayout(landscape=landscape, size=size, margin_cm=margin) for size, margin in steps]
+
+
+def find_soffice(config: Config) -> str | None:
+    for candidate in (config.soffice_bin, shutil.which("soffice"), *_SOFFICE_PLACES):
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def source_pages(path: Path) -> int | None:
+    """How many pages the original has, when that is known: a PDF's, or 1 for a
+    picture. A Word or Excel source has no page count that means anything."""
+    suffix = path.suffix.lower()
+    if suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}:
+        return 1
+    if suffix != ".pdf":
+        return None
+    try:
+        from pypdf import PdfReader
+
+        return len(PdfReader(path).pages) or None
+    except Exception:
+        return None
+
+
+def count_pages(docx: bytes, soffice: str) -> int | None:
+    """The Word file's pages as LibreOffice lays it out; None if that failed.
+    The file is in a temporary folder only while this runs."""
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return None
+    with tempfile.TemporaryDirectory() as folder:
+        source = Path(folder) / "t.docx"
+        source.write_bytes(docx)
+        command = [
+            soffice,
+            f"-env:UserInstallation={(Path(folder) / 'profile').as_uri()}",
+            "--headless",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            folder,
+            str(source),
+        ]
+        try:
+            subprocess.run(  # noqa: S603 -- built here, not from a job
+                command, capture_output=True, timeout=180, stdin=subprocess.DEVNULL, check=False
+            )
+            return len(PdfReader(Path(folder) / "t.pdf").pages)
+        except Exception:
+            return None
+
+
+def make_docx(config: Config, html: str, *, language: str, pages: int | None) -> bytes:
+    """The translation as a Word file that suits its content.
+
+    A wide table gets a landscape page and columns sized to what they hold; a
+    document Claude marked landscape gets a landscape page. With LibreOffice on
+    the machine and the original's page count known, the page is tightened step
+    by step until the Word file is no longer than the original. Without it, a
+    wide table gets one fixed step. A plain document is left exactly as before.
+    """
+    declared = declared_orientation(html)
+    columns = widest_table(html)
+    wide = columns >= WIDE_COLUMNS
+    landscape = declared if declared is not None else wide
+    layouts = page_layouts(wide=wide, landscape=landscape)
+    soffice = find_soffice(config)
+
+    if pages is None or soffice is None:
+        if not (wide or landscape):
+            return html_to_docx(html, language=language)
+        step = (3 if columns >= 20 else 1) if wide else 0
+        return html_to_docx(html, language=language, layout=layouts[step])
+
+    docx = b""
+    for layout in layouts:
+        docx = html_to_docx(html, language=language, layout=layout)
+        fitted = count_pages(docx, soffice)
+        if fitted is None or fitted <= pages:
+            break
+        log.info("%s pages at %s pt, the original has %s", fitted, layout.size, pages)
+    return docx
+
+
 _DASHES = re.compile("[\u2014\u2013]|-{3,}")
 
 
@@ -365,7 +490,9 @@ def process(config: Config, office: Office, job: dict[str, Any]) -> None:
             run_claude(config, folder, fix_prompt())
             html = read_translation(folder)
         try:
-            docx = html_to_docx(html, language=job["target_language"])
+            docx = make_docx(
+                config, html, language=job["target_language"], pages=source_pages(original)
+            )
         except DocxConversionError as exc:
             raise JobFailedError("The translation could not be made into a Word file.") from exc
         office.result(job_id, job["output_file_name"], docx)
