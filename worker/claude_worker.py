@@ -21,6 +21,8 @@ Configuration is by environment variable:
     POLL_SECONDS              default 15: wait when no job is waiting
     JOB_TIMEOUT_MINUTES       default 25: Office puts a job back after 30
     USAGE_LIMIT_PAUSE_MINUTES default 30: stop asking after a usage limit
+    RULES_FILE                default translation-rules.md next to this script: the
+                              bureau's standing rules, put in every job's CLAUDE.md
     KEEP_WORK                 set to 1 to keep each job's folder (debugging only)
 """
 
@@ -38,6 +40,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from html import unescape
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +49,8 @@ from translation_docx import DocxConversionError, html_to_docx
 
 VERSION = "1.0"
 log = logging.getLogger("claude-worker")
+
+DEFAULT_RULES_FILE = Path(__file__).with_name("translation-rules.md")
 
 #: What Claude Code says when the subscription's usage limit is reached.
 _USAGE_LIMIT = re.compile(
@@ -67,6 +72,8 @@ class Config:
     job_timeout_minutes: float = 25
     usage_limit_pause_minutes: float = 30
     keep_work: bool = False
+    #: The bureau's standing rules, a Markdown file. Missing or empty: none.
+    rules_file: Path | None = None
 
     @staticmethod
     def from_env() -> Config:
@@ -84,6 +91,7 @@ class Config:
             job_timeout_minutes=float(os.environ.get("JOB_TIMEOUT_MINUTES", "25")),
             usage_limit_pause_minutes=float(os.environ.get("USAGE_LIMIT_PAUSE_MINUTES", "30")),
             keep_work=os.environ.get("KEEP_WORK") == "1",
+            rules_file=Path(os.environ.get("RULES_FILE") or DEFAULT_RULES_FILE).resolve(),
         )
 
 
@@ -194,8 +202,16 @@ def readable_source(path: Path) -> Path:
     return path
 
 
-def build_claude_md(job: dict[str, Any]) -> str:
+def read_rules(config: Config) -> str:
+    """The bureau's standing rules, or "" when there is no such file."""
+    if config.rules_file is None or not config.rules_file.is_file():
+        return ""
+    return config.rules_file.read_text(encoding="utf-8").strip()
+
+
+def build_claude_md(job: dict[str, Any], rules: str = "") -> str:
     instructions = (job.get("instructions") or "").strip()
+    bureau = f"\n{rules}\n" if rules else ""
     return f"""# Translation job
 
 You translate one client document for a translation bureau.
@@ -208,15 +224,16 @@ You translate one client document for a translation bureau.
 - Translate everything on the document, faithfully and completely. Do not summarise,
   do not add, do not leave parts out, do not comment.
 - Keep the structure: headings, paragraphs, lists and tables, in the same order.
-- Stamps, seals, signatures, handwriting and letterheads: write them in square
-  brackets where they are, for example [seal: Ministry of Justice of Georgia],
-  [signature], [illegible]. Never guess at text you cannot read.
+- Stamps, seals, signatures, handwriting and letterheads: describe them where they
+  are, as the bureau rules below say (between slashes). Without such a rule use square
+  brackets, for example [seal: Ministry of Justice of Georgia], [signature],
+  [illegible]. Never guess at text you cannot read.
 - Keep numbers, dates, codes and addresses exactly as written. Do not convert
   calendar or number formats.
 - Write proper names as the instructions below say. Otherwise transliterate them
   by the usual conventions of the target language and do not translate them.
 - The result is a draft for a human translator to check.
-
+{bureau}
 ## Output
 
 Write the translation to `translation.html` in this folder, and nothing else.
@@ -288,6 +305,29 @@ def run_claude(config: Config, folder: Path, prompt: str) -> None:
         raise JobFailedError(f"Claude Code stopped with an error (exit code {done.returncode}).")
 
 
+_DASHES = re.compile("[\u2014\u2013]|-{3,}")
+
+
+def has_forbidden_dashes(html: str) -> bool:
+    """An em dash, an en dash or three hyphens in the text of the translation.
+
+    The bureau never uses them in a translation. Markup is not looked at (an HTML
+    comment or an attribute is not text), and a single hyphen is data, not
+    punctuation: dates, codes and numbers keep theirs.
+    """
+    text = re.sub(r"<[^>]*>", " ", unescape(html))
+    return _DASHES.search(text) is not None
+
+
+def fix_prompt() -> str:
+    return (
+        "translation.html contains an em dash, an en dash or three hyphens in a row, which "
+        "CLAUDE.md forbids. Read translation.html and rewrite only those places as "
+        "CLAUDE.md says (a blank field is [-----]; punctuation becomes a comma, a colon, "
+        "brackets or two sentences). Change nothing else. Reply with the single word done."
+    )
+
+
 def read_translation(folder: Path) -> str:
     path = folder / "translation.html"
     if not path.is_file():
@@ -312,10 +352,18 @@ def process(config: Config, office: Office, job: dict[str, Any]) -> None:
         original = source_dir / safe_name(job["file_name"])
         office.download(job_id, original)
         readable = readable_source(original)
-        (folder / "CLAUDE.md").write_text(build_claude_md(job), encoding="utf-8")
+        (folder / "CLAUDE.md").write_text(
+            build_claude_md(job, read_rules(config)), encoding="utf-8"
+        )
 
         run_claude(config, folder, build_prompt(readable, job))
         html = read_translation(folder)
+        if has_forbidden_dashes(html):
+            # Once: asked to fix only those places. If a dash is still there the
+            # draft goes out as it is; the translator checks it anyway.
+            log.info("job %s: asking Claude to remove dashes", job_id)
+            run_claude(config, folder, fix_prompt())
+            html = read_translation(folder)
         try:
             docx = html_to_docx(html, language=job["target_language"])
         except DocxConversionError as exc:

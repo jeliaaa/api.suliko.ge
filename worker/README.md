@@ -19,8 +19,8 @@ translate each file and sends the Word document back. The contract with Office i
 
 ## 2. Install
 
-Copy this `worker` folder to `C:\claude-worker` (all three `.py` files and
-`requirements.txt`), then:
+Copy this `worker` folder to `C:\claude-worker` (the `.py` files, `translation-rules.md`
+and `requirements.txt`), then:
 
 ```
 cd C:\claude-worker
@@ -76,6 +76,22 @@ The log has job ids, order numbers and statuses only, never document text.
 | `POLL_SECONDS` | 15 | Wait when nothing is queued |
 | `JOB_TIMEOUT_MINUTES` | 25 | Office puts a job back after 30, so keep it lower |
 | `USAGE_LIMIT_PAUSE_MINUTES` | 30 | Pause after Claude's usage limit |
+| `RULES_FILE` | `translation-rules.md` beside the script | The bureau's standing rules, put in every job |
+
+## The bureau's rules
+
+`translation-rules.md` holds the bureau's standing rules (Georgian names, mirroring the
+original, slashes for stamps and photos, `[-----]` for blank fields, no dashes,
+passport layout, what to check before finishing). Every job's CLAUDE.md contains it,
+ahead of the order's own instructions, which win where they disagree.
+
+Edit the file on the server to change the rules: it is read for each job, so no
+restart is needed. After Claude writes the translation the worker looks for an em
+dash, an en dash or three hyphens in the text and, if it finds one, asks Claude once to
+fix only those places.
+
+The converter sets the page (A4, 2 cm margins, 11 pt), so rules about page count and
+type size can only be met by mirroring the original; they cannot be set from here.
 
 ## What it does and does not do
 

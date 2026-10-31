@@ -7,6 +7,7 @@ each way a job can end.
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import subprocess
 import sys
@@ -276,3 +277,100 @@ def test_the_token_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CLAUDE_WORKER_TOKEN", raising=False)
     with pytest.raises(SystemExit):
         worker.Config.from_env()
+
+
+def with_rules(
+    config: worker.Config, tmp_path: Path, text: str = "## Bureau rules\nUse slashes."
+) -> None:
+    rules = tmp_path / "rules.md"
+    rules.write_text(text, encoding="utf-8")
+    return dataclasses.replace(config, rules_file=rules)
+
+
+def test_the_bureau_rules_are_in_every_jobs_claude_md(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, _office, client = make(tmp_path, [JOB])
+    config = with_rules(config, tmp_path)
+    seen = fake_claude(monkeypatch)
+
+    worker.run(config, once=True, office=client)
+
+    claude_md = seen[0]["claude_md"]
+    assert "Use slashes." in claude_md
+    # The order's own instructions come after them, so they win.
+    assert claude_md.index("Use slashes.") < claude_md.index("Spell Tamar as Tamara.")
+
+
+def test_no_rules_file_is_no_rules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config, _office, client = make(tmp_path, [JOB])
+    config = dataclasses.replace(config, rules_file=tmp_path / "missing.md")
+    seen = fake_claude(monkeypatch)
+
+    assert worker.run(config, once=True, office=client) == 0
+    assert "Bureau rules" not in seen[0]["claude_md"]
+
+
+def test_the_shipped_rules_file_is_read_by_default() -> None:
+    assert worker.DEFAULT_RULES_FILE.is_file()
+    text = worker.DEFAULT_RULES_FILE.read_text(encoding="utf-8")
+    assert "[-----]" in text and "თარჯიმანი:" in text
+
+
+@pytest.mark.parametrize(
+    ("html", "found"),
+    [
+        ("<p>a — b</p>", True),
+        (f"<p>a {chr(0x2013)} b</p>", True),
+        ("<p>a &mdash; b</p>", True),
+        ("<p>[---]</p>", True),
+        ("<p>[-----]</p>", True),
+        ("<p>04-10-2004 EN 1317-5:2007+A2:2012</p>", False),
+        ("<p>one - two</p>", False),
+        ('<p style="x">fine</p><!-- --- -->', False),
+    ],
+)
+def test_dashes_are_found_in_the_text_only(html: str, found: bool) -> None:
+    assert worker.has_forbidden_dashes(html) is found
+
+
+def test_a_dash_gets_one_fix_pass_and_the_fixed_text_is_sent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, office, client = make(tmp_path, [JOB])
+    prompts: list[str] = []
+    outputs = ["<h1>ცნობა — ISO</h1>", "<h1>ცნობა, ISO</h1>"]
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        prompts.append(command[command.index("-p") + 1])
+        (Path(kwargs["cwd"]) / "translation.html").write_text(outputs.pop(0), encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="done", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", run)
+
+    worker.run(config, once=True, office=client)
+
+    assert len(prompts) == 2 and "em dash" in prompts[1]
+    (_, docx) = office.uploads[0]
+    with zipfile.ZipFile(io.BytesIO(docx)) as archive:
+        text = archive.read("word/document.xml").decode("utf-8")
+    assert "—" not in text and "ცნობა, ISO" in text
+
+
+def test_a_dash_that_survives_the_fix_is_not_looped_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, office, client = make(tmp_path, [JOB])
+    runs: list[int] = []
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        runs.append(1)
+        (Path(kwargs["cwd"]) / "translation.html").write_text("<p>a — b</p>", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="done", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", run)
+
+    worker.run(config, once=True, office=client)
+
+    assert len(runs) == 2
+    assert len(office.uploads) == 1
