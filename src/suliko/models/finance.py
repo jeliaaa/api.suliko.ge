@@ -18,12 +18,14 @@ Notary allocations key on ``order_document_id``, not ``order_id``, because
 from __future__ import annotations
 
 import enum
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     Date,
+    DateTime,
     Enum,
     ForeignKey,
     Index,
@@ -218,6 +220,23 @@ class NotaryPayment(Base, IdMixin, TenantScoped, TimestampMixin):
         ForeignKey("users.id", ondelete="SET NULL"), default=None
     )
     idempotency_key: Mapped[str | None] = mapped_column(String(64), default=None)
+
+    # Set only for a transfer started through Bank of Georgia Business Online
+    # (`method = bog_online`). The transfer is created unsigned; money moves
+    # when the owner signs it in the bank's app, so these track where it is.
+    #: Our id for the document, sent to the bank (it refuses a repeat for 7 days).
+    bog_unique_id: Mapped[str | None] = mapped_column(String(36), default=None)
+    #: The bank's id for the document, needed to ask for its status.
+    bog_unique_key: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    #: The bank's own word for the status, as last read. Shown as is.
+    bog_status: Mapped[str | None] = mapped_column(String(60), default=None)
+    #: pending (waiting for the signature) | completed | unconfirmed (the bank
+    #: did not answer, so a document may or may not exist). A refused transfer
+    #: is not kept: the money never left.
+    bog_state: Mapped[str | None] = mapped_column(String(20), default=None)
+    bog_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
 
 
 class NotaryPaymentAllocation(Base, IdMixin, TenantScoped, TimestampMixin):

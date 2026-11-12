@@ -144,13 +144,18 @@ PROVIDERS: dict[IntegrationProvider, ProviderSpec] = {
         provider=IntegrationProvider.BOG_BUSINESS,
         name="Bank of Georgia: Business Online",
         summary="Outbound transfers to translators and notaries.",
-        enables="Paying a translator or notary directly from a payout.",
+        enables="Paying a notary from a payout: Office prepares the transfer and "
+        "you sign it in the bank's app.",
         fields=(
             FieldSpec(key="client_id", label="Client ID"),
             FieldSpec(key="client_secret", label="Client secret", secret=True),
             FieldSpec(key="source_iban", label="Source IBAN", help="The account paid from."),
             FieldSpec(key="payer_inn", label="Payer tax ID"),
-            FieldSpec(key="payer_name", label="Payer name"),
+            FieldSpec(
+                key="payer_name",
+                label="Payer name",
+                help="The company's legal name, as sent to the bank.",
+            ),
         ),
     ),
     IntegrationProvider.SMS_OFFICE: ProviderSpec(
@@ -499,6 +504,32 @@ async def _check_drive(config: dict[str, Any], secrets: dict[str, str]) -> Check
     )
 
 
+async def _check_bog_business(secrets: dict[str, str], config: dict[str, Any]) -> CheckResult:
+    """Sign in to the bank with the saved id and secret. Moves no money."""
+    from suliko.integrations.bog_business import BogBusiness, BogCredentials, BogError
+
+    bank = BogBusiness(
+        BogCredentials(
+            client_id=str(config.get("client_id", "")).strip(),
+            client_secret=str(secrets.get("client_secret", "")).strip(),
+            source_iban=str(config.get("source_iban", "")).strip(),
+            payer_inn=str(config.get("payer_inn", "")).strip(),
+            payer_name=str(config.get("payer_name", "")).strip(),
+        )
+    )
+    try:
+        await bank.check()
+    except BogError as exc:
+        return CheckResult(ok=False, detail=exc.message)
+    finally:
+        await bank.aclose()
+    return CheckResult(
+        ok=True,
+        detail="Connected. The bank accepted the Client ID and Client secret. "
+        "Transfers are left for you to sign in Business Online.",
+    )
+
+
 @router.post("/{provider}/check", response_model=CheckResult)
 async def check_integration(
     provider: IntegrationProvider,
@@ -514,8 +545,9 @@ async def check_integration(
 
     What it does today is catch the common half of the problem — a required
     field left blank, a provider enabled before it was filled in. Each live
-    check lands with the flow that needs it: SMTP with the confirmation email,
-    BOG with the payment link.
+    check lands with the flow that needs it: Drive and the bank's Business
+    Online sign in to the real service; SMTP and BOG e-commerce come with their
+    flows.
     """
     _require_allowed(session, provider)
     spec = _spec(provider)
@@ -542,6 +574,8 @@ async def check_integration(
         )
     elif provider is IntegrationProvider.GOOGLE_DRIVE:
         result = await _check_drive(row.config, secrets)
+    elif provider is IntegrationProvider.BOG_BUSINESS:
+        result = await _check_bog_business(secrets, row.config)
     else:
         result = CheckResult(
             ok=True,
