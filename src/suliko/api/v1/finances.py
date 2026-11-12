@@ -1235,6 +1235,12 @@ class NotaryPayoutAllocationOut(BaseModel):
 
 
 class NotaryPayoutOut(PayoutOut):
+    #: Where a Bank of Georgia transfer stands (pending the owner's signature,
+    #: completed, or unconfirmed). None for a payment recorded by hand.
+    bog_state: str | None = None
+    #: The bank's own word for it, as last read.
+    bog_status: str | None = None
+    bog_checked_at: datetime | None = None
     paid_via_translator_payment_id: int | None
     allocations: list[NotaryPayoutAllocationOut]
 
@@ -1557,6 +1563,9 @@ async def _notary_payouts_out(
             method=row.method,
             notes=row.notes,
             paid_via_translator_payment_id=row.paid_via_translator_payment_id,
+            bog_state=row.bog_state,
+            bog_status=row.bog_status,
+            bog_checked_at=row.bog_checked_at,
             allocations=allocations.get(row.id, []),
             unallocated=row.amount
             - sum((a.amount_allocated for a in allocations.get(row.id, [])), ZERO),
@@ -1666,6 +1675,15 @@ async def delete_notary_payout(payout_id: int, db: Db, session: MoneyUndoer) -> 
     row = await db.get(NotaryPayment, payout_id)
     if row is None:
         raise NotFoundError("Payout not found.")
+    # A transfer the bank holds, or has paid, is not ours to forget: removing
+    # the record would show the fee as owed again and invite a second payment.
+    if row.bog_state in ("pending", "completed"):
+        raise ConflictError(
+            "This payment was sent through Bank of Georgia. Reject the document in "
+            "Business Online first, then refresh its status here."
+            if row.bog_state == "pending"
+            else "This payment was completed through Bank of Georgia and cannot be removed."
+        )
 
     from suliko.core.audit import record
 
